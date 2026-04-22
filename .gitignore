@@ -1,0 +1,44 @@
+# Node / web
+node_modules/
+dist/
+.vite/
+test-results/
+playwright-report/
+coverage/
+
+# Android / Gradle
+android/build/
+android/app/build/
+android/.gradle/
+android/.idea/
+android/.kotlin/
+android/local.properties
+android/capacitor-cordova-android-plugins/build/
+*.iml
+
+# `npx cap sync` output — regenerated from dist/ on every sync
+android/app/src/main/assets/public/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code state
+.claude/
+
+# Local logs / scratch
+logs.txt
+*.log
+
+# Large binaries — ship via GitHub Releases instead
+# The `releases/` folder is a staging area for Release assets; do not commit.
+releases/
+app-debug.apk
+*.pkl
+
+# CLAP ONNX model — not required; on-device inference path is unused.
+# If you want it, download separately and drop into android/app/src/main/assets/.
+android/app/src/main/assets/clap_audio_encoder.onnx
+android/app/src/main/assets/clap_audio_encoder.onnx.data

@@ -1,0 +1,18 @@
+{
+  "appId": "com.musicplayer.app.test",
+  "appName": "Music App",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#0a0a0f"
+  },
+  "server": {
+    "androidScheme": "https",
+    "allowNavigation": ["*"]
+  },
+  "plugins": {
+    "Filesystem": {
+      "androidExternalStorage": true
+    }
+  }
+}

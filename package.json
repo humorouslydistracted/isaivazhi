@@ -1,0 +1,35 @@
+{
+  "name": "music_app_development",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/app.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "sync": "vite build && npx cap sync",
+    "open": "npx cap open android",
+    "convert": "python convert_data.py",
+    "test:unit": "vitest run --config vitest.config.mjs",
+    "test:unit:watch": "vitest --config vitest.config.mjs",
+    "test:ui": "playwright test --config playwright.config.mjs",
+    "test:ui:headed": "playwright test --config playwright.config.mjs --headed"
+  },
+  "keywords": [],
+  "author": "Yuvaraj M P",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/cli": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
+    "@capacitor/filesystem": "^8.1.2",
+    "@capacitor/preferences": "^8.0.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "jsdom": "^29.0.2",
+    "vite": "^8.0.3",
+    "vitest": "^4.1.4"
+  }
+}

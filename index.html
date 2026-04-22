@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#e84545">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Music Player</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+
+<div class="search-bar" id="searchBar" style="display:none;">
+    <input type="text" id="searchInput" placeholder="Search songs, artists, albums...">
+    <button class="search-clear" id="searchClear" onclick="window._app.clearSearch()" style="display:none;">&times;</button>
+</div>
+
+<div id="statusToast" class="status-toast" style="display:none;"></div>
+
+<!-- On-screen debug log — hidden. Uncomment this block to re-enable the DBG button + log panel.
+<div id="debugLogToggle" style="position:fixed;top:calc(env(safe-area-inset-top, 24px) + 14px);left:10px;z-index:100000;background:#e84545;color:#fff;padding:6px 14px;font-size:12px;border-radius:8px;cursor:pointer;" onclick="var p=document.getElementById('debugLogPanel');p.style.display=p.style.display==='none'?'block':'none';">DBG</div>
+<div id="debugLogPanel" style="display:none;position:fixed;top:calc(env(safe-area-inset-top, 24px) + 50px);left:0;right:0;bottom:0;z-index:99999;background:rgba(0,0,0,0.95);color:#0f0;font-family:monospace;font-size:11px;overflow-y:auto;padding:8px;white-space:pre-wrap;word-break:break-all;">
+<div id="debugLogCopyBtn" style="position:sticky;top:0;background:#333;color:#fff;padding:8px 16px;border-radius:6px;text-align:center;cursor:pointer;margin-bottom:8px;" onclick="var t=document.getElementById('debugLogText').textContent;navigator.clipboard.writeText(t).then(function(){document.getElementById('debugLogCopyBtn').textContent='Copied!';setTimeout(function(){document.getElementById('debugLogCopyBtn').textContent='Copy Logs';},1500);});">Copy Logs</div>
+<div id="debugLogText"></div>
+</div>
+-->
+
+<div class="content">
+    <div class="panel active" id="panel-discover">
+        <div class="discover-top">
+            <div id="profile-stats" class="profile-stats" style="display:none;"></div>
+            <div id="recommendationStatus" class="recommendation-status"></div>
+        </div>
+
+        <div class="pull-indicator" id="pullIndicator"></div>
+        <div id="discover-pull-body" class="discover-pull-body">
+            <div class="section-header clickable" id="similar-header" onclick="window._app.viewAll('similar')">Most Similar
+                <div class="section-actions">
+                    <button class="similar-freeze-btn" id="similarFreezeBtn" onclick="event.stopPropagation(); window._app.toggleSimilarFreeze()">Freeze</button>
+                    <span class="action-hint">View All &rsaquo;</span>
+                </div>
+            </div>
+            <div class="hscroll-wrap" id="similar-list"></div>
+
+            <div class="section-header clickable" onclick="window._app.viewAll('forYou')">For You<span class="section-badge" id="foryou-badge"></span></div>
+            <div class="hscroll-wrap" id="for-you-list"></div>
+
+            <div id="because-you-played"></div>
+
+            <div class="section-header" id="unexplored-header" style="display:none;">Unexplored Sounds</div>
+            <div id="unexplored-clusters"></div>
+        </div>
+    </div>
+
+    <div class="panel" id="panel-songs"></div>
+    <div class="panel" id="panel-albums"></div>
+    <div class="panel" id="panel-browse">
+        <div id="browse-tiles" class="discover-tiles browse-tiles"></div>
+        <div class="section-header" id="playlist-header">
+            <span>Playlists</span>
+            <div class="section-actions">
+                <button class="action-btn" onclick="window._app.showPlaylistCreator()">+ New</button>
+            </div>
+        </div>
+        <div id="playlists-list" class="playlist-tiles"></div>
+    </div>
+    <div class="panel" id="panel-recs">
+        <div class="recs-toolbar">
+            <div class="section-header">
+                <span>Up Next</span>
+                <div class="section-actions">
+                    <label class="rec-toggle-label">
+                        <input type="checkbox" id="recToggle" checked onchange="window._app.toggleRec(this.checked)">
+                        <span class="rec-toggle-slider"></span>
+                        <span class="rec-toggle-text">AI</span>
+                    </label>
+                    <button class="action-btn" onclick="window._app.refreshRecs()">Refresh</button>
+                </div>
+            </div>
+            <div class="session-label" id="recs-session-label" style="display:none;"></div>
+        </div>
+        <div class="recs-list-wrap" id="recs-list-wrap">
+            <div id="recs-list"></div>
+        </div>
+    </div>
+    <div class="panel" id="panel-history" style="display:none;">
+        <div id="history-list"></div>
+    </div>
+</div>
+
+<div class="bottom-bar" id="bottomBar">
+    <div class="now-playing" id="nowPlaying" style="display:none;">
+        <div class="np-card">
+            <div class="np-info">
+                <div class="np-icon" id="npIcon">
+                    <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55C7.79 13 6 14.79 6 17s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+                </div>
+                <div class="np-text">
+                    <div class="np-title-row">
+                        <span id="npTitle">---</span>
+                        <span class="red-dot-inline" id="npRedDot" style="display:none;" title="No embedding"></span>
+                        <span class="mode-indicator mode-shuffle" id="modeIndicator">Shuffle</span>
+                    </div>
+                    <div class="np-artist" id="npArtist">---</div>
+                </div>
+                <div class="fav-btn" id="favBtn" role="button" onclick="window._app.toggleFavorite()">&#9825;</div>
+            </div>
+            <div class="np-progress" id="progressBar">
+                <div class="np-progress-fill" id="progressFill"></div>
+                <div class="seek-thumb" id="seekThumb"></div>
+            </div>
+            <div class="np-time">
+                <span id="npTime">0:00</span>
+                <span id="npDuration">0:00</span>
+            </div>
+            <div class="np-controls">
+                <button class="np-btn np-btn-sm" id="loopBtn" onclick="window._app.toggleLoop()">
+                    <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+                </button>
+                <button class="np-btn" onclick="window._app.prev()">
+                    <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+                </button>
+                <button class="np-btn play-btn" id="playBtn" onclick="window._app.togglePause()">
+                    <svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5v14l11-7z"/></svg>
+                </button>
+                <button class="np-btn" onclick="window._app.neutralSkip()">
+                    <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+                </button>
+                <button class="np-btn np-btn-sm" id="shuffleBtn" onclick="window._app.toggleShuffle()">
+                    <svg viewBox="0 0 24 24"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
+                </button>
+                <button class="np-btn np-btn-sm" onclick="window._app.next()" title="Dislike skip">
+                    <svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>
+                </button>
+                <button class="np-btn np-btn-sm" onclick="window._app.goToQueue()">
+                    <svg viewBox="0 0 24 24"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+    <div class="tabs">
+        <div class="tab active" data-tab="discover">Discover</div>
+        <div class="tab" data-tab="songs">Songs</div>
+        <div class="tab" data-tab="albums">Albums</div>
+        <div class="tab" data-tab="recs">Up Next</div>
+        <div class="tab" data-tab="browse">Browse</div>
+    </div>
+</div>
+
+<!-- Full-screen player overlay -->
+<div class="full-player" id="fullPlayer">
+    <div class="fp-handle" id="fpHandle"><div class="fp-handle-bar"></div></div>
+    <div class="fp-art" id="fpArt">
+        <div class="fp-art-placeholder" id="fpArtPlaceholder">M</div>
+        <img class="fp-art-img" id="fpArtImg" style="display:none;" alt="">
+    </div>
+    <div class="fp-title" id="fpTitle">---</div>
+    <div class="fp-artist" id="fpArtist">---</div>
+    <div class="fp-progress" id="fpProgressBar">
+        <div class="fp-progress-fill" id="fpProgressFill"></div>
+        <div class="fp-seek-thumb" id="fpSeekThumb"></div>
+    </div>
+    <div class="fp-time">
+        <span id="fpTime">0:00</span>
+        <span id="fpDuration">0:00</span>
+    </div>
+    <div class="fp-controls">
+        <button class="fp-btn fp-btn-sm" id="fpLoopBtn" onclick="window._app.toggleLoop()">
+            <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+        </button>
+        <button class="fp-btn" onclick="window._app.prev()">
+            <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+        </button>
+        <button class="fp-btn fp-play-btn" id="fpPlayBtn" onclick="window._app.togglePause()">
+            <svg viewBox="0 0 24 24" id="fpPlayIcon"><path d="M8 5v14l11-7z"/></svg>
+        </button>
+        <button class="fp-btn" onclick="window._app.neutralSkip()">
+            <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+        </button>
+        <button class="fp-btn fp-btn-sm" id="fpShuffleBtn" onclick="window._app.toggleShuffle()">
+            <svg viewBox="0 0 24 24"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
+        </button>
+    </div>
+    <div class="fp-actions">
+        <div class="fp-fav-btn" id="fpFavBtn" onclick="window._app.toggleFavorite()">&#9825;</div>
+        <button class="fp-btn fp-btn-sm" onclick="window._app.next()" title="Dislike skip">
+            <svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>
+        </button>
+        <button class="fp-btn fp-btn-sm" onclick="window._app.goToQueue()">
+            <svg viewBox="0 0 24 24"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
+        </button>
+    </div>
+</div>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
