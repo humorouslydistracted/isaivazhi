@@ -1,5 +1,7 @@
 # IsaiVazhi
 
+An offline-first Android music player that learns from how you actually listen -- no accounts, no streaming, no tracking.
+
 An offline-first Android music player with AI-powered recommendations driven by CLAP audio embeddings. The app learns what you actually listen to — plays, skips, favorites, dislikes — and uses that, plus audio-similarity via precomputed embeddings, to surface Discover, Taste Signal, and dynamic Up Next feeds.
 
 Built as a Capacitor hybrid: the UI and recommendation engine are plain HTML/CSS/JS, and the media-playback, notification, lockscreen, and background paths are native Android (Java) on top of Android `MediaSession`.
