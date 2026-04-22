@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import android.Manifest;
 import android.content.pm.PackageManager;

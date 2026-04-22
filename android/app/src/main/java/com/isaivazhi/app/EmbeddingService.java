@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import android.content.Context;
 import android.media.MediaCodec;

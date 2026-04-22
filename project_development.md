@@ -121,8 +121,8 @@ APK output:
   - focused manual playback / Discover / media-control checks on device
 
 ### App Identity
-- Display name is `Music App`.
-- Android package / app id remains `com.musicplayer.app.test`.
+- Display name is `IsaiVazhi`.
+- Android package / app id is `com.isaivazhi.app`.
 - A future package-id rename would be a real migration decision, not just a cosmetic label change.
 
 ### Playback And Listen Capture
@@ -239,7 +239,7 @@ APK output:
 
 ### Bluetooth And Background Playback
 - The playback service now seeds friendly app metadata before the first track metadata arrives.
-- Media session and notification use the app display name (`Music App`) and share a consistent content intent.
+- Media session and notification use the app display name (`IsaiVazhi`) and share a consistent content intent.
 - Audio focus is tracked explicitly across request / gain / loss / abandon.
 - Notification and media-session metadata now fall back to app-name metadata when track metadata is missing.
 - Lockscreen and notification player now expose app-wired `favorite` and `close` actions.
@@ -248,8 +248,7 @@ APK output:
 - Notification / lockscreen `close` dismisses the mini player / native player surface instead of only hiding controls.
 - MediaSession custom actions for `favorite` / `close` are now handled natively as well, so Android system media controls (lockscreen / notification shade player) no longer depend on custom notification-view click wiring alone.
 - Remaining limitation:
-  - the package / app id is still `com.musicplayer.app.test`
-  - if a car head unit still shows a package-like identifier after the metadata fixes, the next step would be an explicit package rename / migration decision
+  - if a car head unit still shows a package-like identifier after the metadata fixes, the next step would be checking head-unit caching / metadata refresh behavior on that specific device
 
 ## Latest Verified Changes
 
@@ -309,6 +308,7 @@ APK output:
   - `npm.cmd run test:unit`, `npm.cmd run test:ui`, `npm.cmd run build`, `npx.cmd cap sync android`, `testDebugUnitTest`, and Android `assembleDebug` all succeeded after landing. `:app:connectedDebugAndroidTest` was not re-run (no emulator attached).
 
 - 2026-04-21: `Last 30 Playback Signal Updates` short-skip filter was broadened to match the UI promise. Previously only `action === 'neutral_skip'` entries with fraction ≤ 10% were suppressed — user-initiated path changes (tapping a different tile, section playback, background recovery, native auto-advance) all bypassed the filter and still showed up in the list even when the user had only listened for 1%. The filter now runs inside `_applyRecordedListen` at the `_rememberPlaybackSignalEvent` call site: any skip (`isSkip && fraction ≤ NEUTRAL_SKIP_CAPTURE_THRESHOLD`) is excluded from the per-playback-result timeline regardless of `transitionAction`. Engine state (`state.listened`, profile summary, negative scores, similarity propagation) is still updated so repeat-sampling evidence is preserved; only the render-level event is suppressed. The Taste Signal intro sub text was updated from "Very early neutral skips under 10% listened are not added here" to "Very early skips under 10% listened are not added here".
+- 2026-04-22: App branding and Android identity were renamed for public release. Display name is now `IsaiVazhi`, and Capacitor/Android app id moved from `com.musicplayer.app.test` to `com.isaivazhi.app`. This is a clean identity break on Android, so installs of the older `.test` package do not upgrade in place and old app-private data / embeddings paths are not migrated automatically.
 
 ## Files Most Relevant To Current Behavior
 

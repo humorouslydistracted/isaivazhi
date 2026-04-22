@@ -1,10 +1,10 @@
 # =============================================================================
-# CLAP Embedding Generator for Music Player App
+# CLAP Embedding Generator for IsaiVazhi
 # Run this in Google Colab (GPU runtime recommended for speed)
 #
 # Generates local_embeddings.json compatible with the mobile app.
 # Copy the output file to your phone's app-private folder:
-#   /storage/emulated/0/Android/data/com.musicplayer.app.test/files/
+#   /storage/emulated/0/Android/data/com.isaivazhi.app/files/
 # =============================================================================
 
 # ===== CONFIGURATION - EDIT THESE =====
@@ -307,7 +307,7 @@ print(f"Time: {elapsed/60:.1f} minutes ({elapsed/max(processed, 1):.1f}s per son
 print(f"\nSaved to: {output_path}")
 print(f"\nNext steps:")
 print(f"1. Copy local_embeddings.json to your phone:")
-print(f"   /storage/emulated/0/Android/data/com.musicplayer.app.test/files/")
+print(f"   /storage/emulated/0/Android/data/com.isaivazhi.app/files/")
 print(f"2. If local_embeddings.bin and local_embeddings_meta.json already exist there, delete both so the app rebuilds from JSON.")
 print(f"3. Open the app - embeddings will be loaded automatically")
 print(f"{'='*60}")

@@ -1,4 +1,4 @@
-# Music App
+# IsaiVazhi
 
 An offline-first Android music player with AI-powered recommendations driven by CLAP audio embeddings. The app learns what you actually listen to — plays, skips, favorites, dislikes — and uses that, plus audio-similarity via precomputed embeddings, to surface Discover, Taste Signal, and dynamic Up Next feeds.
 
@@ -76,7 +76,7 @@ The app uses [CLAP](https://github.com/LAION-AI/CLAP) audio embeddings for simil
 4. Run it. It generates `local_embeddings.json` keyed by a hash of the audio file contents.
 5. Copy `local_embeddings.json` to the app's private folder on your phone:
    ```
-   /storage/emulated/0/Android/data/com.musicplayer.app.test/files/
+   /storage/emulated/0/Android/data/com.isaivazhi.app/files/
    ```
 6. Open the app — it'll pick up the embeddings on the next scan.
 
@@ -94,7 +94,7 @@ src/
   logger.js           — shared activity log
   activity-log.js     — rendering helpers for the log UI
 android/
-  app/src/main/java/com/musicplayer/app/
+  app/src/main/java/com/isaivazhi/app/
     MainActivity.java
     MusicPlaybackService.java   — MediaSession, audio focus, notification, transitions
     MusicBridgePlugin.java      — Capacitor <-> native bridge
@@ -113,8 +113,8 @@ project_development_archive.md  — compacted older history
 
 ## Known limitations
 
-- Android package id is `com.musicplayer.app.test` — a relic from development. Renaming it is a real migration, not a cosmetic change.
-- Some car head units may display the package id until the rename happens.
+- Android package id is now `com.isaivazhi.app`. This is a clean Android app-identity break from the older `com.musicplayer.app.test` build, so old installs do not upgrade in place and old app-private data/embeddings paths are not migrated automatically.
+- Some car head units may continue showing cached metadata until Android/head-unit caches refresh.
 - Embeddings pipeline is offline / manual; there's no in-app "regenerate embeddings" button.
 - Only Android is a first-class target. The web build runs but assumes Capacitor `MusicBridge` is mocked or native.
 - The repo does **not** ship the CLAP ONNX model (`android/app/src/main/assets/clap_audio_encoder.onnx{,.data}`, ~285 MB). On-device inference is a stubbed-out path; the supported flow is Colab-generated `local_embeddings.json`. If you want to revive on-device inference, drop your own ONNX export into that assets folder and wire up `EmbeddingService.java`.

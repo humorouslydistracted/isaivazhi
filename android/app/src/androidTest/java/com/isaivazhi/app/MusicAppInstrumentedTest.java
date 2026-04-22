@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import static org.junit.Assert.assertEquals;
 
@@ -16,6 +16,6 @@ public class MusicAppInstrumentedTest {
     @Test
     public void targetContextUsesExpectedPackageName() {
         Context appContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        assertEquals("com.musicplayer.app.test", appContext.getPackageName());
+        assertEquals("com.isaivazhi.app", appContext.getPackageName());
     }
 }

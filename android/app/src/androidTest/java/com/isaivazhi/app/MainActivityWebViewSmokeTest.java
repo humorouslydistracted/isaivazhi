@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;

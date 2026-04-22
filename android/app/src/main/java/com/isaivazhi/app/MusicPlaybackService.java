@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -54,14 +54,14 @@ public class MusicPlaybackService extends Service {
     public static final String RECOVERY_TRANSITIONS_KEY = "recent_transitions";
     private static final int MAX_RECOVERY_TRANSITIONS = 24;
 
-    public static final String ACTION_PLAY = "com.musicplayer.app.PLAY";
-    public static final String ACTION_PAUSE = "com.musicplayer.app.PAUSE";
-    public static final String ACTION_NEXT = "com.musicplayer.app.NEXT";
-    public static final String ACTION_PREV = "com.musicplayer.app.PREV";
-    public static final String ACTION_UPDATE = "com.musicplayer.app.UPDATE";
-    public static final String ACTION_STOP = "com.musicplayer.app.STOP";
-    public static final String ACTION_DISMISS = "com.musicplayer.app.DISMISS";
-    public static final String ACTION_TOGGLE_FAVORITE = "com.musicplayer.app.FAVORITE";
+    public static final String ACTION_PLAY = "com.isaivazhi.app.PLAY";
+    public static final String ACTION_PAUSE = "com.isaivazhi.app.PAUSE";
+    public static final String ACTION_NEXT = "com.isaivazhi.app.NEXT";
+    public static final String ACTION_PREV = "com.isaivazhi.app.PREV";
+    public static final String ACTION_UPDATE = "com.isaivazhi.app.UPDATE";
+    public static final String ACTION_STOP = "com.isaivazhi.app.STOP";
+    public static final String ACTION_DISMISS = "com.isaivazhi.app.DISMISS";
+    public static final String ACTION_TOGGLE_FAVORITE = "com.isaivazhi.app.FAVORITE";
     private static final String CAPACITOR_STORAGE_PREFS = "CapacitorStorage";
     private static final String PREF_KEY_PLAYBACK_STATE = "playback_state";
     private static final String PREF_KEY_FAVORITES = "favorites";
@@ -70,7 +70,7 @@ public class MusicPlaybackService extends Service {
     private MediaSessionCompat mediaSession;
     private PowerManager.WakeLock wakeLock;
     private boolean isPlaying = false;
-    String currentTitle = "Music Player";
+    String currentTitle = "IsaiVazhi";
     String currentArtist = "";
     String currentAlbum = "";
     String currentFilePath = null;
@@ -1706,9 +1706,9 @@ public class MusicPlaybackService extends Service {
     private String getAppDisplayName() {
         try {
             String label = getString(R.string.app_name);
-            return (label != null && !label.isEmpty()) ? label : "Music App";
+            return (label != null && !label.isEmpty()) ? label : "IsaiVazhi";
         } catch (Exception e) {
-            return "Music App";
+            return "IsaiVazhi";
         }
     }
 

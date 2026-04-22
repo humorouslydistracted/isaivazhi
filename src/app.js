@@ -1,5 +1,5 @@
 /**
- * Music Player UI — Capacitor version.
+ * IsaiVazhi UI — Capacitor version.
  * No server fetch calls — all logic runs locally via engine.js.
  */
 

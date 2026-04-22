@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -27,8 +27,8 @@ public class EmbeddingForegroundService extends Service {
     private static final String CHANNEL_ID = "embedding_service";
     private static final int NOTIFICATION_ID = 2;
 
-    public static final String ACTION_START = "com.musicplayer.app.EMBEDDING_START";
-    public static final String ACTION_STOP = "com.musicplayer.app.EMBEDDING_STOP";
+    public static final String ACTION_START = "com.isaivazhi.app.EMBEDDING_START";
+    public static final String ACTION_STOP = "com.isaivazhi.app.EMBEDDING_STOP";
     public static final String EXTRA_PATHS = "paths";
 
     private EmbeddingService embeddingService;

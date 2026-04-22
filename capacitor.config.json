@@ -1,6 +1,6 @@
 {
-  "appId": "com.musicplayer.app.test",
-  "appName": "Music App",
+  "appId": "com.isaivazhi.app",
+  "appName": "IsaiVazhi",
   "webDir": "dist",
   "android": {
     "allowMixedContent": true,

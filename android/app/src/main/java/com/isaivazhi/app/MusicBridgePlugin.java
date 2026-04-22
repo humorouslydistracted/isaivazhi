@@ -1,4 +1,4 @@
-package com.musicplayer.app;
+package com.isaivazhi.app;
 
 import android.Manifest;
 import android.content.ContentResolver;
@@ -886,7 +886,7 @@ public class MusicBridgePlugin extends Plugin {
             call.reject("No path provided");
             return;
         }
-        String title = call.getString("title", "Music Player");
+        String title = call.getString("title", "IsaiVazhi");
         String artist = call.getString("artist", "");
         long seekTo = call.hasOption("seekTo") ? (long)(call.getFloat("seekTo", 0f) * 1000) : 0;
 
@@ -1158,7 +1158,7 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void startPlaybackService(PluginCall call) {
-        String title = call.getString("title", "Music Player");
+        String title = call.getString("title", "IsaiVazhi");
         String artist = call.getString("artist", "");
         boolean isPlaying = call.getBoolean("isPlaying", true);
 
