@@ -1,5 +1,5 @@
 /**
- * Binary-first embedding storage.
+ * Embedding storage with a fast binary runtime cache plus a portable JSON mirror.
  *
  * Stable runtime store:
  *   - local_embeddings.bin
@@ -8,7 +8,7 @@
  * In-progress recovery store:
  *   - pending_embeddings.json
  *
- * Legacy migration input:
+ * Portable interchange / merge file:
  *   - local_embeddings.json
  */
 
@@ -26,35 +26,67 @@ export function setDataDir(dir) {
 }
 
 export async function loadFromDisk() {
-  await recoverPendingToStable();
+  const [stableInfo, legacyInfo, pendingInfo] = await Promise.all([
+    _getStableStoreInfo(),
+    _getFileInfo(LEGACY_JSON),
+    _getFileInfo(PENDING_JSON),
+  ]);
+
+  // Fast path for the first JSON import: avoid pulling a large file over the
+  // JS bridge when there is no binary cache yet and no pending app-side work.
+  if (!stableInfo.exists && legacyInfo.exists && !pendingInfo.exists) {
+    try {
+      const convResult = await MusicBridge.convertEmbeddingsJsonToBinary();
+      if (convResult.success) {
+        console.log(`Native JSON->binary conversion: ${convResult.entries} entries, ${convResult.dim}D`);
+        const migrated = await _loadBinaryStore();
+        if (migrated) return migrated;
+      } else {
+        console.log('No local_embeddings.json available for native conversion:', convResult.reason);
+      }
+    } catch (e) {
+      console.log('Native JSON conversion unavailable:', e.message);
+    }
+  }
 
   const stable = await _loadBinaryStore();
-  if (stable) return stable;
+  const shouldImportLegacy = legacyInfo.exists && (!stableInfo.exists || legacyInfo.lastModified > stableInfo.lastModified);
 
-  try {
-    const convResult = await MusicBridge.convertEmbeddingsJsonToBinary();
-    if (convResult.success) {
-      console.log(`Native JSON→binary conversion: ${convResult.entries} entries, ${convResult.dim}D`);
-      const migrated = await _loadBinaryStore();
-      if (migrated) return migrated;
-    } else {
-      console.log('No legacy local embeddings JSON to convert:', convResult.reason);
+  let merged = stable ? _normalizeEmbeddingObject(stable) : { _path_index: {} };
+  let changed = false;
+
+  if (shouldImportLegacy) {
+    const legacy = await _readEmbeddingsJson(LEGACY_JSON);
+    if (legacy) {
+      merged = _mergeEmbeddingObjects(merged, legacy);
+      changed = true;
+      console.log('Imported local_embeddings.json into the stable store');
     }
-  } catch (e) {
-    console.log('Native JSON conversion unavailable:', e.message);
   }
 
-  const legacy = await _readEmbeddingsJson(LEGACY_JSON);
-  if (legacy) {
-    await saveToDisk(legacy);
-    return legacy;
+  const pending = await _readEmbeddingsJson(PENDING_JSON);
+  const pendingCount = _countEmbeddings(pending);
+  if (pendingCount > 0) {
+    merged = _mergeEmbeddingObjects(merged, pending);
+    changed = true;
+    console.log(`Recovered ${pendingCount} pending embeddings into the stable store`);
   }
 
+  if (changed) {
+    await saveToDisk(merged);
+    if (pendingCount > 0) {
+      await _clearPending();
+    }
+    return merged;
+  }
+
+  if (stable) return stable;
   return null;
 }
 
 export async function saveToDisk(embObj) {
   const normalized = _normalizeEmbeddingObject(embObj);
+  await _writeLegacyJson(normalized);
   await _writeBinaryStore(normalized);
 }
 
@@ -70,9 +102,9 @@ export async function recoverPendingToStable() {
 
   const stable = (await _loadBinaryStore()) || { _path_index: {} };
   const merged = _mergeEmbeddingObjects(stable, pending);
-  await _writeBinaryStore(merged);
+  await saveToDisk(merged);
   await _clearPending();
-  console.log(`Recovered ${pendingCount} pending embeddings into stable binary store`);
+  console.log(`Recovered ${pendingCount} pending embeddings into stable store + local_embeddings.json mirror`);
   return true;
 }
 
@@ -174,6 +206,17 @@ async function _writeBinaryStore(embObj) {
   console.log(`Wrote stable binary store: ${entries.length} entries, ${dim}d`);
 }
 
+async function _writeLegacyJson(embObj) {
+  const normalized = _normalizeEmbeddingObject(embObj);
+  const tmpJson = _path(`${LEGACY_JSON}.tmp`);
+  await MusicBridge.writeTextFile({
+    path: tmpJson,
+    content: JSON.stringify(normalized),
+  });
+  await _replaceFile(tmpJson, _path(LEGACY_JSON));
+  console.log(`Wrote local_embeddings.json mirror: ${_countEmbeddings(normalized)} entries`);
+}
+
 async function _readEmbeddingsJson(filename) {
   try {
     const result = await MusicBridge.readTextFile({ path: _path(filename) });
@@ -189,7 +232,7 @@ async function _readEmbeddingsJson(filename) {
 }
 
 function _normalizeEmbeddingObject(embObj) {
-  const normalized = { _path_index: embObj._path_index || {} };
+  const normalized = { _path_index: embObj && embObj._path_index ? embObj._path_index : {} };
   for (const [key, data] of Object.entries(embObj || {})) {
     if (key === '_path_index') continue;
     if (!data || !Array.isArray(data.embedding) || data.embedding.length === 0) continue;
@@ -253,6 +296,29 @@ async function _replaceFile(fromPath, toPath) {
 
 async function _deleteIfExists(filename) {
   await MusicBridge.deleteFile({ path: _path(filename) }).catch(() => {});
+}
+
+async function _getStableStoreInfo() {
+  const [binInfo, metaInfo] = await Promise.all([
+    _getFileInfo(STABLE_BIN),
+    _getFileInfo(STABLE_META),
+  ]);
+  return {
+    exists: binInfo.exists && metaInfo.exists,
+    lastModified: Math.max(binInfo.lastModified, metaInfo.lastModified),
+  };
+}
+
+async function _getFileInfo(filename) {
+  try {
+    const result = await MusicBridge.getFileModified({ path: _path(filename) });
+    return {
+      exists: !!(result && result.exists),
+      lastModified: Number(result && result.lastModified) || 0,
+    };
+  } catch (e) {
+    return { exists: false, lastModified: 0 };
+  }
 }
 
 function _path(filename) {

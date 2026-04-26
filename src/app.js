@@ -68,15 +68,23 @@ let _initRestoreComplete = false; // true after restorePlaybackState resolves
 let _quickRestoreInfo = null; // cached song info for UI only; not used as a playback source
 let _miniPlayerFromQuickDisplay = false; // mini player was shown from quickDisplay; keep visible even if engine restore returned null (library not ready yet)
 let _startupPlaybackTouched = false; // user started playback before startup restore finished
+let _pendingStartupResume = false; // play was tapped before authoritative restore completed
 let _aiHydrationState = 'cold'; // cold -> playback_ready -> ai_hydrating -> ai_ready
 let _scanCompleted = false;
 let _embeddingsReadyEvent = false;
 let _aiReadyCommitted = false;
+let _lastPlaybackIntentAt = 0;
 let _lastPlaybackPersistAt = 0;
 let _lastPlaybackPersistPos = -1;
 let _nativeAudioEventsBound = false;
 const NAV_GUARD_MS = 320;
+const STARTUP_AI_HYDRATION_DELAY_MS = 1500;
+const PLAY_INTENT_AI_DEFER_MS = 4000;
 const _lastNavAtByKind = { next: 0, prev: 0 };
+
+function _notePlaybackIntent() {
+  _lastPlaybackIntentAt = Date.now();
+}
 
 function _shouldBlockRapidNav(kind) {
   const now = Date.now();
@@ -489,15 +497,24 @@ function _setAiHydrationState(next) {
 }
 
 function _scheduleBackgroundHydration() {
-  _setAiHydrationState('ai_hydrating');
   const start = () => {
+    const recentPlaybackIntentAge = _lastPlaybackIntentAt > 0 ? (Date.now() - _lastPlaybackIntentAt) : Infinity;
+    if (_pendingStartupResume || recentPlaybackIntentAge < PLAY_INTENT_AI_DEFER_MS) {
+      const remaining = _pendingStartupResume
+        ? 350
+        : Math.max(350, PLAY_INTENT_AI_DEFER_MS - recentPlaybackIntentAge);
+      _dbg('init: background scan deferred ' + remaining + 'ms after playback intent');
+      setTimeout(start, remaining);
+      return;
+    }
+    _setAiHydrationState('ai_hydrating');
     engine.startBackgroundScan();
     _dbg('init: background scan started');
   };
   if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => setTimeout(start, 120));
+    requestAnimationFrame(() => setTimeout(start, STARTUP_AI_HYDRATION_DELAY_MS));
   } else {
-    setTimeout(start, 120);
+    setTimeout(start, STARTUP_AI_HYDRATION_DELAY_MS);
   }
 }
 
@@ -808,10 +825,24 @@ async function init() {
             _dbg('init: native session was in completed state, forcing cold restore path');
           }
         }
+        if (_pendingStartupResume && !nativeHasUsableSession && displaySong.filePath && !nativeFileLoaded) {
+          _pendingStartupResume = false;
+          _dbg('init: honoring queued startup resume tap');
+          await loadAndPlay({
+            id: displaySong.id,
+            title: displaySong.title,
+            artist: displaySong.artist,
+            album: displaySong.album,
+            filename: displaySong.filename,
+            filePath: displaySong.filePath,
+            isFavorite: displaySong.isFavorite || false,
+          }, restored.currentTime || nativeAudioPos || 0);
+        }
       }
     }
     _quickRestoreInfo = null; // full restore done, no longer needed
     _initRestoreComplete = true;
+    _pendingStartupResume = false;
     _setAiHydrationState('playback_ready');
     _dbg('init: READY — currentSong=' + currentSong + ' initComplete=true');
 
@@ -846,6 +877,19 @@ async function init() {
             updateHeartIcon(currentIsFav);
             _miniPlayerFromQuickDisplay = false;
             _dbg('scanComplete: retry restore OK id=' + retried.id);
+            if (_pendingStartupResume && retried.filePath && !nativeFileLoaded) {
+              _pendingStartupResume = false;
+              _dbg('scanComplete: honoring queued startup resume tap');
+              await loadAndPlay({
+                id: retried.id,
+                title: retried.title,
+                artist: retried.artist,
+                album: retried.album,
+                filename: retried.filename,
+                filePath: retried.filePath,
+                isFavorite: retried.isFavorite || false,
+              }, retried.currentTime || nativeAudioPos || 0);
+            }
           } else {
             _dbg('scanComplete: retry restore still null, keeping quickDisplay shim');
           }
@@ -1248,6 +1292,8 @@ function updateEmbeddingStatus() {
 // restore them across re-renders (ISSUE-11).
 const _embDetailExpanded = {
   unmatched: false,
+  unmatchedConfirm: false,
+  orphanConfirm: false,
   removed: false,
   pending: false,
   pendingNew: false,
@@ -1255,6 +1301,7 @@ const _embDetailExpanded = {
   pendingReembed: false,
 };
 let _embLogTab = 'common';
+let _embDetailScrollTargetId = null;
 let _tastePlaybackExpanded = false;
 let _tasteEngineExpanded = false;
 let _tasteLogsExpanded = false;
@@ -1475,6 +1522,8 @@ function showEmbeddingDetail() {
   const st = engine.getEmbeddingStatus();
   const panel = document.getElementById('panel-discover');
   const wasDetailOpen = !!panel.querySelector('.emb-detail-page');
+  const embScrollTargetId = _embDetailScrollTargetId;
+  _embDetailScrollTargetId = null;
   // Only save backup on first open, not on live refreshes
   if (!wasDetailOpen) {
     discoverContentBackup = panel.innerHTML;
@@ -1535,22 +1584,24 @@ function showEmbeddingDetail() {
 
   // Unmatched songs list (collapsible) — ISSUE-14
   const unmatchedListHtml = unmatched.length > 0
-    ? `<div id="unmatchedSongsList" class="emb-song-list" style="display:${disp(_embDetailExpanded.unmatched)};">
-        <div class="emb-song-item" style="color:var(--text3);font-size:11px;line-height:1.4;">
-          "Unmatched" means your imported (e.g. Colab) embeddings reference songs that aren't on this device —
-          they may have been renamed, moved, or never copied over. They take up space but can't be used.
+    ? `<div style="display:${disp(_embDetailExpanded.unmatched)};">
+        <div id="unmatchedSongsList" class="emb-song-list">
+          <div class="emb-song-item" style="color:var(--text3);font-size:11px;line-height:1.4;">
+            "Unmatched" means your imported (e.g. Colab) embeddings reference songs that aren't on this device —
+            they may have been renamed, moved, or never copied over. They take up space but can't be used.
+          </div>
+          ${unmatched.map(u =>
+            `<div class="emb-song-item"><span class="orange-dot-inline"></span> ${esc(u.filename)} <span class="emb-song-artist">— ${esc(u.artist)}${u.filepath ? ' (' + esc(u.filepath) + ')' : ''}</span></div>`
+          ).join('')}
         </div>
-        ${unmatched.map(u =>
-          `<div class="emb-song-item"><span class="orange-dot-inline"></span> ${esc(u.filename)} <span class="emb-song-artist">— ${esc(u.artist)}${u.filepath ? ' (' + esc(u.filepath) + ')' : ''}</span></div>`
-        ).join('')}
-        <div id="unmatchedConfirm" style="display:none;">
+        <div id="unmatchedConfirm" style="display:${disp(_embDetailExpanded.unmatchedConfirm)};">
           <div class="emb-confirm-msg">Remove ${unmatched.length} unmatched embeddings? This cannot be undone.</div>
           <div class="emb-confirm-btns">
             <button class="emb-confirm-yes" onclick="window._app.confirmRemoveUnmatched()">Yes, Remove</button>
-            <button class="emb-confirm-no" onclick="document.getElementById('unmatchedConfirm').style.display='none'">Cancel</button>
+            <button class="emb-confirm-no" onclick="window._app.setEmbConfirm('unmatchedConfirm', false)">Cancel</button>
           </div>
         </div>
-        <button class="emb-orphan-btn" onclick="document.getElementById('unmatchedConfirm').style.display='block'">Remove ${unmatched.length} Unmatched Embeddings</button>
+        <button class="emb-orphan-btn" onclick="window._app.setEmbConfirm('unmatchedConfirm', true)">Remove ${unmatched.length} Unmatched Embeddings</button>
       </div>`
     : '';
 
@@ -1641,14 +1692,14 @@ function showEmbeddingDetail() {
         <div class="emb-song-list">${engine.getOrphanedSongs().map(s =>
           `<div class="emb-song-item"><span class="orphan-dot-inline"></span> ${esc(s.title)} <span class="emb-song-artist">— ${esc(s.artist)}</span></div>`
         ).join('')}</div>
-        <div id="orphanConfirm" style="display:none;">
+        <div id="orphanConfirm" style="display:${disp(_embDetailExpanded.orphanConfirm)};">
           <div class="emb-confirm-msg">Remove ${st.orphanCount} orphaned embeddings? This cannot be undone.</div>
           <div class="emb-confirm-btns">
             <button class="emb-confirm-yes" onclick="window._app.confirmRemoveOrphans()">Yes, Remove</button>
-            <button class="emb-confirm-no" onclick="document.getElementById('orphanConfirm').style.display='none'">Cancel</button>
+            <button class="emb-confirm-no" onclick="window._app.setEmbConfirm('orphanConfirm', false)">Cancel</button>
           </div>
         </div>
-        <button class="emb-orphan-btn" onclick="document.getElementById('orphanConfirm').style.display='block'">Remove ${st.orphanCount} Orphaned Embeddings</button>
+        <button class="emb-orphan-btn" onclick="window._app.setEmbConfirm('orphanConfirm', true)">Remove ${st.orphanCount} Orphaned Embeddings</button>
       </div>` : ''}
 
       <div class="emb-section-title">Logs</div>
@@ -1670,6 +1721,12 @@ function showEmbeddingDetail() {
     </div>
   `;
 
+  const focusScrollTarget = () => {
+    if (!embScrollTargetId) return;
+    const target = document.getElementById(embScrollTargetId);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+
   if (_embScrollState) {
     requestAnimationFrame(() => {
       const restoreScroll = () => {
@@ -1682,20 +1739,38 @@ function showEmbeddingDetail() {
         if (activityEl) activityEl.scrollTop = _embScrollState.activityLog || 0;
       };
       restoreScroll();
-      requestAnimationFrame(restoreScroll);
+      requestAnimationFrame(() => {
+        restoreScroll();
+        focusScrollTarget();
+      });
     });
+  } else if (embScrollTargetId) {
+    requestAnimationFrame(focusScrollTarget);
   }
 }
 
 function _embToggleSection(key) {
   // Independent toggles now (not exclusive accordion) — needed for nested
   // pending sub-actions. Re-render the detail page so headers update too.
+  if (key === 'unmatched' && _embDetailExpanded.unmatched) {
+    _embDetailExpanded.unmatchedConfirm = false;
+  }
   _embDetailExpanded[key] = !_embDetailExpanded[key];
   showEmbeddingDetail();
 }
 
 function _setEmbLogTab(tab) {
   _embLogTab = tab === 'embeddings' ? 'embeddings' : 'common';
+  showEmbeddingDetail();
+}
+
+function _setEmbConfirm(key, open) {
+  if (key !== 'unmatchedConfirm' && key !== 'orphanConfirm') return;
+  if (key === 'unmatchedConfirm' && open) {
+    _embDetailExpanded.unmatched = true;
+  }
+  _embDetailExpanded[key] = !!open;
+  _embDetailScrollTargetId = open ? key : null;
   showEmbeddingDetail();
 }
 
@@ -2932,6 +3007,8 @@ function setupNativeAudioEvents() {
         } catch (e) {
           console.warn('markSongMissingByPath failed:', e && e.message || e);
         }
+      } else {
+        showStatusToast('Playback error: ' + String(err || 'unknown error').slice(0, 80), 3000);
       }
     });
   } catch (e) {
@@ -3001,6 +3078,7 @@ function setupNativeMediaListener() {
         nativePlaybackInstanceId = 0;
         currentSong = null;
         currentIsFav = false;
+        _miniPlayerFromQuickDisplay = false;
         closeFullPlayer();
         updateHeartIcon(false);
         updatePlayIcon(true);
@@ -3055,6 +3133,9 @@ function setupPositionPersistence() {
 
 function setupEmbeddingUI() {
   try {
+    let embUiRefreshTimer = null;
+    let embUiRefreshDiscover = false;
+
     const refreshIfOnDetailPage = () => {
       // If the detail page is currently showing, refresh it live
       const panel = document.getElementById('panel-discover');
@@ -3063,26 +3144,34 @@ function setupEmbeddingUI() {
       }
     };
 
+    const scheduleEmbeddingUiRefresh = ({ delay = 120, refreshDiscover = false } = {}) => {
+      embUiRefreshDiscover = embUiRefreshDiscover || refreshDiscover;
+      if (embUiRefreshTimer) return;
+      embUiRefreshTimer = setTimeout(() => {
+        embUiRefreshTimer = null;
+        const shouldRefreshDiscover = embUiRefreshDiscover;
+        embUiRefreshDiscover = false;
+        updateEmbeddingStatus();
+        refreshIfOnDetailPage();
+        if (shouldRefreshDiscover && activeTab === 'discover' && !_isOnSubPage()) {
+          refreshDiscoverPrimaryState();
+        }
+      }, delay);
+    };
+
     MusicBridge.addListener('embeddingProgress', () => {
-      updateEmbeddingStatus();
-      refreshIfOnDetailPage();
+      scheduleEmbeddingUiRefresh();
     });
     MusicBridge.addListener('embeddingSongComplete', () => {
-      updateEmbeddingStatus();
-      refreshIfOnDetailPage();
+      scheduleEmbeddingUiRefresh();
     });
     MusicBridge.addListener('embeddingComplete', (data) => {
       _dbg('native embeddingComplete: processed=' + (data && data.processed) + ' failed=' + (data && data.failed) + ' currentSong=' + currentSong + ' nativeAudioPlaying=' + nativeAudioPlaying);
       // Delay slightly to let engine handler finish async work
-      setTimeout(() => {
-        updateEmbeddingStatus();
-        refreshIfOnDetailPage();
-        if (activeTab === 'discover' && !_isOnSubPage()) refreshDiscoverPrimaryState();
-      }, 300);
+      scheduleEmbeddingUiRefresh({ delay: 300, refreshDiscover: true });
     });
     MusicBridge.addListener('embeddingError', () => {
-      updateEmbeddingStatus();
-      refreshIfOnDetailPage();
+      scheduleEmbeddingUiRefresh();
     });
 
     // Auto-refresh detail page every 2s while it's open (catches missed events)
@@ -3720,6 +3809,7 @@ async function loadAndPlay(songInfo, seekToSec) {
         updatePlayIcon(false);
       } catch (e2) {
         console.error('Native play retry also failed:', e2);
+        showStatusToast('Playback failed. Please try again.', 2200);
       }
     }
   } else {
@@ -3767,6 +3857,7 @@ async function syncUpcomingNativeQueue() {
 
 async function playSongUI(id, source) {
   if (!source) source = 'manual_' + activeTab + '_tab';
+  _notePlaybackIntent();
   // If the tapped song is already the currently playing song, don't restart it.
   // Open the full player instead so the tap feels intentional.
   if (id === currentSong && nativeAudioPlaying) {
@@ -3903,6 +3994,7 @@ async function playOnlyUI(songId) {
 
 async function togglePauseUI() {
   try {
+    _notePlaybackIntent();
     _dbg('PLAY-TAP: playing=' + nativeAudioPlaying + ' loaded=' + nativeFileLoaded + ' cur=' + currentSong + ' quick=' + !!_quickRestoreInfo + ' init=' + _initRestoreComplete);
 
     if (nativeAudioPlaying) {
@@ -3931,6 +4023,7 @@ async function togglePauseUI() {
         _dbg('PLAY: song has no filePath!');
       }
     } else if (!_initRestoreComplete && _quickRestoreInfo) {
+      _pendingStartupResume = true;
       _dbg('PLAY: waiting for authoritative restore');
       showStatusToast('Restoring playback...', 1200);
     } else if (!nativeFileLoaded && currentSong == null) {
@@ -5012,6 +5105,7 @@ window._app = {
   toggleSection: toggleSectionUI,
   clearSearch,
   showEmbeddingDetail,
+  setEmbConfirm: _setEmbConfirm,
   retryEmbedding: () => { engine.retryEmbedding(); showEmbeddingDetail(); },
   embedNewPending: () => { engine.retryEmbedding(); showEmbeddingDetail(); },
   embedRemovedPending: () => {
@@ -5026,8 +5120,14 @@ window._app = {
     showEmbeddingDetail();
   },
   stopEmbedding: () => { engine.stopEmbedding(); setTimeout(showEmbeddingDetail, 1000); },
-  confirmRemoveOrphans: () => { const n = engine.removeOrphanedEmbeddings(); console.log(`Removed ${n} orphaned embeddings`); showEmbeddingDetail(); },
+  confirmRemoveOrphans: () => {
+    _embDetailExpanded.orphanConfirm = false;
+    const n = engine.removeOrphanedEmbeddings();
+    console.log(`Removed ${n} orphaned embeddings`);
+    showEmbeddingDetail();
+  },
   confirmRemoveUnmatched: async () => {
+    _embDetailExpanded.unmatchedConfirm = false;
     const n = await engine.removeUnmatchedEmbeddings();
     _embDetailExpanded.unmatched = false;
     showStatusToast(n > 0 ? `Removed ${n} unmatched embeddings` : 'No unmatched embeddings to remove', 1500);

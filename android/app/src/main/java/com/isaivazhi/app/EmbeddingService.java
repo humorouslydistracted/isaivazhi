@@ -1,6 +1,9 @@
 package com.isaivazhi.app;
 
 import android.content.Context;
+import android.os.Build;
+import android.os.PowerManager;
+import android.os.SystemClock;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
@@ -56,23 +59,51 @@ public class EmbeddingService {
     private static final int WINDOW_SAMPLES = TARGET_SAMPLE_RATE * WINDOW_SECONDS; // 480,000
     private static final float[] WINDOW_POSITIONS = {0.20f, 0.50f, 0.80f};
     private static final int EMBEDDING_DIM = 512;
+    private static final int DEFAULT_ORT_THREADS = 2;
+    private static final int PLAYBACK_FRIENDLY_ORT_THREADS = 1;
+    private static final int ACTIVE_PLAYBACK_YIELD_MS = 120;
+    private static final int COOLDOWN_YIELD_MS = 450;
+    private static final int POWER_SAVE_YIELD_MS = 350;
+    private static final int THERMAL_MODERATE_YIELD_MS = 700;
+    private static final int THERMAL_SEVERE_YIELD_MS = 2000;
+    private static final int MAX_RESPONSIVE_SLEEP_SLICE_MS = 120;
 
     private OrtEnvironment ortEnv;
     private OrtSession ortSession;
     private Context context;
+    private final PlaybackActivityProvider playbackActivityProvider;
+    private String modelFilePath;
+    private int currentOrtThreads = 0;
     private boolean isInitialized = false;
     private volatile boolean cancelled = false;
 
     // Callback for progress/completion
+    public interface PlaybackActivityProvider {
+        boolean isPlaybackActive();
+
+        default long getCooldownUntilElapsedMs() {
+            return 0L;
+        }
+
+        default String getThrottleReason() {
+            return "";
+        }
+    }
+
     public interface EmbeddingCallback {
         void onProgress(String filename, String filepath, int current, int total);
-        void onSongComplete(String filename, String filepath, float[] embedding, String contentHash);
+        void onSongComplete(String filename, String filepath, String contentHash);
         void onComplete(int totalProcessed, int failed);
         void onError(String message, String filepath);
     }
 
     public EmbeddingService(Context context) {
+        this(context, null);
+    }
+
+    public EmbeddingService(Context context, PlaybackActivityProvider playbackActivityProvider) {
         this.context = context;
+        this.playbackActivityProvider = playbackActivityProvider;
         // Use app-private external storage — no permissions needed, works on GrapheneOS
         File extDir = context.getExternalFilesDir(null);
         if (extDir == null) extDir = context.getFilesDir();
@@ -87,12 +118,12 @@ public class EmbeddingService {
     public String getLastError() { return lastError; }
 
     public synchronized boolean initialize() {
-        if (isInitialized) return true;
-
         try {
-            Log.i(TAG, "Initializing ONNX Runtime...");
-            ortEnv = OrtEnvironment.getEnvironment();
-            Log.i(TAG, "ORT environment created");
+            if (ortEnv == null) {
+                Log.i(TAG, "Initializing ONNX Runtime...");
+                ortEnv = OrtEnvironment.getEnvironment();
+                Log.i(TAG, "ORT environment created");
+            }
 
             // ONNX models with external data need filesystem paths (not asset streams).
             // Extract both .onnx and .onnx.data from assets to internal storage.
@@ -107,20 +138,53 @@ public class EmbeddingService {
             extractAssetIfNeeded(ONNX_MODEL_FILENAME + ".data", dataFile);
 
             Log.i(TAG, "Model files ready: " + modelFile.length() + " bytes (graph), " + dataFile.length() + " bytes (weights)");
+            modelFilePath = modelFile.getAbsolutePath();
 
-            OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-            opts.setIntraOpNumThreads(2);
-            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-
-            // Load from filesystem path so ONNX can find the .data file
-            ortSession = ortEnv.createSession(modelFile.getAbsolutePath(), opts);
-            isInitialized = true;
-            Log.i(TAG, "ONNX session created successfully");
-            return true;
+            return ensureOrtSessionForCurrentPolicy();
 
         } catch (Exception e) {
             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
             Log.e(TAG, "Failed to initialize ONNX", e);
+            return false;
+        }
+    }
+
+    private synchronized boolean ensureOrtSessionForCurrentPolicy() {
+        try {
+            if (ortEnv == null || modelFilePath == null) {
+                return initialize();
+            }
+
+            int desiredThreads = getDesiredOrtThreads();
+            if (isInitialized && ortSession != null && currentOrtThreads == desiredThreads) {
+                return true;
+            }
+
+            if (ortSession != null) {
+                try {
+                    ortSession.close();
+                } catch (Exception e) {
+                    Log.w(TAG, "Error closing old ONNX session before policy switch", e);
+                }
+                ortSession = null;
+            }
+
+            OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+            opts.setIntraOpNumThreads(desiredThreads);
+            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+
+            // Load from filesystem path so ONNX can find the .data file.
+            ortSession = ortEnv.createSession(modelFilePath, opts);
+            isInitialized = true;
+            currentOrtThreads = desiredThreads;
+            Log.i(TAG, "ONNX session ready (threads=" + desiredThreads
+                    + ", reason=" + getCurrentThrottleReason() + ")");
+            return true;
+        } catch (Exception e) {
+            lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
+            Log.e(TAG, "Failed to prepare ONNX session", e);
+            isInitialized = false;
+            currentOrtThreads = 0;
             return false;
         }
     }
@@ -155,6 +219,8 @@ public class EmbeddingService {
             Log.e(TAG, "Error releasing ONNX: " + e.getMessage());
         }
         isInitialized = false;
+        currentOrtThreads = 0;
+        modelFilePath = null;
     }
 
     /**
@@ -169,6 +235,8 @@ public class EmbeddingService {
     public void embedSongs(List<String> filePaths, EmbeddingCallback callback) {
         cancelled = false;
         new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+
             if (!initialize()) {
                 callback.onError("Failed to initialize ONNX Runtime: " + lastError, null);
                 return;
@@ -192,13 +260,27 @@ public class EmbeddingService {
 
                 callback.onProgress(filename, path, i + 1, filePaths.size());
 
+                if (isPathAlreadyEmbedded(localEmbeddings, path)) {
+                    Log.i(TAG, "Skipping already-embedded path during resume: " + filename);
+                    continue;
+                }
+
                 try {
                     // Decode audio (memory-capped) — retry once on failure
+                    if (!yieldForPolicy("decode:" + filename)) {
+                        writeLocalEmbeddings(localEmbeddings);
+                        callback.onComplete(processed, failed);
+                        return;
+                    }
                     float[] audioSamples = decodeAudio(path);
                     if (audioSamples == null || audioSamples.length == 0) {
                         Log.w(TAG, "Decode failed, retrying after GC: " + filename);
                         System.gc();
-                        try { Thread.sleep(1000); } catch (InterruptedException ie) { /* ignore */ }
+                        if (!sleepResponsive(1000)) {
+                            writeLocalEmbeddings(localEmbeddings);
+                            callback.onComplete(processed, failed);
+                            return;
+                        }
                         audioSamples = decodeAudio(path);
                     }
                     if (audioSamples == null || audioSamples.length == 0) {
@@ -217,14 +299,35 @@ public class EmbeddingService {
 
                     // Run ONNX inference on each window
                     List<float[]> windowEmbeddings = new ArrayList<>();
+                    boolean inferenceSetupFailed = false;
                     for (int w = 0; w < windows.size(); w++) {
+                        if (!yieldForPolicy("window_" + (w + 1) + "_inference:" + filename)) {
+                            writeLocalEmbeddings(localEmbeddings);
+                            callback.onComplete(processed, failed);
+                            return;
+                        }
+                        if (!ensureOrtSessionForCurrentPolicy()) {
+                            callback.onError("Failed to prepare ONNX Runtime: " + lastError, path);
+                            failed++;
+                            inferenceSetupFailed = true;
+                            break;
+                        }
                         float[] emb = runInference(windows.get(w));
                         if (emb != null) {
                             windowEmbeddings.add(emb);
                         }
                         windows.set(w, null); // release window after inference
+                        if (!yieldForPolicy("window_" + (w + 1) + "_complete:" + filename)) {
+                            writeLocalEmbeddings(localEmbeddings);
+                            callback.onComplete(processed, failed);
+                            return;
+                        }
                     }
                     windows = null;
+
+                    if (inferenceSetupFailed) {
+                        continue;
+                    }
 
                     if (windowEmbeddings.isEmpty()) {
                         Log.w(TAG, "No embeddings produced for: " + filename);
@@ -240,7 +343,7 @@ public class EmbeddingService {
 
                     // Save to pending embeddings with filepath
                     saveEmbedding(localEmbeddings, filename, path, avgEmbedding, contentHash);
-                    callback.onSongComplete(filename, path, avgEmbedding, contentHash);
+                    callback.onSongComplete(filename, path, contentHash);
                     processed++;
 
                     Log.i(TAG, "Embedded: " + filename + " (" + (i + 1) + "/" + filePaths.size() + ")");
@@ -251,8 +354,13 @@ public class EmbeddingService {
                     failed++;
                 }
 
-                // GC after every song to reclaim decoded audio memory before next decode
-                System.gc();
+                // Avoid periodic explicit GC; it is a stop-the-world pause.
+                // The retry-time GC above remains only for actual decode pressure.
+                if (!yieldForPolicy("song_complete:" + filename)) {
+                    writeLocalEmbeddings(localEmbeddings);
+                    callback.onComplete(processed, failed);
+                    return;
+                }
 
                 // Save incrementally every 5 songs
                 if ((i + 1) % 5 == 0 || (i + 1) == filePaths.size()) {
@@ -267,6 +375,110 @@ public class EmbeddingService {
             Log.i(TAG, "Embedding complete: " + processed + " processed, " + failed + " failed");
 
         }, "EmbeddingWorker").start();
+    }
+
+    private boolean isPlaybackActive() {
+        try {
+            if (playbackActivityProvider != null) {
+                return playbackActivityProvider.isPlaybackActive();
+            }
+            return MusicPlaybackService.instance != null && MusicPlaybackService.instance.isCurrentlyPlaying();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private long getPlaybackCooldownUntilElapsedMs() {
+        try {
+            return playbackActivityProvider != null ? playbackActivityProvider.getCooldownUntilElapsedMs() : 0L;
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    private boolean isInPlaybackCooldown() {
+        return getPlaybackCooldownUntilElapsedMs() > SystemClock.elapsedRealtime();
+    }
+
+    private String getCurrentThrottleReason() {
+        try {
+            String reason = playbackActivityProvider != null ? playbackActivityProvider.getThrottleReason() : "";
+            if (reason != null && !reason.isEmpty()) return reason;
+        } catch (Exception e) {
+            // ignore
+        }
+        if (isInPlaybackCooldown()) return "playback_cooldown";
+        if (isPlaybackActive()) return "playback_active";
+        if (getDevicePressureDelayMs() > 0) return "device_pressure";
+        return "normal";
+    }
+
+    private int getDesiredOrtThreads() {
+        return (isPlaybackActive() || isInPlaybackCooldown() || getDevicePressureDelayMs() > 0)
+                ? PLAYBACK_FRIENDLY_ORT_THREADS
+                : DEFAULT_ORT_THREADS;
+    }
+
+    private int getDevicePressureDelayMs() {
+        try {
+            PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+            int delay = 0;
+            if (pm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && pm.isPowerSaveMode()) {
+                delay = Math.max(delay, POWER_SAVE_YIELD_MS);
+            }
+            if (pm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                int thermalStatus = pm.getCurrentThermalStatus();
+                if (thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE) {
+                    delay = Math.max(delay, THERMAL_SEVERE_YIELD_MS);
+                } else if (thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE) {
+                    delay = Math.max(delay, THERMAL_MODERATE_YIELD_MS);
+                }
+            }
+            return delay;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private int getPolicyYieldMs() {
+        int delay = getDevicePressureDelayMs();
+        long cooldownRemaining = getPlaybackCooldownUntilElapsedMs() - SystemClock.elapsedRealtime();
+        if (cooldownRemaining > 0L) {
+            delay = Math.max(delay, COOLDOWN_YIELD_MS);
+        }
+        if (isPlaybackActive()) {
+            delay = Math.max(delay, ACTIVE_PLAYBACK_YIELD_MS);
+        }
+        return delay;
+    }
+
+    private boolean yieldForPolicy(String stage) {
+        if (cancelled) return false;
+
+        int delayMs = getPolicyYieldMs();
+        if (delayMs <= 0) {
+            Thread.yield();
+            return !cancelled;
+        }
+
+        Log.d(TAG, "Yielding " + delayMs + "ms before/after " + stage
+                + " (reason=" + getCurrentThrottleReason() + ")");
+        return sleepResponsive(delayMs);
+    }
+
+    private boolean sleepResponsive(int totalMs) {
+        int remaining = Math.max(0, totalMs);
+        while (remaining > 0 && !cancelled) {
+            int slice = Math.min(remaining, MAX_RESPONSIVE_SLEEP_SLICE_MS);
+            try {
+                Thread.sleep(slice);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            remaining -= slice;
+        }
+        return !cancelled;
     }
 
     /**
@@ -558,6 +770,9 @@ public class EmbeddingService {
      */
     private float[] runInference(float[] window) {
         try {
+            if (!ensureOrtSessionForCurrentPolicy()) {
+                return null;
+            }
             // Create input tensor: shape [1, 480000]
             float[][] input2d = new float[1][WINDOW_SAMPLES];
             System.arraycopy(window, 0, input2d[0], 0, WINDOW_SAMPLES);
@@ -698,6 +913,20 @@ public class EmbeddingService {
             Log.i(TAG, "Pending embeddings saved: " + localEmbeddings.length() + " entries");
         } catch (Exception e) {
             Log.e(TAG, "Error writing pending embeddings: " + e.getMessage());
+        }
+    }
+
+    private boolean isPathAlreadyEmbedded(JSONObject localEmbeddings, String filepath) {
+        try {
+            if (localEmbeddings == null || filepath == null || filepath.isEmpty()) return false;
+            JSONObject pathIndex = localEmbeddings.optJSONObject("_path_index");
+            if (pathIndex == null) return false;
+            String contentHash = pathIndex.optString(filepath, "");
+            if (contentHash.isEmpty()) return false;
+            JSONObject existing = localEmbeddings.optJSONObject(contentHash);
+            return existing != null && existing.has("embedding");
+        } catch (Exception e) {
+            return false;
         }
     }
 }

@@ -257,6 +257,9 @@ let embeddingQueue = [];        // songs waiting to be embedded
 let localEmbeddings = {};       // filename -> { embedding, contentHash }
 let embeddingLog = [];          // chronological log of embedding events
 let embeddingCurrentFile = '';  // currently processing filename
+let embeddingTotalCount = 0;    // native-reported total items in the active batch
+let embeddingProcessedCount = 0; // native-reported completed items in the active batch
+let embeddingReportedFailedCount = 0; // native-reported failed items in the active batch
 let embeddingFailedPaths = [];  // paths that failed during last run (for retry)
 let embeddingStartTime = null;  // when embedding batch started
 let embeddingPausedByUser = false; // user explicitly stopped — don't auto-restart
@@ -867,6 +870,56 @@ function _recResultsToSongItems(recResults, opts = {}) {
   return _applyRecommendationPolicyToSongItems(items, opts);
 }
 
+function _nativeNearestResultsToSongItems(results, opts = {}) {
+  const pathMap = _getPathMap();
+  const hashMap = {};
+  for (const s of songs) {
+    if (s && s.contentHash && hashMap[s.contentHash] == null) hashMap[s.contentHash] = s.id;
+  }
+  const items = (results || [])
+    .map(item => {
+      const fp = item && (item.filepath || item.filePath);
+      const hash = item && (item.contentHash || item.content_hash);
+      let id = fp ? pathMap[String(fp).toLowerCase()] : null;
+      if (id == null && hash) id = hashMap[hash];
+      return {
+        id,
+        similarity: Number(item && item.similarity) || 0,
+      };
+    })
+    .filter(item => {
+      const song = songs[item.id];
+      return song && song.filePath;
+    });
+  return _applyRecommendationPolicyToSongItems(items, opts);
+}
+
+function _embExcludeToFilepaths(excludeEmbIdx) {
+  const paths = [];
+  for (const embIdx of excludeEmbIdx || []) {
+    const sid = _fastEmbIdxToSongId(embIdx);
+    const song = sid != null && sid >= 0 ? songs[sid] : null;
+    if (song && song.filePath) paths.push(song.filePath);
+  }
+  return paths;
+}
+
+async function _nativeRecommendFromQueryVec(queryVec, limit, excludeEmbIdx = new Set(), opts = {}) {
+  if (!queryVec || typeof MusicBridge.findNearestEmbeddings !== 'function') return [];
+  try {
+    const topK = Math.max(limit || TOP_N, (limit || TOP_N) + (excludeEmbIdx ? excludeEmbIdx.size : 0) + 20);
+    const result = await MusicBridge.findNearestEmbeddings({
+      queryVector: Array.from(queryVec),
+      topK,
+      excludeFilepaths: _embExcludeToFilepaths(excludeEmbIdx),
+    });
+    return _nativeNearestResultsToSongItems(result && result.results, { ...opts, limit });
+  } catch (e) {
+    _embLog('info', `Native similarity unavailable, using JS fallback: ${e && e.message || e}`);
+    return [];
+  }
+}
+
 function _recommendFromQueryVec(queryVec, limit = TOP_N, exclude = null, artistMap = null, currentArtist = null, opts = {}) {
   if (!rec || !queryVec) return [];
   const raw = rec.recommend(queryVec, _getRecommendationPoolSize(limit), exclude, artistMap, currentArtist);
@@ -1401,6 +1454,10 @@ async function loadData() {
 
 function startBackgroundScan(opts) {
   const force = !!(opts && opts.force);
+  _setupEmbeddingListeners();
+  if (typeof MusicBridge.requestEmbeddingStatus === 'function') {
+    MusicBridge.requestEmbeddingStatus().catch(() => {});
+  }
   const embeddingPromise = _loadLocalEmbeddings();
   _backgroundScan(embeddingPromise, force);
 }
@@ -2337,6 +2394,9 @@ function _startEmbedding(songList) {
   }
   embeddingInProgress = true;
   embeddingStartTime = Date.now();
+  embeddingTotalCount = songList.length;
+  embeddingProcessedCount = 0;
+  embeddingReportedFailedCount = 0;
   embeddingFailedPaths = [];
   embeddingQueue = songList.map(s => ({ id: s.id, path: s.filePath, filename: s.filename }));
   const paths = songList.map(s => s.filePath);
@@ -2449,14 +2509,25 @@ function _setupEmbeddingListeners() {
   _embeddingListenersSet = true;
 
   MusicBridge.addListener('embeddingSongComplete', (data) => {
-    const { filename, filepath, embedding, contentHash } = data;
-    _embLog('success', `Embedded: ${filename} (${embedding.length}D)`);
+    const { filename, filepath, contentHash } = data;
+    embeddingProcessedCount = Math.max(embeddingProcessedCount, Number(data.processed) || 0);
+    embeddingReportedFailedCount = Math.max(embeddingReportedFailedCount, Number(data.failed) || 0);
+    _embLog('success', `Embedded: ${filename}`);
+    embeddingQueue = embeddingQueue.filter(q => q.path !== filepath);
+    if (contentHash && filepath) {
+      if (!localEmbeddings._path_index) localEmbeddings._path_index = {};
+      localEmbeddings._path_index[filepath] = contentHash;
+    }
+    return;
 
     // Find song by filename (O(1) map lookup) or filepath fallback
     const fnMap = _getFilenameMap();
     const sidByFn = fnMap[filename.toLowerCase()];
     let song = sidByFn != null ? songs[sidByFn] : null;
-    if (!song && filepath) song = songs.find(s => s.filePath === filepath);
+    if (!song && filepath) {
+      const sidByPath = _getPathMap()[String(filepath).toLowerCase()];
+      song = sidByPath != null ? songs[sidByPath] : null;
+    }
 
     const fnLower = filename.toLowerCase();
 
@@ -2464,11 +2535,11 @@ function _setupEmbeddingListeners() {
       // Update or create embedding slot
       if (song.hasEmbedding && song.embeddingIndex != null) {
         // Re-embedding: replace existing embedding in-place
-        embeddings[song.embeddingIndex] = new Float32Array(embedding);
+        embeddings[song.embeddingIndex] = new Float32Array(embArray);
       } else {
         // New embedding
         const newIdx = embeddings.length;
-        embeddings.push(new Float32Array(embedding));
+        embeddings.push(new Float32Array(embArray));
         embeddingMap[fnLower] = newIdx;
         song.hasEmbedding = true;
         song.embeddingIndex = newIdx;
@@ -2477,7 +2548,7 @@ function _setupEmbeddingListeners() {
     } else if (embeddingMap[fnLower] === undefined) {
       // Song not in list but save embedding anyway
       const newIdx = embeddings.length;
-      embeddings.push(new Float32Array(embedding));
+      embeddings.push(new Float32Array(embArray));
       embeddingMap[fnLower] = newIdx;
     }
 
@@ -2485,7 +2556,7 @@ function _setupEmbeddingListeners() {
     // race condition with Java's incremental writes to the same file
     if (!localEmbeddings._path_index) localEmbeddings._path_index = {};
     localEmbeddings[contentHash] = {
-      embedding: Array.from(embedding),
+      embedding: embArray,
       content_hash: contentHash,
       filepath: filepath,
       timestamp: Date.now(),
@@ -2525,6 +2596,9 @@ function _setupEmbeddingListeners() {
     embeddingInProgress = false;
     embeddingQueue = [];
     embeddingCurrentFile = '';
+    embeddingProcessedCount = Number(data.processed) || 0;
+    embeddingReportedFailedCount = Number(data.failed) || 0;
+    embeddingTotalCount = embeddingProcessedCount + embeddingReportedFailedCount;
 
     // Reload local embeddings from disk (Java is the sole writer during embedding —
     // it writes incrementally every 5 songs + final write. Don't write from JS here
@@ -2532,6 +2606,8 @@ function _setupEmbeddingListeners() {
     try {
       await EmbeddingCache.recoverPendingToStable();
       await _loadLocalEmbeddings();
+      const mergedCount = _mergeLocalEmbeddings();
+      _embLog('info', `Merged ${mergedCount} embeddings from disk after batch completion`);
     } catch (e) {
       _embLog('error', `Failed to promote pending embeddings: ${e.message}`);
     }
@@ -2545,9 +2621,12 @@ function _setupEmbeddingListeners() {
     }
 
     // Rebuild recommender with updated embeddings
-    rec = new Recommender(embeddings); rec.lam = _tuning.adventurous;
-    _artistMap = null;
-    _embIdxMap = null;
+    if (embeddings.length > 0) {
+      rec = new Recommender(embeddings);
+      rec.lam = _tuning.adventurous;
+      _artistMap = null;
+      _embIdxMap = null;
+    }
     buildProfileVec().then(v => { profileVec = v; }).catch(() => {});
     for (const cb of scanCallbacks) {
       try { cb(); } catch (e) { /* ignore */ }
@@ -2555,12 +2634,18 @@ function _setupEmbeddingListeners() {
   });
 
   MusicBridge.addListener('embeddingProgress', (data) => {
+    embeddingInProgress = true;
     embeddingCurrentFile = data.filename || '';
+    embeddingTotalCount = Number(data.total) || embeddingTotalCount;
+    embeddingProcessedCount = Number(data.processed) || embeddingProcessedCount;
+    embeddingReportedFailedCount = Number(data.failed) || embeddingReportedFailedCount;
+    if (!embeddingStartTime) embeddingStartTime = Date.now();
     _embLog('progress', `Processing ${data.current}/${data.total}: ${data.filename}`);
   });
 
   MusicBridge.addListener('embeddingError', (data) => {
     const msg = data.error || 'Unknown error';
+    embeddingReportedFailedCount = Math.max(embeddingReportedFailedCount, Number(data.failed) || 0);
     _embLog('error', msg);
     // Track failed song paths for retry
     if (data.filepath) {
@@ -2579,20 +2664,24 @@ function getEmbeddingStatus() {
   const playable = songs.filter(s => s.filePath);
   const totalEmbedded = playable.filter(s => s.hasEmbedding).length;
   const unembedded = playable.filter(s => !s.hasEmbedding).length;
+  const failedCount = Math.max(embeddingFailedPaths.length, embeddingReportedFailedCount);
+  const queueSize = embeddingInProgress
+    ? Math.max(0, (embeddingTotalCount || embeddingQueue.length) - embeddingProcessedCount - failedCount)
+    : embeddingQueue.length;
   return {
     inProgress: embeddingInProgress,
     paused: embeddingPausedByUser,
-    queueSize: embeddingQueue.length,
+    queueSize,
     localCount,
     totalEmbedded,
     totalSongs: playable.length,
     unembedded,
-    allDone: playable.length > 0 && unembedded === 0 && embeddingFailedPaths.length === 0,
+    allDone: playable.length > 0 && unembedded === 0 && failedCount === 0,
     currentFile: embeddingCurrentFile,
     log: embeddingLog,
     startTime: embeddingStartTime,
     orphanCount: orphanedSongs.length,
-    failedCount: embeddingFailedPaths.length,
+    failedCount,
     unmatchedEmbeddings,
   };
 }
@@ -4153,7 +4242,10 @@ async function analyzeProfile(mostPlayedLimit = 15, opts = {}) {
     // don't need MMR diversity for a pool we're about to shuffle anyway.
     const recentShownSet = new Set(_forYouRecentShown);
     let rawPool = [];
-    if (typeof rec._findNearest === 'function') {
+    const nativePool = await _nativeRecommendFromQueryVec(profileVec, FORYOU_POOL_SIZE, excludeIdx);
+    if (nativePool.length > 0) {
+      rawPool = nativePool;
+    } else if (typeof rec._findNearest === 'function') {
       const desired = FORYOU_POOL_SIZE + excludeIdx.size + 20;
       const { topIndices } = rec._findNearest(profileVec, desired);
       const rawItems = [];
@@ -4918,6 +5010,9 @@ function _buildBlendedVec(songId) {
   if (!songs[songId].hasEmbedding) return { blended: null, label: songs[songId].title };
 
   const embIdx = songs[songId].embeddingIndex;
+  if (!_embeddingsReady || embIdx == null || !embeddings[embIdx]) {
+    return { blended: null, label: songs[songId].title };
+  }
   const currentVec = embeddings[embIdx];
   const sessionVec = _getSessionVec();
   const nListened = state.listened.length;
@@ -4961,7 +5056,12 @@ function _doRefresh(reason = 'auto') {
   const currentArtist = _getCurrentArtist();
   let sourceType = null;
 
-  const hasCurrentEmb = state.current != null && songs[state.current] && songs[state.current].hasEmbedding;
+  const hasCurrentEmb = _embeddingsReady
+    && state.current != null
+    && songs[state.current]
+    && songs[state.current].hasEmbedding
+    && songs[state.current].embeddingIndex != null
+    && !!embeddings[songs[state.current].embeddingIndex];
   const currentVec = hasCurrentEmb ? embeddings[songs[state.current].embeddingIndex] : null;
 
   const w = _blendWeights('refresh', state.listened.length, hasCurrentEmb, sessionVec != null, profileVec != null);
@@ -5009,7 +5109,7 @@ function _doRefresh(reason = 'auto') {
  *   STABLE_ZONE..end   — fluid, replaced with best fresh candidates
  */
 function _softRefreshQueue() {
-  if (!recToggle || state.queue.length < FROZEN_ZONE) return;
+  if (!recToggle || !_embeddingsReady || state.queue.length < FROZEN_ZONE) return;
   if (state.playingFavorites || state.playingAlbum || state.playingPlaylist) return;
   if (state.timelineMode === 'explicit') return;
   if (state.current == null) return;
@@ -5128,7 +5228,7 @@ function play(songId, prevFraction = null, source = 'manual') {
   // Build queue
   if (!recToggle) {
     _buildShuffleQueue();
-  } else if (songs[songId].hasEmbedding) {
+  } else if (_embeddingsReady && songs[songId].hasEmbedding) {
     const exclude = new Set([...state.history, songId]);
     const embExclude = _songIdsToEmbExclude(exclude);
     const { blended, label } = _buildBlendedVec(songId);

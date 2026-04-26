@@ -4,7 +4,7 @@ An offline-first Android music player that learns from how you actually listen -
 
 An offline-first Android music player with AI-powered recommendations driven by CLAP audio embeddings. The app learns what you actually listen to — plays, skips, favorites, dislikes — and uses that, plus audio-similarity via precomputed embeddings, to surface Discover, Taste Signal, and dynamic Up Next feeds.
 
-Built as a Capacitor hybrid: the UI and recommendation engine are plain HTML/CSS/JS, and the media-playback, notification, lockscreen, and background paths are native Android (Java) on top of Android `MediaSession`.
+Built as a Capacitor hybrid: the UI and recommendation engine are plain HTML/CSS/JS, and the media-playback, notification, lockscreen, and background paths are native Android (Java) on top of Media3 `MediaSessionService` + `ExoPlayer`.
 
 ---
 
@@ -84,11 +84,19 @@ The app uses [CLAP](https://github.com/LAION-AI/CLAP) audio embeddings for simil
 
 Songs without embeddings still play; they just won't appear in audio-similarity surfaces until you regenerate.
 
+If you want to generate embeddings locally on Windows instead of Colab, `local_embedding_generator.py` is the laptop-oriented variant. It can use CUDA when available and otherwise falls back to CPU.
+
 ## Project layout
 
 ```
 src/
-  app.js              — UI, tab wiring, mini-player, modals, bridge glue
+  app.js              — UI bootstrap, tab wiring, mini-player, bridge glue
+  app-debug.js        — debug logger / error hooks
+  app-status-ui.js    — status toast and recommendation rebuild UI
+  app-art.js          — album-art queue / fallback helpers
+  app-playlists-ui.js — playlist picker and CRUD modal helpers
+  app-back-navigation.js — Android back-button and sub-page close helpers
+  app-browse-render.js   — browse/search render helpers
   engine.js           — recommendation engine, discover cache, taste signal, persistence
   music-bridge.js     — thin Capacitor plugin wrapper
   recommender.js      — similarity / nearest-neighbor math
@@ -98,14 +106,18 @@ src/
 android/
   app/src/main/java/com/isaivazhi/app/
     MainActivity.java
-    MusicPlaybackService.java   — MediaSession, audio focus, notification, transitions
-    MusicBridgePlugin.java      — Capacitor <-> native bridge
-    EmbeddingService.java       — (currently unused runtime path; CLAP runs in Colab)
+    Media3PlaybackService.java          — active playback service (`:playback` process)
+    Media3PlaybackControllerClient.java — controller bridge into Media3
+    MusicBridgePlugin.java              — Capacitor <-> native bridge
+    EmbeddingForegroundService.java     — active embedding coordinator (`:ai` process)
+    EmbeddingControllerClient.java      — controller bridge into embedding service
+    EmbeddingService.java               — embedding worker runtime
 tests/
   engine.regression.test.js
   engine.pending-coverage.test.js
   e2e/                          — Playwright smoke
 colab_embedding_generator.py    — run in Colab to produce local_embeddings.json
+local_embedding_generator.py    — local Windows generator with CUDA/CPU fallback
 merge_local_embeddings.py      — merge / validate multiple local_embeddings.json outputs
 project_development.md          — ongoing dev log; current source of truth for landed behavior
 project_development_archive.md  — compacted older history

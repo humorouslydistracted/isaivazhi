@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
@@ -41,16 +42,60 @@ import java.util.Set;
 @CapacitorPlugin(name = "MusicBridge")
 public class MusicBridgePlugin extends Plugin {
     private static final String ART_CACHE_KEY_PREFIX = "art_v2::";
+    private static final boolean USE_MEDIA3_PLAYBACK = true;
+    private static final long EMBEDDING_PLAYBACK_START_COOLDOWN_MS = 6000L;
+    private static final long EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS = 8000L;
+    private static final long EMBEDDING_PLAYBACK_ERROR_COOLDOWN_MS = 15000L;
 
     private static final Set<String> AUDIO_EXTENSIONS = new HashSet<>(Arrays.asList(
             "opus", "mp3", "flac", "aac", "wav", "m4a", "ogg", "wma"
     ));
 
     private EmbeddingService embeddingService;
+    private EmbeddingControllerClient embeddingControllerClient;
+    private Media3PlaybackControllerClient media3PlaybackClient;
+    private volatile boolean lastKnownPlaybackActive = false;
+    private volatile boolean embeddingBridgeKnownActive = false;
 
     @Override
     public void load() {
         MusicPlaybackService.pluginRef = this;
+        embeddingControllerClient = new EmbeddingControllerClient(
+                getContext(),
+                ContextCompat.getMainExecutor(getContext()),
+                this::onEmbeddingServiceEvent
+        );
+        media3PlaybackClient = new Media3PlaybackControllerClient(
+                getContext(),
+                ContextCompat.getMainExecutor(getContext()),
+                this::onMedia3PlaybackEvent
+        );
+        if (USE_MEDIA3_PLAYBACK && media3PlaybackClient != null) {
+            media3PlaybackClient.ensureConnected(new Media3PlaybackControllerClient.ControllerReadyCallback() {
+                @Override
+                public void onReady(androidx.media3.session.MediaController controller) {
+                    // Keep a live controller connection so Media3 playback events can be relayed to JS.
+                }
+
+                @Override
+                public void onError(String message) {
+                    Log.w("MusicBridge", "Initial Media3 controller connection failed: " + message);
+                }
+            });
+        }
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        if (embeddingControllerClient != null) {
+            embeddingControllerClient.release();
+            embeddingControllerClient = null;
+        }
+        if (media3PlaybackClient != null) {
+            media3PlaybackClient.release();
+            media3PlaybackClient = null;
+        }
+        super.handleOnDestroy();
     }
 
     @PluginMethod
@@ -110,7 +155,7 @@ public class MusicBridgePlugin extends Plugin {
             }
         }
         data.put("action", action);
-        notifyListeners("mediaAction", data);
+        notifyListeners("mediaAction", data, true);
     }
 
     /** Emit audio time update to JS */
@@ -162,17 +207,221 @@ public class MusicBridgePlugin extends Plugin {
         notifyListeners("queueEnded", new JSObject());
     }
 
+    void emitEmbeddingProgress(String filename, String filepath, int current, int total, int processed, int failed) {
+        JSObject data = new JSObject();
+        data.put("filename", filename != null ? filename : "");
+        if (filepath != null) data.put("filepath", filepath);
+        data.put("current", current);
+        data.put("total", total);
+        data.put("processed", processed);
+        data.put("failed", failed);
+        notifyListeners("embeddingProgress", data);
+    }
+
+    void emitEmbeddingSongComplete(String filename, String filepath, String contentHash, int processed, int failed) {
+        JSObject data = new JSObject();
+        data.put("filename", filename != null ? filename : "");
+        if (filepath != null) data.put("filepath", filepath);
+        data.put("contentHash", contentHash != null ? contentHash : "");
+        data.put("processed", processed);
+        data.put("failed", failed);
+        notifyListeners("embeddingSongComplete", data);
+    }
+
+    void emitEmbeddingComplete(int processed, int failed) {
+        JSObject data = new JSObject();
+        data.put("processed", processed);
+        data.put("failed", failed);
+        notifyListeners("embeddingComplete", data);
+    }
+
+    void emitEmbeddingError(String error, String filepath, int failed) {
+        JSObject data = new JSObject();
+        data.put("error", error != null ? error : "Embedding error");
+        if (filepath != null) data.put("filepath", filepath);
+        data.put("failed", failed);
+        notifyListeners("embeddingError", data);
+    }
+
+    private void onEmbeddingServiceEvent(int what, Bundle data) {
+        Bundle safe = data != null ? data : Bundle.EMPTY;
+        switch (what) {
+            case EmbeddingCommandContract.MSG_STATUS:
+                embeddingBridgeKnownActive = safe.getBoolean(EmbeddingCommandContract.KEY_IN_PROGRESS, false);
+                if (safe.getBoolean(EmbeddingCommandContract.KEY_IN_PROGRESS, false)) {
+                    emitEmbeddingProgress(
+                            safe.getString(EmbeddingCommandContract.KEY_FILENAME, ""),
+                            safe.getString(EmbeddingCommandContract.KEY_FILE_PATH, null),
+                            safe.getInt(EmbeddingCommandContract.KEY_CURRENT, 0),
+                            safe.getInt(EmbeddingCommandContract.KEY_TOTAL, 0),
+                            safe.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0),
+                            safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
+                    );
+                }
+                break;
+            case EmbeddingCommandContract.MSG_PROGRESS:
+                embeddingBridgeKnownActive = true;
+                emitEmbeddingProgress(
+                        safe.getString(EmbeddingCommandContract.KEY_FILENAME, ""),
+                        safe.getString(EmbeddingCommandContract.KEY_FILE_PATH, null),
+                        safe.getInt(EmbeddingCommandContract.KEY_CURRENT, 0),
+                        safe.getInt(EmbeddingCommandContract.KEY_TOTAL, 0),
+                        safe.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0),
+                        safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
+                );
+                break;
+            case EmbeddingCommandContract.MSG_SONG_COMPLETE:
+                emitEmbeddingSongComplete(
+                        safe.getString(EmbeddingCommandContract.KEY_FILENAME, ""),
+                        safe.getString(EmbeddingCommandContract.KEY_FILE_PATH, null),
+                        safe.getString(EmbeddingCommandContract.KEY_CONTENT_HASH, ""),
+                        safe.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0),
+                        safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
+                );
+                break;
+            case EmbeddingCommandContract.MSG_COMPLETE:
+                embeddingBridgeKnownActive = false;
+                emitEmbeddingComplete(
+                        safe.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0),
+                        safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
+                );
+                break;
+            case EmbeddingCommandContract.MSG_ERROR:
+                emitEmbeddingError(
+                        safe.getString(EmbeddingCommandContract.KEY_ERROR, "Embedding error"),
+                        safe.getString(EmbeddingCommandContract.KEY_FILE_PATH, null),
+                        safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
+                );
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void updateEmbeddingPlaybackPolicy(boolean active, String reason, long cooldownMs) {
+        lastKnownPlaybackActive = active;
+        if (embeddingControllerClient == null) return;
+        if (!embeddingBridgeKnownActive) return;
+        embeddingControllerClient.setPlaybackState(active, reason, cooldownMs);
+    }
+
+    private void onMedia3PlaybackEvent(String action, Bundle data) {
+        if (action == null) return;
+        Bundle safe = data != null ? data : Bundle.EMPTY;
+        switch (action) {
+            case PlaybackCommandContract.EVT_TRANSPORT_READY:
+                lastKnownPlaybackActive = safe.getBoolean("isPlaying", false);
+                updateEmbeddingPlaybackPolicy(
+                        lastKnownPlaybackActive,
+                        "transport_ready",
+                        lastKnownPlaybackActive ? EMBEDDING_PLAYBACK_START_COOLDOWN_MS : 0L
+                );
+                break;
+            case PlaybackCommandContract.EVT_AUDIO_TIME_UPDATE:
+                emitAudioTimeUpdate(
+                        safe.getDouble("position", 0d),
+                        safe.getDouble("duration", 0d),
+                        safe.getBoolean("isPlaying", false),
+                        safe.getLong("playedMs", 0L),
+                        safe.getLong("durationMs", 0L),
+                        safe.getLong("playbackInstanceId", 0L)
+                );
+                break;
+            case PlaybackCommandContract.EVT_AUDIO_PLAY_STATE_CHANGED:
+                lastKnownPlaybackActive = safe.getBoolean("isPlaying", false);
+                updateEmbeddingPlaybackPolicy(
+                        lastKnownPlaybackActive,
+                        lastKnownPlaybackActive ? "playback_started" : "playback_paused",
+                        lastKnownPlaybackActive ? EMBEDDING_PLAYBACK_START_COOLDOWN_MS : 0L
+                );
+                emitAudioPlayStateChanged(lastKnownPlaybackActive);
+                break;
+            case PlaybackCommandContract.EVT_QUEUE_CURRENT_CHANGED:
+                updateEmbeddingPlaybackPolicy(
+                        lastKnownPlaybackActive,
+                        "queue_current_changed",
+                        EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS
+                );
+                emitQueueCurrentChanged(bundleToJsObject(safe));
+                break;
+            case PlaybackCommandContract.EVT_QUEUE_CHANGED:
+                emitQueueChanged(bundleToJsObject(safe));
+                break;
+            case PlaybackCommandContract.EVT_QUEUE_ENDED:
+                emitQueueEnded();
+                break;
+            case PlaybackCommandContract.EVT_AUDIO_ERROR:
+                updateEmbeddingPlaybackPolicy(
+                        lastKnownPlaybackActive,
+                        "playback_error",
+                        EMBEDDING_PLAYBACK_ERROR_COOLDOWN_MS
+                );
+                emitAudioError(safe.getString("error", "Playback error"), safe.getString("path"));
+                break;
+            case PlaybackCommandContract.EVT_MEDIA_ACTION: {
+                JSObject extra = bundleToJsObject(safe);
+                String mediaAction = safe.getString("action", "");
+                if (mediaAction.contains("next") || mediaAction.contains("prev")
+                        || mediaAction.contains("play") || mediaAction.contains("resume")
+                        || mediaAction.contains("seek")) {
+                    updateEmbeddingPlaybackPolicy(
+                            lastKnownPlaybackActive,
+                            "media_action:" + mediaAction,
+                            EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS
+                    );
+                }
+                onMediaAction(mediaAction, extra);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    private JSObject bundleToJsObject(Bundle bundle) {
+        JSObject out = new JSObject();
+        if (bundle == null) return out;
+        for (String key : bundle.keySet()) {
+            Object value = bundle.get(key);
+            if (value == null) {
+                out.put(key, JSONObject.NULL);
+            } else if (value instanceof Bundle) {
+                out.put(key, bundleToJsObject((Bundle) value));
+            } else if (value instanceof Boolean || value instanceof Number || value instanceof String) {
+                out.put(key, value);
+            } else if (value instanceof ArrayList) {
+                JSArray arr = new JSArray();
+                ArrayList<?> list = (ArrayList<?>) value;
+                for (Object item : list) {
+                    if (item instanceof Bundle) {
+                        arr.put(bundleToJsObject((Bundle) item));
+                    } else if (item instanceof Boolean || item instanceof Number || item instanceof String) {
+                        arr.put(item);
+                    } else {
+                        arr.put(String.valueOf(item));
+                    }
+                }
+                out.put(key, arr);
+            } else {
+                out.put(key, String.valueOf(value));
+            }
+        }
+        return out;
+    }
+
     // ===== ON-DEVICE EMBEDDING =====
 
     @PluginMethod
     public void stopEmbedding(PluginCall call) {
-        // Stop via foreground service
-        if (EmbeddingForegroundService.instance != null) {
-            EmbeddingForegroundService.instance.cancelEmbedding();
-        } else if (embeddingService != null) {
-            embeddingService.cancelEmbedding();
+        try {
+            Intent intent = new Intent(getContext(), EmbeddingForegroundService.class);
+            intent.setAction(EmbeddingForegroundService.ACTION_STOP);
+            getContext().startService(intent);
+            embeddingBridgeKnownActive = false;
+            call.resolve(new JSObject().put("status", "cancel_requested"));
+        } catch (Exception e) {
+            call.reject("Failed to stop embedding: " + e.getMessage());
         }
-        call.resolve(new JSObject().put("status", "cancelled"));
     }
 
     @PluginMethod
@@ -190,65 +439,127 @@ public class MusicBridgePlugin extends Plugin {
             }
 
             // Resolve immediately — progress comes via events
-            call.resolve(new JSObject().put("status", "started").put("count", paths.size()));
-
-            // Set up the callback that the foreground service will use to notify JS
-            final MusicBridgePlugin self = this;
-            EmbeddingForegroundService.pluginCallback = new EmbeddingService.EmbeddingCallback() {
-                @Override
-                public void onProgress(String filename, String filepath, int current, int total) {
-                    JSObject data = new JSObject();
-                    data.put("filename", filename);
-                    data.put("filepath", filepath);
-                    data.put("current", current);
-                    data.put("total", total);
-                    self.notifyListeners("embeddingProgress", data);
-                }
-
-                @Override
-                public void onSongComplete(String filename, String filepath, float[] embedding, String contentHash) {
-                    try {
-                        JSObject data = new JSObject();
-                        data.put("filename", filename);
-                        data.put("filepath", filepath);
-                        data.put("contentHash", contentHash);
-                        JSArray embArray = new JSArray();
-                        for (float v : embedding) embArray.put((double) v);
-                        data.put("embedding", embArray);
-                        self.notifyListeners("embeddingSongComplete", data);
-                    } catch (Exception e) { /* ignore */ }
-                }
-
-                @Override
-                public void onComplete(int totalProcessed, int failed) {
-                    JSObject data = new JSObject();
-                    data.put("processed", totalProcessed);
-                    data.put("failed", failed);
-                    self.notifyListeners("embeddingComplete", data);
-                    EmbeddingForegroundService.pluginCallback = null;
-                }
-
-                @Override
-                public void onError(String message, String filepath) {
-                    JSObject data = new JSObject();
-                    data.put("error", message);
-                    if (filepath != null) data.put("filepath", filepath);
-                    self.notifyListeners("embeddingError", data);
-                }
-            };
-
-            // Start foreground service with wake lock + notification
             Intent intent = new Intent(getContext(), EmbeddingForegroundService.class);
             intent.setAction(EmbeddingForegroundService.ACTION_START);
             intent.putStringArrayListExtra(EmbeddingForegroundService.EXTRA_PATHS, paths);
+            intent.putExtra(EmbeddingForegroundService.EXTRA_PLAYBACK_ACTIVE, lastKnownPlaybackActive);
+            embeddingBridgeKnownActive = true;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 getContext().startForegroundService(intent);
             } else {
                 getContext().startService(intent);
             }
 
+            if (embeddingControllerClient != null) {
+                embeddingControllerClient.ensureConnected(new EmbeddingControllerClient.ConnectionCallback() {
+                    @Override
+                    public void onConnected() {
+                        embeddingControllerClient.setPlaybackState(
+                                lastKnownPlaybackActive,
+                                lastKnownPlaybackActive ? "embedding_started_during_playback" : "embedding_started",
+                                lastKnownPlaybackActive ? EMBEDDING_PLAYBACK_START_COOLDOWN_MS : 0L
+                        );
+                        embeddingControllerClient.requestStatus();
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        Log.w("MusicBridge", "Embedding controller reconnect failed after start: " + message);
+                    }
+                });
+            }
+
+            call.resolve(new JSObject().put("status", "started").put("count", paths.size()));
+
         } catch (Exception e) {
             call.reject("Embedding failed: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void requestEmbeddingStatus(PluginCall call) {
+        if (embeddingControllerClient == null) {
+            call.reject("Embedding controller unavailable");
+            return;
+        }
+
+        embeddingControllerClient.ensureConnected(new EmbeddingControllerClient.ConnectionCallback() {
+            @Override
+            public void onConnected() {
+                embeddingControllerClient.requestStatus();
+                call.resolve(new JSObject().put("status", "requested"));
+            }
+
+            @Override
+            public void onError(String message) {
+                call.reject(message);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void findNearestEmbeddings(PluginCall call) {
+        if (embeddingControllerClient == null) {
+            call.reject("Embedding controller unavailable");
+            return;
+        }
+
+        try {
+            Bundle args = new Bundle();
+            int topK = call.getInt("topK", 20);
+            args.putInt(EmbeddingCommandContract.KEY_TOP_K, Math.max(1, topK));
+
+            JSArray queryVector = call.getArray("queryVector");
+            if (queryVector != null && queryVector.length() > 0) {
+                float[] vec = new float[queryVector.length()];
+                for (int i = 0; i < queryVector.length(); i++) {
+                    vec[i] = (float) queryVector.getDouble(i);
+                }
+                args.putFloatArray(EmbeddingCommandContract.KEY_QUERY_VECTOR, vec);
+            }
+
+            String queryFilepath = call.getString("queryFilepath");
+            if (queryFilepath != null) {
+                args.putString(EmbeddingCommandContract.KEY_QUERY_FILE_PATH, queryFilepath);
+            }
+            String queryContentHash = call.getString("queryContentHash");
+            if (queryContentHash != null) {
+                args.putString(EmbeddingCommandContract.KEY_QUERY_CONTENT_HASH, queryContentHash);
+            }
+
+            JSArray excludeFilepaths = call.getArray("excludeFilepaths");
+            if (excludeFilepaths != null) {
+                ArrayList<String> paths = new ArrayList<>();
+                for (int i = 0; i < excludeFilepaths.length(); i++) {
+                    String path = excludeFilepaths.getString(i);
+                    if (path != null && !path.isEmpty()) paths.add(path);
+                }
+                args.putStringArrayList(EmbeddingCommandContract.KEY_EXCLUDE_FILE_PATHS, paths);
+            }
+
+            JSArray excludeContentHashes = call.getArray("excludeContentHashes");
+            if (excludeContentHashes != null) {
+                ArrayList<String> hashes = new ArrayList<>();
+                for (int i = 0; i < excludeContentHashes.length(); i++) {
+                    String hash = excludeContentHashes.getString(i);
+                    if (hash != null && !hash.isEmpty()) hashes.add(hash);
+                }
+                args.putStringArrayList(EmbeddingCommandContract.KEY_EXCLUDE_CONTENT_HASHES, hashes);
+            }
+
+            embeddingControllerClient.findNearest(args, new EmbeddingControllerClient.SimilarityCallback() {
+                @Override
+                public void onSuccess(Bundle data) {
+                    call.resolve(bundleToJsObject(data));
+                }
+
+                @Override
+                public void onError(String message) {
+                    call.reject(message);
+                }
+            });
+        } catch (Exception e) {
+            call.reject("Nearest-neighbor query failed: " + e.getMessage());
         }
     }
 
@@ -888,7 +1199,25 @@ public class MusicBridgePlugin extends Plugin {
         }
         String title = call.getString("title", "IsaiVazhi");
         String artist = call.getString("artist", "");
+        String album = call.getString("album", "");
         long seekTo = call.hasOption("seekTo") ? (long)(call.getFloat("seekTo", 0f) * 1000) : 0;
+        updateEmbeddingPlaybackPolicy(
+                true,
+                seekTo > 0L ? "play_audio_seek" : "play_audio",
+                EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS
+        );
+
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            args.putInt(PlaybackCommandContract.KEY_SONG_ID, call.getInt("songId", -1));
+            args.putString(PlaybackCommandContract.KEY_FILE_PATH, path);
+            args.putString(PlaybackCommandContract.KEY_TITLE, title);
+            args.putString(PlaybackCommandContract.KEY_ARTIST, artist);
+            args.putString(PlaybackCommandContract.KEY_ALBUM, album);
+            args.putLong(PlaybackCommandContract.KEY_SEEK_TO_MS, seekTo);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_PLAY_AUDIO, args, call);
+            return;
+        }
 
         // Start/ensure service is running, then play
         Intent intent = new Intent(getContext(), MusicPlaybackService.class);
@@ -929,6 +1258,10 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void pauseAudio(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            withMedia3ControllerNoResult(controller -> controller.pause(), call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.pausePlayback();
         }
@@ -937,6 +1270,11 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void resumeAudio(PluginCall call) {
+        updateEmbeddingPlaybackPolicy(true, "resume_audio", EMBEDDING_PLAYBACK_START_COOLDOWN_MS);
+        if (USE_MEDIA3_PLAYBACK) {
+            withMedia3ControllerNoResult(controller -> controller.play(), call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.resumePlayback();
         }
@@ -946,6 +1284,12 @@ public class MusicBridgePlugin extends Plugin {
     @PluginMethod
     public void seekAudio(PluginCall call) {
         float positionSec = call.getFloat("position", 0f);
+        updateEmbeddingPlaybackPolicy(lastKnownPlaybackActive, "seek_audio", EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS);
+        if (USE_MEDIA3_PLAYBACK) {
+            long positionMs = (long) (positionSec * 1000);
+            withMedia3ControllerNoResult(controller -> controller.seekTo(Math.max(0L, positionMs)), call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.seekTo((long)(positionSec * 1000));
         }
@@ -954,6 +1298,10 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void getAudioState(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            sendMedia3CommandWithResult(PlaybackCommandContract.CMD_GET_AUDIO_STATE, Bundle.EMPTY, call);
+            return;
+        }
         JSObject ret = new JSObject();
         if (MusicPlaybackService.instance != null) {
             ret.put("position", MusicPlaybackService.instance.getCurrentPosition() / 1000.0);
@@ -1002,6 +1350,12 @@ public class MusicBridgePlugin extends Plugin {
     @PluginMethod
     public void setLooping(PluginCall call) {
         boolean loop = call.getBoolean("loop", false);
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            args.putInt(PlaybackCommandContract.KEY_LOOP_MODE, loop ? 1 : 0);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_SET_LOOP_MODE, args, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.setLooping(loop);
         }
@@ -1029,6 +1383,85 @@ public class MusicBridgePlugin extends Plugin {
             Log.e("MusicBridge", "parseQueueItems failed", e);
         }
         return out;
+    }
+
+    private ArrayList<PlaybackQueueItem> parseMedia3QueueItems(PluginCall call) {
+        ArrayList<PlaybackQueueItem> out = new ArrayList<>();
+        JSArray arr = call.getArray("items");
+        if (arr == null) return out;
+        try {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                int songId = o.optInt("songId", -1);
+                String path = o.optString("filePath", null);
+                if (path == null || path.isEmpty()) continue;
+                String title = o.optString("title", "");
+                String artist = o.optString("artist", "");
+                String album = o.optString("album", "");
+                out.add(new PlaybackQueueItem(songId, path, title, artist, album));
+            }
+        } catch (Exception e) {
+            Log.e("MusicBridge", "parseMedia3QueueItems failed", e);
+        }
+        return out;
+    }
+
+    private void sendMedia3CommandNoResult(String action, Bundle args, PluginCall call) {
+        if (!USE_MEDIA3_PLAYBACK || media3PlaybackClient == null) {
+            call.reject("Media3 playback unavailable");
+            return;
+        }
+        media3PlaybackClient.sendCustomCommand(action, args, new Media3PlaybackControllerClient.CommandResultCallback() {
+            @Override
+            public void onSuccess(Bundle extras) {
+                Log.d("MusicBridge", "Media3 command OK: " + action);
+                call.resolve();
+            }
+
+            @Override
+            public void onError(String message) {
+                Log.e("MusicBridge", "Media3 command failed: " + action + " error=" + message);
+                call.reject(message);
+            }
+        });
+    }
+
+    private void sendMedia3CommandWithResult(String action, Bundle args, PluginCall call) {
+        if (!USE_MEDIA3_PLAYBACK || media3PlaybackClient == null) {
+            call.reject("Media3 playback unavailable");
+            return;
+        }
+        media3PlaybackClient.sendCustomCommand(action, args, new Media3PlaybackControllerClient.CommandResultCallback() {
+            @Override
+            public void onSuccess(Bundle extras) {
+                Log.d("MusicBridge", "Media3 command OK: " + action);
+                call.resolve(bundleToJsObject(extras));
+            }
+
+            @Override
+            public void onError(String message) {
+                Log.e("MusicBridge", "Media3 command failed: " + action + " error=" + message);
+                call.reject(message);
+            }
+        });
+    }
+
+    private void withMedia3ControllerNoResult(Media3PlaybackControllerClient.ControllerAction action, PluginCall call) {
+        if (!USE_MEDIA3_PLAYBACK || media3PlaybackClient == null) {
+            call.reject("Media3 playback unavailable");
+            return;
+        }
+        media3PlaybackClient.withController(action, new Media3PlaybackControllerClient.CommandResultCallback() {
+            @Override
+            public void onSuccess(Bundle extras) {
+                call.resolve();
+            }
+
+            @Override
+            public void onError(String message) {
+                call.reject(message);
+            }
+        });
     }
 
     private void ensureServiceStarted() {
@@ -1071,6 +1504,18 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void setQueue(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            final ArrayList<PlaybackQueueItem> items = parseMedia3QueueItems(call);
+            final int startIndex = call.getInt("startIndex", 0);
+            final long seekTo = call.hasOption("seekTo") ? (long)(call.getFloat("seekTo", 0f) * 1000) : 0;
+            Bundle args = new Bundle();
+            args.putParcelableArrayList(PlaybackCommandContract.KEY_ITEMS, PlaybackQueueItem.toBundleList(items));
+            args.putString(PlaybackCommandContract.KEY_ITEMS_JSON, PlaybackQueueItem.toJsonString(items));
+            args.putInt(PlaybackCommandContract.KEY_START_INDEX, startIndex);
+            args.putLong(PlaybackCommandContract.KEY_SEEK_TO_MS, seekTo);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_SET_QUEUE, args, call);
+            return;
+        }
         final List<MusicPlaybackService.QueueItem> items = parseQueueItems(call);
         final int startIndex = call.getInt("startIndex", 0);
         final long seekTo = call.hasOption("seekTo") ? (long)(call.getFloat("seekTo", 0f) * 1000) : 0;
@@ -1079,24 +1524,52 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void replaceUpcoming(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            final ArrayList<PlaybackQueueItem> items = parseMedia3QueueItems(call);
+            Bundle args = new Bundle();
+            args.putParcelableArrayList(PlaybackCommandContract.KEY_ITEMS, PlaybackQueueItem.toBundleList(items));
+            args.putString(PlaybackCommandContract.KEY_ITEMS_JSON, PlaybackQueueItem.toJsonString(items));
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_REPLACE_UPCOMING, args, call);
+            return;
+        }
         final List<MusicPlaybackService.QueueItem> items = parseQueueItems(call);
         withService(() -> MusicPlaybackService.instance.replaceUpcoming(items), call);
     }
 
     @PluginMethod
     public void insertAfterCurrent(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            final ArrayList<PlaybackQueueItem> items = parseMedia3QueueItems(call);
+            Bundle args = new Bundle();
+            args.putParcelableArrayList(PlaybackCommandContract.KEY_ITEMS, PlaybackQueueItem.toBundleList(items));
+            args.putString(PlaybackCommandContract.KEY_ITEMS_JSON, PlaybackQueueItem.toJsonString(items));
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_INSERT_AFTER_CURRENT, args, call);
+            return;
+        }
         final List<MusicPlaybackService.QueueItem> items = parseQueueItems(call);
         withService(() -> MusicPlaybackService.instance.insertAfterCurrent(items), call);
     }
 
     @PluginMethod
     public void appendToQueue(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            final ArrayList<PlaybackQueueItem> items = parseMedia3QueueItems(call);
+            Bundle args = new Bundle();
+            args.putParcelableArrayList(PlaybackCommandContract.KEY_ITEMS, PlaybackQueueItem.toBundleList(items));
+            args.putString(PlaybackCommandContract.KEY_ITEMS_JSON, PlaybackQueueItem.toJsonString(items));
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_APPEND_TO_QUEUE, args, call);
+            return;
+        }
         final List<MusicPlaybackService.QueueItem> items = parseQueueItems(call);
         withService(() -> MusicPlaybackService.instance.appendToQueue(items), call);
     }
 
     @PluginMethod
     public void clearQueueAfterCurrent(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_CLEAR_QUEUE_AFTER_CURRENT, Bundle.EMPTY, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.clearQueueAfterCurrent();
         }
@@ -1106,6 +1579,13 @@ public class MusicBridgePlugin extends Plugin {
     @PluginMethod
     public void playIndex(PluginCall call) {
         final int index = call.getInt("index", 0);
+        updateEmbeddingPlaybackPolicy(lastKnownPlaybackActive, "play_index", EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS);
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            args.putInt(PlaybackCommandContract.KEY_INDEX, index);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_PLAY_INDEX, args, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.playIndex(index);
         }
@@ -1116,6 +1596,14 @@ public class MusicBridgePlugin extends Plugin {
     public void nextTrack(PluginCall call) {
         float prevFraction = call.getFloat("prevFraction", -1f);
         String action = call.getString("action", "user_next");
+        updateEmbeddingPlaybackPolicy(lastKnownPlaybackActive, "next_track", EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS);
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            args.putString(PlaybackCommandContract.KEY_ACTION, action);
+            args.putDouble(PlaybackCommandContract.KEY_PREV_FRACTION, prevFraction);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_NEXT_TRACK, args, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.nextTrack(action, prevFraction);
         }
@@ -1125,6 +1613,13 @@ public class MusicBridgePlugin extends Plugin {
     @PluginMethod
     public void prevTrack(PluginCall call) {
         float prevFraction = call.getFloat("prevFraction", -1f);
+        updateEmbeddingPlaybackPolicy(lastKnownPlaybackActive, "prev_track", EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS);
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            args.putDouble(PlaybackCommandContract.KEY_PREV_FRACTION, prevFraction);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_PREV_TRACK, args, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.prevTrack(prevFraction);
         }
@@ -1134,6 +1629,12 @@ public class MusicBridgePlugin extends Plugin {
     @PluginMethod
     public void setLoopMode(PluginCall call) {
         int mode = call.getInt("mode", 2);
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            args.putInt(PlaybackCommandContract.KEY_LOOP_MODE, mode);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_SET_LOOP_MODE, args, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             MusicPlaybackService.instance.setLoopMode(mode);
         }
@@ -1142,6 +1643,10 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void getQueueState(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            sendMedia3CommandWithResult(PlaybackCommandContract.CMD_GET_QUEUE_STATE, Bundle.EMPTY, call);
+            return;
+        }
         if (MusicPlaybackService.instance != null) {
             call.resolve(MusicPlaybackService.instance.getQueueSnapshot());
         } else {
@@ -1158,6 +1663,14 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void startPlaybackService(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            withMedia3ControllerNoResult(controller -> {
+                if (call.getBoolean("isPlaying", false)) {
+                    controller.play();
+                }
+            }, call);
+            return;
+        }
         String title = call.getString("title", "IsaiVazhi");
         String artist = call.getString("artist", "");
         boolean isPlaying = call.getBoolean("isPlaying", true);
@@ -1183,6 +1696,16 @@ public class MusicBridgePlugin extends Plugin {
         String artist = call.getString("artist");
         String album = call.getString("album");
         boolean isPlaying = call.getBoolean("isPlaying", false);
+
+        if (USE_MEDIA3_PLAYBACK) {
+            Bundle args = new Bundle();
+            if (title != null) args.putString(PlaybackCommandContract.KEY_TITLE, title);
+            if (artist != null) args.putString(PlaybackCommandContract.KEY_ARTIST, artist);
+            if (album != null) args.putString(PlaybackCommandContract.KEY_ALBUM, album);
+            args.putBoolean(PlaybackCommandContract.KEY_IS_PLAYING, isPlaying);
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_UPDATE_NOTIFICATION_STATE, args, call);
+            return;
+        }
 
         Intent intent = new Intent(getContext(), MusicPlaybackService.class);
         intent.setAction(MusicPlaybackService.ACTION_UPDATE);
@@ -1249,6 +1772,10 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void stopPlaybackService(PluginCall call) {
+        if (USE_MEDIA3_PLAYBACK) {
+            sendMedia3CommandNoResult(PlaybackCommandContract.CMD_STOP_SERVICE, Bundle.EMPTY, call);
+            return;
+        }
         Intent intent = new Intent(getContext(), MusicPlaybackService.class);
         intent.setAction(MusicPlaybackService.ACTION_STOP);
         try {

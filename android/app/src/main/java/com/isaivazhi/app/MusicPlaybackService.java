@@ -1453,7 +1453,7 @@ public class MusicPlaybackService extends Service {
                 rememberStopTransition("user_dismiss");
                 clearSavedPlaybackState();
                 notifyPlugin("dismiss", buildCurrentMediaPayload());
-                stopAudioAndCleanup();
+                new Handler(Looper.getMainLooper()).postDelayed(this::stopAudioAndCleanup, 120L);
                 return true;
             default:
                 return false;

@@ -183,6 +183,49 @@ afterEach(() => {
 });
 
 describe('engine regression coverage', () => {
+  it('dedupes duplicate native queue advances so the next song is not misclassified', async () => {
+    const engine = await loadFreshEngine();
+
+    engine.playOnly(0);
+
+    const first = engine.onNativeAdvance({
+      action: 'user_jump',
+      songId: 1,
+      title: 'Beta',
+      artist: 'Artist Two',
+      album: 'Album Two',
+      filePath: '/music/beta.opus',
+      newIndex: 1,
+      prevSongId: 0,
+      prevFilename: 'alpha.opus',
+      prevPlaybackInstanceId: 101,
+      currentPlaybackInstanceId: 102,
+      prevFraction: 0.53,
+    });
+    const duplicate = engine.onNativeAdvance({
+      action: 'user_jump',
+      songId: 1,
+      title: 'Beta',
+      artist: 'Artist Two',
+      album: 'Album Two',
+      filePath: '/music/beta.opus',
+      newIndex: 1,
+      prevSongId: 0,
+      prevFilename: 'alpha.opus',
+      prevPlaybackInstanceId: 101,
+      currentPlaybackInstanceId: 102,
+      prevFraction: 0.53,
+    });
+
+    const insights = engine.getInsights();
+
+    expect(first && first.duplicate).not.toBe(true);
+    expect(duplicate).toMatchObject({ duplicate: true });
+    expect(engine.getState().current).toMatchObject({ id: 1, title: 'Beta' });
+    expect(insights.session.totalListened).toBe(1);
+    expect(insights.session.listenedSongs.map((song) => song.title)).toEqual(['Alpha']);
+  });
+
   it('restores favorites and dislikes from persisted filename-based storage', async () => {
     const engine = await loadFreshEngine({
       prefSeed: {
