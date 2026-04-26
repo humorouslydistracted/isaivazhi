@@ -31,6 +31,7 @@ Thumbs.db
 # Local logs / scratch
 logs.txt
 *.log
+colab_embedding_generator copy.py
 
 # Large binaries — ship via GitHub Releases instead
 # The `releases/` folder is a staging area for Release assets; do not commit.
