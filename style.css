@@ -18,7 +18,9 @@
 
 /* Status toast */
 .status-toast {
-    position: fixed; top: calc(env(safe-area-inset-top, 24px) + 16px); right: 10px; z-index: 9999;
+    /* Sits below the .top-bar (40 px). No safe-area inset because the bar
+       no longer applies one either. */
+    position: fixed; top: 48px; right: 10px; z-index: 9999;
     background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
     padding: 6px 14px; border-radius: 8px; font-size: 12px;
     transition: opacity 0.3s; max-width: 70%;
@@ -118,10 +120,70 @@ body {
 .pull-indicator .pull-arrow { display: inline-block; font-size: 17px; transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); color: inherit; }
 .pull-indicator .pull-arrow-ready { transform: rotate(180deg); }
 @keyframes spin { to { transform: rotate(360deg); } }
-.panel { display: none; }
-.panel.active { display: block; }
-#panel-recs { display: none; height: 100%; min-height: 0; flex-direction: column; }
-#panel-recs.active { display: flex; }
+/* 2026-05-10 follow-up #10: panels live in a horizontal scroll-snap strip.
+   Browser-native handling of the gesture: 60fps, hardware-composited
+   pan-and-snap, every device behaves like ViewPager2. JS does NO touch
+   work during the swipe — it only listens to scroll-events to update
+   `activeTab` after a commit (via IntersectionObserver), and on tab-tap
+   it calls `panelStrip.scrollTo()` to glide programmatically. */
+.content {
+    position: relative;
+    overflow: hidden;  /* the strip handles all scrolling */
+}
+.panel-strip {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+    height: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    /* Hide the horizontal scrollbar visually — the snapped panels are
+       enough indication of position. */
+    scrollbar-width: none;
+}
+.panel-strip::-webkit-scrollbar { display: none; }
+
+.panel {
+    flex: 0 0 100%;
+    width: 100%;
+    height: 100%;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;  /* never skip past a tab on a fast flick */
+    /* 2026-05-10 follow-up #14: flicker-hardening for the swipe.
+       - `background: var(--bg)` so a panel never shows through to whatever's
+         under the strip during the snap (prevents brief bg-colour flash).
+       - `transform: translateZ(0)` promotes the panel to its own compositor
+         layer up-front, so swipes composite instead of repainting every
+         frame. Pairs with `backface-visibility: hidden` to lock the layer.
+       - `contain: layout paint` isolates each panel — the browser can skip
+         processing offscreen panels, and changes inside one panel can't
+         force layout on another. */
+    background: var(--bg);
+    transform: translateZ(0);
+    contain: layout;  /* not `paint` — would clip song-menu popups */
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+}
+.panel-strip {
+    will-change: scroll-position;
+}
+/* `.panel.active` is informational only now (used by some JS for "which tab
+   is currently focused"); it no longer controls visibility. */
+
+/* The history panel sits OUTSIDE the strip and is shown / hidden manually. */
+.panel.panel-floating { display: none; }
+.panel.panel-floating.active { display: block; }
+/* Up Next panel needs internal column flex so its toolbar sits above the
+   scrolling list. With scroll-snap the panel itself is always visible (its
+   horizontal position determines whether the user sees it), so display is
+   always flex column — no `.active` toggle needed. */
+#panel-recs { display: flex; flex-direction: column; min-height: 0; }
 .recs-toolbar { flex-shrink: 0; background: var(--bg); border-bottom: 1px solid var(--border); }
 .recs-toolbar .section-header { padding-bottom: 8px; }
 .recs-toolbar .session-label { padding-top: 0; padding-bottom: 12px; }
@@ -823,11 +885,11 @@ body.audio-paused .playing-eq span { animation-play-state: paused; }
 .tuning-reset:active { background: var(--border, #2a2a30); }
 
 /* ===== DISCOVER ACTION BUTTONS (replaces stats row) ===== */
-.discover-action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 12px; }
-.discover-action-btn { background: var(--surface2, #1d1d22); border: 1px solid var(--border, #2a2a30); border-radius: 12px; padding: 16px 12px; color: var(--text, #eaeaea); text-align: left; cursor: pointer; transition: background 0.12s; }
+.discover-action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 0 12px; }
+.discover-action-btn { background: var(--surface2, #1d1d22); border: 1px solid var(--border, #2a2a30); border-radius: 10px; padding: 10px 10px; color: var(--text, #eaeaea); text-align: left; cursor: pointer; transition: background 0.12s; }
 .discover-action-btn:active { background: var(--border, #2a2a30); }
-.dab-main { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
-.dab-sub { font-size: 12px; color: var(--text2, #aaa); }
+.dab-main { font-size: 13px; font-weight: 700; margin-bottom: 2px; }
+.dab-sub { font-size: 10px; color: var(--text2, #aaa); }
 
 /* ===== TASTE WEIGHTS "Show more" BUTTON ===== */
 .tw-more-btn { display: block; width: 100%; margin-top: 8px; padding: 10px; background: var(--surface2, #1d1d22); color: var(--accent, #8a7dff); border: 1px solid var(--border, #2a2a30); border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; }
@@ -907,3 +969,290 @@ body.audio-paused .playing-eq span { animation-play-state: paused; }
 .similar-freeze-btn { padding: 4px 10px; background: transparent; border: 1px solid var(--border, #2a2a30); color: var(--text2, #aaa); border-radius: 999px; font-size: 11px; font-weight: 700; cursor: pointer; font-family: inherit; margin-right: 8px; }
 .similar-freeze-btn:active { background: var(--surface3, #2a2a30); }
 .similar-freeze-btn-active { background: rgba(90, 160, 230, 0.18); border-color: rgba(90, 160, 230, 0.5); color: #7ab8ea; }
+
+/* ===== HAMBURGER + SIDEBAR ===== */
+/* 2026-05-10 follow-up #16: removed `env(safe-area-inset-top)` padding
+   that was producing the visible empty space the user reported. Capacitor
+   on Android renders the WebView below the status bar by default, so the
+   safe-area inset is redundant — adding it just leaves a strip of bar
+   colour visible above the icons. iOS users with `apple-mobile-web-app-
+   status-bar-style: black-translucent` may need the inset back; if so,
+   guard with `@supports (padding: max(0px)) { ... }` and add iOS-only.*/
+.top-bar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    height: 40px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    z-index: 30;
+}
+.top-bar-menu {
+    width: 40px;
+    height: 40px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text);
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex-shrink: 0;
+}
+.top-bar-menu:active { background: var(--surface2); }
+
+/* 2026-05-10 follow-up #12: search input lives in the top bar, replacing
+   the IsaiVazhi title. Takes flex: 1 so it fills the row to the right of
+   the hamburger. Clear button (×) sits inside, on the right, only visible
+   when there's text. */
+.top-bar-search {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    position: relative;
+    min-width: 0;  /* allow flex shrink within the bar */
+}
+.top-bar-search input {
+    width: 100%;
+    height: 36px;
+    padding: 0 36px 0 14px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    box-sizing: border-box;
+    -webkit-appearance: none;
+    appearance: none;
+}
+.top-bar-search input::placeholder { color: var(--text3); }
+.top-bar-search input:focus { border-color: var(--accent); }
+.top-bar-search-clear {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: var(--surface3);
+    border: none;
+    color: var(--text2);
+    font-size: 18px;
+    cursor: pointer;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    -webkit-tap-highlight-color: transparent;
+    padding: 0;
+}
+.top-bar-search-clear:active { background: var(--border); }
+
+/* Search results overlay — covers the panel-strip (sits inside .content
+   so it shares the same vertical space below the top-bar). */
+.search-overlay {
+    position: absolute;
+    inset: 0;
+    background: var(--bg);
+    z-index: 10;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+}
+.search-section { padding: 12px 0 4px; }
+.search-section-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 6px 16px 8px;
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text3);
+}
+.search-section-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text3);
+    text-transform: none;
+    letter-spacing: 0;
+}
+.search-results-list:empty + .search-section-empty,
+.search-results-list:empty {
+    /* sections without matches just collapse — the global #searchEmpty
+       handles the all-zero case */
+}
+.search-empty {
+    text-align: center;
+    color: var(--text3);
+    font-size: 14px;
+    padding: 60px 16px;
+}
+
+/* Legacy floating hamburger — no longer used (now lives inside .top-bar).
+   Block kept commented in case the floating variant is wanted again. */
+.hamburger-btn--legacy-disabled {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 12px);
+    left: 12px;
+    z-index: 50;
+    width: 38px;
+    height: 38px;
+    border: none;
+    border-radius: 8px;
+    background: rgba(20, 20, 24, 0.55);
+    color: #fff;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+.hamburger-btn--legacy-disabled:active { background: rgba(40, 40, 46, 0.7); }
+
+.sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 200;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+.sidebar-backdrop.open { opacity: 1; pointer-events: auto; }
+
+.sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(82vw, 320px);
+    background: var(--surface, #18181c);
+    z-index: 210;
+    transform: translateX(-100%);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex;
+    flex-direction: column;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-shadow: 2px 0 16px rgba(0,0,0,0.4);
+}
+.sidebar.open { transform: translateX(0); }
+/* While the user is finger-dragging the sidebar (edge-swipe open or right-
+   swipe close), kill the CSS transition so the drawer follows the finger
+   exactly. The .open class drives the snap when drag releases. */
+.sidebar.dragging { transition: none; }
+.sidebar-backdrop.dragging { transition: none; }
+.sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px 14px;
+    border-bottom: 1px solid var(--border, #2a2a30);
+}
+.sidebar-title { font-size: 17px; font-weight: 700; color: var(--text1, #e0e0e0); }
+.sidebar-close {
+    background: transparent;
+    border: none;
+    color: var(--text2, #aaa);
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 8px;
+}
+.sidebar-close:active { color: var(--text1, #e0e0e0); }
+/* Sidebar body uses a column flex so .sidebar-spacer can push .sidebar-items
+   to the bottom, within thumb reach. Settings sub-page replaces this content
+   with its own free-form markup. */
+.sidebar-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0 12px;
+    display: flex;
+    flex-direction: column;
+}
+.sidebar-spacer { flex: 1; }
+.sidebar-items { display: flex; flex-direction: column; }
+.sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 18px;
+    cursor: pointer;
+    color: var(--text1, #e0e0e0);
+    font-size: 15px;
+}
+.sidebar-item:active { background: var(--surface3, #2a2a30); }
+.sidebar-icon { font-size: 18px; width: 22px; text-align: center; color: var(--text2, #aaa); }
+
+/* Settings sub-page (rendered inside sidebar body) */
+.settings-back-row { padding: 0 12px 8px; }
+.settings-back-btn {
+    background: transparent;
+    border: none;
+    color: var(--text2, #aaa);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 6px 6px;
+}
+.settings-back-btn:active { color: var(--text1, #e0e0e0); }
+.settings-section { padding: 0 18px 24px; }
+.settings-section-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text3, #888);
+    margin-bottom: 12px;
+}
+.settings-stat {
+    background: var(--surface2, #20202a);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+}
+.settings-stat-label { font-size: 11px; color: var(--text3, #888); text-transform: uppercase; letter-spacing: 0.5px; }
+.settings-stat-value { font-size: 15px; color: var(--text1, #e0e0e0); margin-top: 4px; font-weight: 600; }
+.settings-help {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text2, #aaa);
+    margin: 0 0 12px;
+}
+.settings-help code {
+    font-family: ui-monospace, Menlo, monospace;
+    background: var(--surface3, #2a2a30);
+    color: var(--text1, #e0e0e0);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 11px;
+}
+.settings-upload-btn {
+    width: 100%;
+    padding: 12px;
+    background: var(--accent, #e84545);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+}
+.settings-upload-btn:active { background: #c23a3a; }
+.settings-upload-status { margin-top: 12px; font-size: 12px; line-height: 1.5; min-height: 18px; }
+.settings-status-busy { color: var(--text2, #aaa); }
+.settings-status-error { color: #e87070; }
+.settings-status-warn { color: #e8b15a; }
+.settings-status-ok { color: #6acf77; }

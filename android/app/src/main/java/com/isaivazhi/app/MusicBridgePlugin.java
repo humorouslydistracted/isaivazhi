@@ -4,7 +4,6 @@ import android.Manifest;
 import android.content.ContentResolver;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
@@ -24,32 +23,16 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.media.MediaMetadataRetriever;
-
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.InputStreamReader;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 @CapacitorPlugin(name = "MusicBridge")
 public class MusicBridgePlugin extends Plugin {
-    private static final String ART_CACHE_KEY_PREFIX = "art_v2::";
     private static final boolean USE_MEDIA3_PLAYBACK = true;
     private static final long EMBEDDING_PLAYBACK_START_COOLDOWN_MS = 6000L;
     private static final long EMBEDDING_PLAYBACK_TRANSITION_COOLDOWN_MS = 8000L;
     private static final long EMBEDDING_PLAYBACK_ERROR_COOLDOWN_MS = 15000L;
-
-    private static final Set<String> AUDIO_EXTENSIONS = new HashSet<>(Arrays.asList(
-            "opus", "mp3", "flac", "aac", "wav", "m4a", "ogg", "wma"
-    ));
 
     private EmbeddingService embeddingService;
     private EmbeddingControllerClient embeddingControllerClient;
@@ -246,9 +229,11 @@ public class MusicBridgePlugin extends Plugin {
     private void onEmbeddingServiceEvent(int what, Bundle data) {
         Bundle safe = data != null ? data : Bundle.EMPTY;
         switch (what) {
-            case EmbeddingCommandContract.MSG_STATUS:
-                embeddingBridgeKnownActive = safe.getBoolean(EmbeddingCommandContract.KEY_IN_PROGRESS, false);
-                if (safe.getBoolean(EmbeddingCommandContract.KEY_IN_PROGRESS, false)) {
+            case EmbeddingCommandContract.MSG_STATUS: {
+                boolean nowActive = safe.getBoolean(EmbeddingCommandContract.KEY_IN_PROGRESS, false);
+                boolean wasActive = embeddingBridgeKnownActive;
+                embeddingBridgeKnownActive = nowActive;
+                if (nowActive) {
                     emitEmbeddingProgress(
                             safe.getString(EmbeddingCommandContract.KEY_FILENAME, ""),
                             safe.getString(EmbeddingCommandContract.KEY_FILE_PATH, null),
@@ -257,8 +242,17 @@ public class MusicBridgePlugin extends Plugin {
                             safe.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0),
                             safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
                     );
+                } else if (wasActive) {
+                    // Fallback: a status snapshot says the batch is no longer active,
+                    // but we never saw MSG_COMPLETE. Synthesize embeddingComplete so
+                    // the JS merge path runs without waiting for a cold restart.
+                    emitEmbeddingComplete(
+                            safe.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0),
+                            safe.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
+                    );
                 }
                 break;
+            }
             case EmbeddingCommandContract.MSG_PROGRESS:
                 embeddingBridgeKnownActive = true;
                 emitEmbeddingProgress(
@@ -611,185 +605,20 @@ public class MusicBridgePlugin extends Plugin {
     @PluginMethod
     public void scanAudioFiles(PluginCall call) {
         try {
-            JSArray results = new JSArray();
-            Set<String> seenPaths = new HashSet<>();
-            Set<String> scanRoots = new HashSet<>();
-            ContentResolver resolver = getContext().getContentResolver();
-            Uri uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
-
-            String[] projection = {
-                    MediaStore.Audio.Media.DATA,
-                    MediaStore.Audio.Media.DISPLAY_NAME,
-                    MediaStore.Audio.Media.TITLE,
-                    MediaStore.Audio.Media.ARTIST,
-                    MediaStore.Audio.Media.ALBUM,
-                    MediaStore.Audio.Media.DURATION,
-                    MediaStore.Audio.Media.DATE_MODIFIED
-            };
-
-            Cursor cursor = resolver.query(uri, projection, null, null,
-                    MediaStore.Audio.Media.DATE_MODIFIED + " DESC");
-
-            if (cursor != null) {
-                while (cursor.moveToNext()) {
-                    String path = cursor.getString(0);
-                    String displayName = cursor.getString(1);
-                    String title = cursor.getString(2);
-                    String artist = cursor.getString(3);
-                    String album = cursor.getString(4);
-                    long duration = cursor.getLong(5);
-                    long dateModified = cursor.getLong(6);
-
-                    if (path == null) continue;
-
-                    // Skip short audio (ringtones, notifications, system sounds)
-                    if (duration < 30000) continue; // < 30 seconds
-
-                    // Skip system audio directories (Alarms, Ringtones, Notifications)
-                    String pathLower = path.toLowerCase();
-                    if (pathLower.contains("/alarms/") || pathLower.contains("/ringtones/") ||
-                        pathLower.contains("/notifications/") || pathLower.contains("/android/media/")) continue;
-
-                    String ext = "";
-                    int dotIndex = path.lastIndexOf('.');
-                    if (dotIndex > 0) {
-                        ext = path.substring(dotIndex + 1).toLowerCase();
-                    }
-                    if (!AUDIO_EXTENSIONS.contains(ext)) continue;
-
-                    seenPaths.add(path);
-                    File parent = new File(path).getParentFile();
-                    if (parent != null) scanRoots.add(parent.getAbsolutePath());
-
-                    String filename = path;
-                    int slashIndex = path.lastIndexOf('/');
-                    if (slashIndex >= 0) {
-                        filename = path.substring(slashIndex + 1);
-                    }
-
-                    JSObject song = new JSObject();
-                    song.put("path", path);
-                    song.put("filename", filename);
-                    song.put("title", title != null ? title : filename);
-                    song.put("artist", artist != null ? artist : "Unknown");
-                    song.put("album", album != null ? album : "Unknown");
-                    song.put("duration", duration);
-                    song.put("dateModified", dateModified);
-
-                    // Check if album art is already cached
-                    File artFile = new File(getArtCacheDir(), artCacheKey(path) + ".jpg");
-                    if (artFile.exists()) {
-                        song.put("artPath", artFile.getAbsolutePath());
-                    }
-
-                    results.put(song);
-                }
-                cursor.close();
-            }
-
-            // MediaStore can miss a few files intermittently. Re-scan the same discovered
-            // folders directly from the filesystem and merge any audio files missing above.
-            for (String rootPath : scanRoots) {
-                collectAudioFilesRecursive(new File(rootPath), seenPaths, results);
-            }
-
-            JSObject ret = new JSObject();
-            ret.put("songs", results);
-            ret.put("count", results.length());
-            call.resolve(ret);
-
+            call.resolve(MediaScanHelper.scan(getContext()));
         } catch (Exception e) {
             call.reject("Scan failed: " + e.getMessage());
         }
     }
 
-    private void collectAudioFilesRecursive(File dir, Set<String> seenPaths, JSArray results) {
-        if (dir == null || !dir.exists() || !dir.isDirectory()) return;
-
-        File[] files = dir.listFiles();
-        if (files == null) return;
-
-        for (File file : files) {
-            try {
-                if (file.isDirectory()) {
-                    collectAudioFilesRecursive(file, seenPaths, results);
-                    continue;
-                }
-
-                String path = file.getAbsolutePath();
-                if (seenPaths.contains(path)) continue;
-
-                String pathLower = path.toLowerCase();
-                if (pathLower.contains("/alarms/") || pathLower.contains("/ringtones/") ||
-                    pathLower.contains("/notifications/") || pathLower.contains("/android/media/")) continue;
-
-                String ext = "";
-                int dotIndex = path.lastIndexOf('.');
-                if (dotIndex > 0) ext = path.substring(dotIndex + 1).toLowerCase();
-                if (!AUDIO_EXTENSIONS.contains(ext)) continue;
-
-                MediaMetadataRetriever mmr = new MediaMetadataRetriever();
-                String title = null;
-                String artist = null;
-                String album = null;
-                long duration = 0;
-                try {
-                    mmr.setDataSource(path);
-                    title = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE);
-                    artist = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST);
-                    album = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM);
-                    String durationStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
-                    if (durationStr != null) duration = Long.parseLong(durationStr);
-                } catch (Exception e) {
-                    continue;
-                } finally {
-                    try { mmr.release(); } catch (Exception e) { /* ignore */ }
-                }
-
-                if (duration < 30000) continue;
-
-                String filename = file.getName();
-                JSObject song = new JSObject();
-                song.put("path", path);
-                song.put("filename", filename);
-                song.put("title", title != null ? title : filename);
-                song.put("artist", artist != null ? artist : "Unknown");
-                song.put("album", album != null ? album : "Unknown");
-                song.put("duration", duration);
-                song.put("dateModified", file.lastModified() / 1000);
-
-                File artFile = new File(getArtCacheDir(), artCacheKey(path) + ".jpg");
-                if (artFile.exists()) {
-                    song.put("artPath", artFile.getAbsolutePath());
-                }
-
-                results.put(song);
-                seenPaths.add(path);
-            } catch (Exception e) {
-                // Skip unreadable files and continue scanning.
-            }
-        }
-    }
-
     // ===== ALBUM ART =====
-
-    private File getArtCacheDir() {
-        File dir = new File(getContext().getCacheDir(), "albumart");
-        if (!dir.exists()) dir.mkdirs();
-        return dir;
-    }
-
-    private String artCacheKey(String filePath) {
-        // Use a hash of the file path as the cache key
-        return Integer.toHexString((ART_CACHE_KEY_PREFIX + filePath).hashCode());
-    }
 
     @PluginMethod
     public void getAlbumArtUri(PluginCall call) {
         String filePath = call.getString("path");
         if (filePath == null) { call.reject("No path"); return; }
 
-        File cacheFile = new File(getArtCacheDir(), artCacheKey(filePath) + ".jpg");
+        File cacheFile = AlbumArtHelper.cachedArtFile(getContext(), filePath);
         if (cacheFile.exists()) {
             JSObject ret = new JSObject();
             ret.put("uri", cacheFile.getAbsolutePath());
@@ -798,9 +627,8 @@ public class MusicBridgePlugin extends Plugin {
             return;
         }
 
-        // Extract on demand
         new Thread(() -> {
-            String result = extractAndCacheArt(filePath);
+            String result = AlbumArtHelper.extractAndCacheArt(getContext(), filePath);
             JSObject ret = new JSObject();
             ret.put("exists", result != null);
             ret.put("uri", result != null ? result : "");
@@ -810,27 +638,25 @@ public class MusicBridgePlugin extends Plugin {
 
     @PluginMethod
     public void extractAlbumArtBatch(PluginCall call) {
-        // Extract art for all given paths in background, notify progress
         JSArray pathsArray = call.getArray("paths");
         if (pathsArray == null) { call.reject("No paths"); return; }
 
         call.resolve(new JSObject().put("status", "started"));
 
         final MusicBridgePlugin self = this;
+        final android.content.Context ctx = getContext();
         new Thread(() -> {
-            File cacheDir = getArtCacheDir();
             int extracted = 0;
             int total = pathsArray.length();
             for (int i = 0; i < total; i++) {
                 try {
                     String path = pathsArray.getString(i);
-                    File cacheFile = new File(cacheDir, artCacheKey(path) + ".jpg");
-                    if (cacheFile.exists()) continue; // already cached
-                    String result = extractAndCacheArt(path);
+                    File cacheFile = AlbumArtHelper.cachedArtFile(ctx, path);
+                    if (cacheFile.exists()) continue;
+                    String result = AlbumArtHelper.extractAndCacheArt(ctx, path);
                     if (result != null) extracted++;
                 } catch (Exception e) { /* skip */ }
             }
-            // Notify JS that batch art extraction is done
             JSObject data = new JSObject();
             data.put("extracted", extracted);
             data.put("total", total);
@@ -838,89 +664,14 @@ public class MusicBridgePlugin extends Plugin {
         }).start();
     }
 
-    private String extractAndCacheArt(String filePath) {
-        try {
-            MediaMetadataRetriever mmr = new MediaMetadataRetriever();
-            mmr.setDataSource(filePath);
-            byte[] artBytes = mmr.getEmbeddedPicture();
-            mmr.release();
-
-            if (artBytes == null || artBytes.length == 0) return null;
-
-            // Decode and scale to thumbnail
-            BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inJustDecodeBounds = true;
-            BitmapFactory.decodeByteArray(artBytes, 0, artBytes.length, opts);
-
-            // Keep cached artwork large enough for the full player, then let CSS
-            // scale it down elsewhere.
-            int size = Math.max(opts.outWidth, opts.outHeight);
-            int sampleSize = 1;
-            while (size / sampleSize > 1536) sampleSize *= 2;
-
-            opts.inJustDecodeBounds = false;
-            opts.inSampleSize = sampleSize;
-            Bitmap bmp = BitmapFactory.decodeByteArray(artBytes, 0, artBytes.length, opts);
-            if (bmp == null) return null;
-
-            // Scale to a square large enough for full-screen rendering on high-DPI phones.
-            Bitmap thumb = Bitmap.createScaledBitmap(bmp, 960, 960, true);
-            if (thumb != bmp) bmp.recycle();
-
-            File outFile = new File(getArtCacheDir(), artCacheKey(filePath) + ".jpg");
-            FileOutputStream fos = new FileOutputStream(outFile);
-            thumb.compress(Bitmap.CompressFormat.JPEG, 92, fos);
-            fos.close();
-            thumb.recycle();
-
-            return outFile.getAbsolutePath();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    // ===== FILE READ =====
+    // ===== FILE I/O (delegated to FileBridgeHelper) =====
 
     @PluginMethod
     public void readTextFile(PluginCall call) {
         String path = call.getString("path");
-        if (path == null) {
-            call.reject("No path provided");
-            return;
-        }
-
+        if (path == null) { call.reject("No path provided"); return; }
         try {
-            File file = new File(path);
-            if (!file.exists()) {
-                Log.d("MusicBridge", "readTextFile: file not found: " + path);
-                JSObject ret = new JSObject();
-                ret.put("exists", false);
-                ret.put("content", "");
-                call.resolve(ret);
-                return;
-            }
-
-            long fileSize = file.length();
-            Log.d("MusicBridge", "readTextFile: " + path + " (" + fileSize + " bytes)");
-
-            FileInputStream fis = new FileInputStream(file);
-            BufferedReader reader = new BufferedReader(new InputStreamReader(fis, "UTF-8"));
-            StringBuilder sb = new StringBuilder((int) Math.min(fileSize, Integer.MAX_VALUE));
-            char[] buffer = new char[8192];
-            int charsRead;
-            while ((charsRead = reader.read(buffer)) != -1) {
-                sb.append(buffer, 0, charsRead);
-            }
-            reader.close();
-
-            String content = sb.toString();
-            Log.d("MusicBridge", "readTextFile: read " + content.length() + " chars");
-
-            JSObject ret = new JSObject();
-            ret.put("exists", true);
-            ret.put("content", content);
-            call.resolve(ret);
-
+            call.resolve(FileBridgeHelper.readTextFile(path));
         } catch (Exception e) {
             Log.e("MusicBridge", "readTextFile failed: " + e.getMessage(), e);
             call.reject("Read failed: " + e.getMessage());
@@ -931,53 +682,20 @@ public class MusicBridgePlugin extends Plugin {
     public void writeTextFile(PluginCall call) {
         String path = call.getString("path");
         String content = call.getString("content");
-        if (path == null || content == null) {
-            call.reject("Path and content required");
-            return;
-        }
+        if (path == null || content == null) { call.reject("Path and content required"); return; }
         try {
-            File file = new File(path);
-            File dir = file.getParentFile();
-            if (dir != null && !dir.exists()) dir.mkdirs();
-            FileOutputStream fos = new FileOutputStream(file);
-            fos.write(content.getBytes("UTF-8"));
-            fos.close();
-            JSObject ret = new JSObject();
-            ret.put("success", true);
-            call.resolve(ret);
+            call.resolve(FileBridgeHelper.writeTextFile(path, content));
         } catch (Exception e) {
             call.reject("Write failed: " + e.getMessage());
         }
     }
-
-    // ===== BINARY FILE I/O (for embedding cache) =====
 
     @PluginMethod
     public void readBinaryFile(PluginCall call) {
         String path = call.getString("path");
         if (path == null) { call.reject("No path provided"); return; }
         try {
-            File file = new File(path);
-            if (!file.exists()) {
-                JSObject ret = new JSObject();
-                ret.put("exists", false);
-                call.resolve(ret);
-                return;
-            }
-            FileInputStream fis = new FileInputStream(file);
-            byte[] bytes = new byte[(int) file.length()];
-            int offset = 0;
-            while (offset < bytes.length) {
-                int read = fis.read(bytes, offset, bytes.length - offset);
-                if (read < 0) break;
-                offset += read;
-            }
-            fis.close();
-            JSObject ret = new JSObject();
-            ret.put("exists", true);
-            ret.put("data", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP));
-            ret.put("size", bytes.length);
-            call.resolve(ret);
+            call.resolve(FileBridgeHelper.readBinaryFile(path));
         } catch (Exception e) {
             call.reject("Read failed: " + e.getMessage());
         }
@@ -989,16 +707,7 @@ public class MusicBridgePlugin extends Plugin {
         String base64Data = call.getString("data");
         if (path == null || base64Data == null) { call.reject("Path and data required"); return; }
         try {
-            byte[] bytes = android.util.Base64.decode(base64Data, android.util.Base64.NO_WRAP);
-            File file = new File(path);
-            File dir = file.getParentFile();
-            if (dir != null && !dir.exists()) dir.mkdirs();
-            FileOutputStream fos = new FileOutputStream(file);
-            fos.write(bytes);
-            fos.close();
-            JSObject ret = new JSObject();
-            ret.put("success", true);
-            call.resolve(ret);
+            call.resolve(FileBridgeHelper.writeBinaryFile(path, base64Data));
         } catch (Exception e) {
             call.reject("Write failed: " + e.getMessage());
         }
@@ -1008,11 +717,7 @@ public class MusicBridgePlugin extends Plugin {
     public void getFileModified(PluginCall call) {
         String path = call.getString("path");
         if (path == null) { call.reject("No path provided"); return; }
-        File file = new File(path);
-        JSObject ret = new JSObject();
-        ret.put("exists", file.exists());
-        ret.put("lastModified", file.exists() ? file.lastModified() : 0);
-        call.resolve(ret);
+        call.resolve(FileBridgeHelper.getFileModified(path));
     }
 
     @PluginMethod
@@ -1020,10 +725,7 @@ public class MusicBridgePlugin extends Plugin {
         String path = call.getString("path");
         if (path == null) { call.reject("No path provided"); return; }
         try {
-            File file = new File(path);
-            JSObject ret = new JSObject();
-            ret.put("success", !file.exists() || file.delete());
-            call.resolve(ret);
+            call.resolve(FileBridgeHelper.deleteFile(path));
         } catch (Exception e) {
             call.reject("Delete failed: " + e.getMessage());
         }
@@ -1035,16 +737,8 @@ public class MusicBridgePlugin extends Plugin {
         String to = call.getString("to");
         if (from == null || to == null) { call.reject("From and to required"); return; }
         try {
-            File src = new File(from);
-            File dest = new File(to);
-            File parent = dest.getParentFile();
-            if (parent != null && !parent.exists()) parent.mkdirs();
-            if (dest.exists()) dest.delete();
-            boolean ok = src.renameTo(dest);
-            if (!ok) {
-                call.reject("Rename failed");
-                return;
-            }
+            String err = FileBridgeHelper.renameFile(from, to);
+            if (err != null) { call.reject(err); return; }
             JSObject ret = new JSObject();
             ret.put("success", true);
             call.resolve(ret);
@@ -1055,132 +749,14 @@ public class MusicBridgePlugin extends Plugin {
 
     /**
      * Convert local_embeddings.json to binary cache (bin + meta.json) natively.
-     * This avoids passing 16MB+ JSON through the Capacitor bridge which can silently fail.
-     * Called from JS when JSON exists but binary cache doesn't.
+     * Avoids passing 16MB+ JSON through the Capacitor bridge which can silently fail.
      */
     @PluginMethod
     public void convertEmbeddingsJsonToBinary(PluginCall call) {
+        final android.content.Context ctx = getContext();
         new Thread(() -> {
             try {
-                File dir = getContext().getExternalFilesDir(null);
-                if (dir == null) dir = getContext().getFilesDir();
-                File jsonFile = new File(dir, "local_embeddings.json");
-                if (!jsonFile.exists()) {
-                    JSObject ret = new JSObject();
-                    ret.put("success", false);
-                    ret.put("reason", "json_not_found");
-                    call.resolve(ret);
-                    return;
-                }
-
-                Log.d("MusicBridge", "Converting local_embeddings.json (" + jsonFile.length() + " bytes) to binary cache...");
-
-                // Read and parse JSON
-                FileInputStream fis = new FileInputStream(jsonFile);
-                byte[] jsonBytes = new byte[(int) jsonFile.length()];
-                int offset = 0;
-                while (offset < jsonBytes.length) {
-                    int read = fis.read(jsonBytes, offset, jsonBytes.length - offset);
-                    if (read < 0) break;
-                    offset += read;
-                }
-                fis.close();
-
-                JSONObject root = new JSONObject(new String(jsonBytes, "UTF-8"));
-                jsonBytes = null; // free memory
-
-                // Extract entries
-                JSONObject pathIndex = root.optJSONObject("_path_index");
-                if (pathIndex == null) pathIndex = new JSONObject();
-
-                java.util.List<String> keys = new ArrayList<>();
-                java.util.List<String> filepaths = new ArrayList<>();
-                java.util.List<String> contentHashes = new ArrayList<>();
-                java.util.List<Long> timestamps = new ArrayList<>();
-                java.util.List<String> filenames = new ArrayList<>();
-                java.util.List<String> artists = new ArrayList<>();
-                java.util.List<String> albums = new ArrayList<>();
-                int dim = 0;
-
-                java.util.Iterator<String> it = root.keys();
-                while (it.hasNext()) {
-                    String key = it.next();
-                    if ("_path_index".equals(key)) continue;
-                    JSONObject entry = root.optJSONObject(key);
-                    if (entry == null) continue;
-                    JSONArray emb = entry.optJSONArray("embedding");
-                    if (emb == null || emb.length() == 0) continue;
-                    if (dim == 0) dim = emb.length();
-                    keys.add(key);
-                    filepaths.add(entry.optString("filepath", ""));
-                    contentHashes.add(entry.optString("content_hash", entry.optString("contentHash", "")));
-                    timestamps.add(entry.optLong("timestamp", 0));
-                    filenames.add(entry.optString("filename", ""));
-                    artists.add(entry.optString("artist", ""));
-                    albums.add(entry.optString("album", ""));
-                }
-
-                if (keys.isEmpty() || dim == 0) {
-                    JSObject ret = new JSObject();
-                    ret.put("success", false);
-                    ret.put("reason", "no_entries");
-                    call.resolve(ret);
-                    return;
-                }
-
-                // Pack embeddings into float array → byte array
-                int totalFloats = keys.size() * dim;
-                java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(totalFloats * 4);
-                buf.order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                for (int i = 0; i < keys.size(); i++) {
-                    String key = keys.get(i);
-                    JSONArray emb = root.getJSONObject(key).getJSONArray("embedding");
-                    for (int j = 0; j < dim; j++) {
-                        buf.putFloat((float) emb.getDouble(j));
-                    }
-                }
-                byte[] binBytes = buf.array();
-
-                // Write .bin file
-                File binFile = new File(dir, "local_embeddings.bin");
-                FileOutputStream binOut = new FileOutputStream(binFile);
-                binOut.write(binBytes);
-                binOut.close();
-
-                // Build and write meta JSON
-                JSONObject meta = new JSONObject();
-                meta.put("dim", dim);
-                meta.put("pathIndex", pathIndex);
-                JSONArray entriesArr = new JSONArray();
-                for (int i = 0; i < keys.size(); i++) {
-                    JSONObject e = new JSONObject();
-                    e.put("key", keys.get(i));
-                    e.put("filepath", filepaths.get(i));
-                    e.put("contentHash", contentHashes.get(i));
-                    e.put("timestamp", timestamps.get(i));
-                    e.put("filename", filenames.get(i));
-                    e.put("artist", artists.get(i));
-                    e.put("album", albums.get(i));
-                    entriesArr.put(e);
-                }
-                meta.put("entries", entriesArr);
-
-                File metaFile = new File(dir, "local_embeddings_meta.json");
-                FileOutputStream metaOut = new FileOutputStream(metaFile);
-                metaOut.write(meta.toString().getBytes("UTF-8"));
-                metaOut.close();
-
-                // Touch bin file to be newer than json (so cache is considered fresh)
-                binFile.setLastModified(jsonFile.lastModified() + 1000);
-
-                Log.d("MusicBridge", "Binary cache created: " + keys.size() + " entries, " + dim + "d, " + binBytes.length + " bytes");
-
-                JSObject ret = new JSObject();
-                ret.put("success", true);
-                ret.put("entries", keys.size());
-                ret.put("dim", dim);
-                call.resolve(ret);
-
+                call.resolve(FileBridgeHelper.convertEmbeddingsJsonToBinary(ctx));
             } catch (Exception e) {
                 Log.e("MusicBridge", "convertEmbeddingsJsonToBinary failed", e);
                 call.reject("Conversion failed: " + e.getMessage());

@@ -12,6 +12,7 @@ import android.util.Log;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
+import ai.onnxruntime.providers.NNAPIFlags;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -27,6 +28,7 @@ import java.nio.FloatBuffer;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -76,6 +78,15 @@ public class EmbeddingService {
     private int currentOrtThreads = 0;
     private boolean isInitialized = false;
     private volatile boolean cancelled = false;
+
+    // Backend tracking — set during ensureOrtSessionForCurrentPolicy().
+    // One of: "nnapi+fp16", "nnapi", "cpu", "cpu_fallback".
+    // Once NNAPI fails to create a session, nnapiPermanentlyDisabled stays true so
+    // we don't repeat the slow failed-init path on every policy switch.
+    private volatile String activeBackend = "cpu";
+    private volatile boolean nnapiPermanentlyDisabled = false;
+
+    public String getActiveBackend() { return activeBackend; }
 
     // Callback for progress/completion
     public interface PlaybackActivityProvider {
@@ -169,24 +180,85 @@ public class EmbeddingService {
                 ortSession = null;
             }
 
-            OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-            opts.setIntraOpNumThreads(desiredThreads);
-            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+            // Attempt NNAPI hardware acceleration (Android 8.1+ / API 27+).
+            // NNAPI delegates ops to the device's neural accelerator (NPU/GPU/DSP);
+            // unsupported ops fall back to CPU automatically inside ONNX Runtime.
+            // If session creation with NNAPI fails entirely (very old/buggy NNAPI driver),
+            // we retry once with CPU only and remember to skip NNAPI for the rest of the session.
+            OrtSession.SessionOptions opts = buildSessionOptions(desiredThreads, /* tryNnapi */ !nnapiPermanentlyDisabled);
+            String attemptedBackend = activeBackend;
 
-            // Load from filesystem path so ONNX can find the .data file.
-            ortSession = ortEnv.createSession(modelFilePath, opts);
+            try {
+                ortSession = ortEnv.createSession(modelFilePath, opts);
+            } catch (Throwable t) {
+                if (attemptedBackend.startsWith("nnapi")) {
+                    Log.w(TAG, "Session creation failed with " + attemptedBackend
+                            + " (" + t.getClass().getSimpleName() + ": " + t.getMessage()
+                            + ") — retrying CPU-only");
+                    nnapiPermanentlyDisabled = true;
+                    try {
+                        opts.close();
+                    } catch (Throwable ignored) {
+                    }
+                    opts = buildSessionOptions(desiredThreads, /* tryNnapi */ false);
+                    ortSession = ortEnv.createSession(modelFilePath, opts);
+                } else {
+                    throw t;
+                }
+            }
+
             isInitialized = true;
             currentOrtThreads = desiredThreads;
             Log.i(TAG, "ONNX session ready (threads=" + desiredThreads
+                    + ", backend=" + activeBackend
                     + ", reason=" + getCurrentThrottleReason() + ")");
             return true;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
             Log.e(TAG, "Failed to prepare ONNX session", e);
             isInitialized = false;
             currentOrtThreads = 0;
             return false;
         }
+    }
+
+    /**
+     * Build SessionOptions for the desired thread count. If tryNnapi is true and the
+     * device API level supports NNAPI, attempts to add NNAPI execution provider with
+     * FP16 enabled, falling back to NNAPI without FP16, then to CPU-only on any failure.
+     * Sets {@link #activeBackend} to one of: "nnapi+fp16", "nnapi", "cpu".
+     */
+    private OrtSession.SessionOptions buildSessionOptions(int desiredThreads, boolean tryNnapi) throws Exception {
+        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        opts.setIntraOpNumThreads(desiredThreads);
+        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+
+        String backend = "cpu";
+        if (tryNnapi && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            // First try with FP16 — fastest path on devices that support it.
+            try {
+                EnumSet<NNAPIFlags> flags = EnumSet.of(NNAPIFlags.USE_FP16);
+                opts.addNnapi(flags);
+                backend = "nnapi+fp16";
+                Log.i(TAG, "NNAPI execution provider enabled with FP16");
+            } catch (Throwable t1) {
+                Log.w(TAG, "NNAPI+FP16 init failed (" + t1.getClass().getSimpleName()
+                        + ": " + t1.getMessage() + ") — trying NNAPI without FP16");
+                try {
+                    opts.addNnapi();
+                    backend = "nnapi";
+                    Log.i(TAG, "NNAPI execution provider enabled (FP32)");
+                } catch (Throwable t2) {
+                    Log.w(TAG, "NNAPI not available on this device ("
+                            + t2.getClass().getSimpleName() + ": " + t2.getMessage()
+                            + ") — using CPU");
+                    // backend stays "cpu" — opts already configured CPU-only.
+                }
+            }
+        }
+
+        activeBackend = backend;
+        return opts;
     }
 
     private void extractAssetIfNeeded(String assetName, File destFile) throws Exception {
@@ -297,33 +369,32 @@ public class EmbeddingService {
                     List<float[]> windows = extractWindows(audioSamples);
                     audioSamples = null; // release large decoded array
 
-                    // Run ONNX inference on each window
-                    List<float[]> windowEmbeddings = new ArrayList<>();
+                    // Run ONNX inference. Batch all windows in a single forward pass when
+                    // possible — ~2x faster than 3 separate sessions for typical songs.
+                    // Single-window short songs use the same code path; batch=1 just runs once.
+                    List<float[]> windowEmbeddings;
                     boolean inferenceSetupFailed = false;
-                    for (int w = 0; w < windows.size(); w++) {
-                        if (!yieldForPolicy("window_" + (w + 1) + "_inference:" + filename)) {
-                            writeLocalEmbeddings(localEmbeddings);
-                            callback.onComplete(processed, failed);
-                            return;
-                        }
-                        if (!ensureOrtSessionForCurrentPolicy()) {
-                            callback.onError("Failed to prepare ONNX Runtime: " + lastError, path);
-                            failed++;
-                            inferenceSetupFailed = true;
-                            break;
-                        }
-                        float[] emb = runInference(windows.get(w));
-                        if (emb != null) {
-                            windowEmbeddings.add(emb);
-                        }
-                        windows.set(w, null); // release window after inference
-                        if (!yieldForPolicy("window_" + (w + 1) + "_complete:" + filename)) {
-                            writeLocalEmbeddings(localEmbeddings);
-                            callback.onComplete(processed, failed);
-                            return;
-                        }
+                    if (!yieldForPolicy("inference:" + filename)) {
+                        writeLocalEmbeddings(localEmbeddings);
+                        callback.onComplete(processed, failed);
+                        return;
                     }
+                    if (!ensureOrtSessionForCurrentPolicy()) {
+                        callback.onError("Failed to prepare ONNX Runtime: " + lastError, path);
+                        failed++;
+                        inferenceSetupFailed = true;
+                        windowEmbeddings = Collections.emptyList();
+                    } else {
+                        windowEmbeddings = runInferenceBatch(windows);
+                    }
+                    // Release window arrays now that inference (or its fallback) is done.
+                    for (int w = 0; w < windows.size(); w++) windows.set(w, null);
                     windows = null;
+                    if (!yieldForPolicy("inference_complete:" + filename)) {
+                        writeLocalEmbeddings(localEmbeddings);
+                        callback.onComplete(processed, failed);
+                        return;
+                    }
 
                     if (inferenceSetupFailed) {
                         continue;
@@ -799,6 +870,91 @@ public class EmbeddingService {
             Log.e(TAG, "Inference error: " + e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Run ONNX inference on N windows in a single batched forward pass.
+     * Input: List of N float[WINDOW_SAMPLES] arrays.
+     * Output: List of N float[EMBEDDING_DIM] embeddings (same order, not normalized).
+     *
+     * For typical 3-window songs this is ~2x faster than 3 separate runInference()
+     * calls because session setup, tensor allocation, and NPU dispatch happen once
+     * instead of three times. Falls through to runInference() per window if the batch
+     * call fails (e.g., NNAPI driver doesn't handle batch dim &gt; 1 for some op).
+     */
+    private List<float[]> runInferenceBatch(List<float[]> windows) {
+        if (windows == null || windows.isEmpty()) return Collections.emptyList();
+        if (windows.size() == 1) {
+            // No batching benefit; use single-window path which already exists.
+            float[] emb = runInference(windows.get(0));
+            return emb != null ? Collections.singletonList(emb) : Collections.emptyList();
+        }
+
+        OnnxTensor inputTensor = null;
+        OrtSession.Result result = null;
+        try {
+            if (!ensureOrtSessionForCurrentPolicy()) {
+                return Collections.emptyList();
+            }
+            int batch = windows.size();
+            // Create batched input tensor: shape [batch, WINDOW_SAMPLES]
+            float[][] input2d = new float[batch][WINDOW_SAMPLES];
+            for (int i = 0; i < batch; i++) {
+                float[] w = windows.get(i);
+                if (w == null || w.length != WINDOW_SAMPLES) {
+                    Log.w(TAG, "Batch inference: window " + i + " has wrong shape, falling back to per-window");
+                    return runInferencePerWindow(windows);
+                }
+                System.arraycopy(w, 0, input2d[i], 0, WINDOW_SAMPLES);
+            }
+
+            inputTensor = OnnxTensor.createTensor(ortEnv, input2d);
+            Map<String, OnnxTensor> inputs = new HashMap<>();
+            inputs.put("waveform", inputTensor);
+
+            result = ortSession.run(inputs);
+
+            // Output: shape [batch, EMBEDDING_DIM]
+            float[][] output = (float[][]) result.get(0).getValue();
+            if (output == null || output.length != batch) {
+                Log.w(TAG, "Batch inference: unexpected output shape, falling back to per-window");
+                return runInferencePerWindow(windows);
+            }
+
+            List<float[]> embeddings = new ArrayList<>(batch);
+            for (int i = 0; i < batch; i++) {
+                if (output[i] == null || output[i].length != EMBEDDING_DIM) {
+                    Log.w(TAG, "Batch inference: row " + i + " has wrong dim, falling back to per-window");
+                    return runInferencePerWindow(windows);
+                }
+                embeddings.add(output[i]);
+            }
+            return embeddings;
+
+        } catch (Throwable e) {
+            Log.w(TAG, "Batch inference failed (" + e.getClass().getSimpleName() + ": "
+                    + e.getMessage() + ") — falling back to per-window inference");
+            return runInferencePerWindow(windows);
+        } finally {
+            if (inputTensor != null) {
+                try { inputTensor.close(); } catch (Throwable ignored) {}
+            }
+            if (result != null) {
+                try { result.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /** Per-window fallback path used when batched inference is unavailable. */
+    private List<float[]> runInferencePerWindow(List<float[]> windows) {
+        List<float[]> embeddings = new ArrayList<>(windows.size());
+        for (int i = 0; i < windows.size(); i++) {
+            float[] w = windows.get(i);
+            if (w == null) continue;
+            float[] emb = runInference(w);
+            if (emb != null) embeddings.add(emb);
+        }
+        return embeddings;
     }
 
     // ===== EMBEDDING MATH =====

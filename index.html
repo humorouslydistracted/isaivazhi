@@ -11,82 +11,101 @@
 </head>
 <body>
 
-
-<div class="search-bar" id="searchBar" style="display:none;">
-    <input type="text" id="searchInput" placeholder="Search songs, artists, albums...">
-    <button class="search-clear" id="searchClear" onclick="window._app.clearSearch()" style="display:none;">&times;</button>
+<div class="top-bar" id="topBar">
+    <button class="top-bar-menu" id="hamburgerBtn" aria-label="Open menu">&#9776;</button>
+    <div class="top-bar-search">
+        <input type="text" id="searchInput" placeholder="Search songs, artists, albums..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+        <button class="top-bar-search-clear" id="searchClear" onclick="window._app.clearSearch()" style="display:none;" aria-label="Clear search">&times;</button>
+    </div>
 </div>
 
 <div id="statusToast" class="status-toast" style="display:none;"></div>
 
-<!-- On-screen debug log — hidden. Uncomment this block to re-enable the DBG button + log panel.
-<div id="debugLogToggle" style="position:fixed;top:calc(env(safe-area-inset-top, 24px) + 14px);left:10px;z-index:100000;background:#e84545;color:#fff;padding:6px 14px;font-size:12px;border-radius:8px;cursor:pointer;" onclick="var p=document.getElementById('debugLogPanel');p.style.display=p.style.display==='none'?'block':'none';">DBG</div>
-<div id="debugLogPanel" style="display:none;position:fixed;top:calc(env(safe-area-inset-top, 24px) + 50px);left:0;right:0;bottom:0;z-index:99999;background:rgba(0,0,0,0.95);color:#0f0;font-family:monospace;font-size:11px;overflow-y:auto;padding:8px;white-space:pre-wrap;word-break:break-all;">
-<div id="debugLogCopyBtn" style="position:sticky;top:0;background:#333;color:#fff;padding:8px 16px;border-radius:6px;text-align:center;cursor:pointer;margin-bottom:8px;" onclick="var t=document.getElementById('debugLogText').textContent;navigator.clipboard.writeText(t).then(function(){document.getElementById('debugLogCopyBtn').textContent='Copied!';setTimeout(function(){document.getElementById('debugLogCopyBtn').textContent='Copy Logs';},1500);});">Copy Logs</div>
-<div id="debugLogText"></div>
-</div>
--->
-
 <div class="content">
-    <div class="panel active" id="panel-discover">
-        <div class="discover-top">
-            <div id="profile-stats" class="profile-stats" style="display:none;"></div>
-            <div id="recommendationStatus" class="recommendation-status"></div>
+    <!-- 2026-05-10 follow-up #10: tabs are now a horizontal CSS scroll-snap
+         strip. Browser handles the swipe gesture natively (60fps), so the
+         JS swipe handler in app.js was removed. Each panel is its own
+         vertical scroll container. Tab clicks call `panelStrip.scrollTo()`
+         programmatically; manual swipes are detected by an
+         IntersectionObserver that updates `activeTab`. -->
+    <div class="panel-strip" id="panelStrip">
+        <div class="panel active" id="panel-discover" data-tab="discover">
+            <div class="discover-top">
+                <div id="profile-stats" class="profile-stats" style="display:none;"></div>
+                <div id="recommendationStatus" class="recommendation-status"></div>
+            </div>
+
+            <div class="pull-indicator" id="pullIndicator"></div>
+            <div id="discover-pull-body" class="discover-pull-body">
+                <div class="section-header clickable" id="similar-header" onclick="window._app.viewAll('similar')">Most Similar
+                    <div class="section-actions">
+                        <button class="similar-freeze-btn" id="similarFreezeBtn" onclick="event.stopPropagation(); window._app.toggleSimilarFreeze()">Freeze</button>
+                        <span class="action-hint">View All &rsaquo;</span>
+                    </div>
+                </div>
+                <div class="hscroll-wrap" id="similar-list"></div>
+
+                <div class="section-header clickable" onclick="window._app.viewAll('forYou')">For You<span class="section-badge" id="foryou-badge"></span></div>
+                <div class="hscroll-wrap" id="for-you-list"></div>
+
+                <div id="because-you-played"></div>
+
+                <div class="section-header" id="unexplored-header" style="display:none;">Unexplored Sounds</div>
+                <div id="unexplored-clusters"></div>
+            </div>
         </div>
 
-        <div class="pull-indicator" id="pullIndicator"></div>
-        <div id="discover-pull-body" class="discover-pull-body">
-            <div class="section-header clickable" id="similar-header" onclick="window._app.viewAll('similar')">Most Similar
+        <div class="panel" id="panel-songs" data-tab="songs"></div>
+        <div class="panel" id="panel-albums" data-tab="albums"></div>
+        <div class="panel" id="panel-recs" data-tab="recs">
+            <div class="recs-toolbar">
+                <div class="section-header">
+                    <span>Up Next</span>
+                    <div class="section-actions">
+                        <label class="rec-toggle-label">
+                            <input type="checkbox" id="recToggle" checked onchange="window._app.toggleRec(this.checked)">
+                            <span class="rec-toggle-slider"></span>
+                            <span class="rec-toggle-text">AI</span>
+                        </label>
+                        <button class="action-btn" onclick="window._app.refreshRecs()">Refresh</button>
+                    </div>
+                </div>
+                <div class="session-label" id="recs-session-label" style="display:none;"></div>
+            </div>
+            <div class="recs-list-wrap" id="recs-list-wrap">
+                <div id="recs-list"></div>
+            </div>
+        </div>
+        <div class="panel" id="panel-browse" data-tab="browse">
+            <div id="browse-tiles" class="discover-tiles browse-tiles"></div>
+            <div class="section-header" id="playlist-header">
+                <span>Playlists</span>
                 <div class="section-actions">
-                    <button class="similar-freeze-btn" id="similarFreezeBtn" onclick="event.stopPropagation(); window._app.toggleSimilarFreeze()">Freeze</button>
-                    <span class="action-hint">View All &rsaquo;</span>
+                    <button class="action-btn" onclick="window._app.showPlaylistCreator()">+ New</button>
                 </div>
             </div>
-            <div class="hscroll-wrap" id="similar-list"></div>
-
-            <div class="section-header clickable" onclick="window._app.viewAll('forYou')">For You<span class="section-badge" id="foryou-badge"></span></div>
-            <div class="hscroll-wrap" id="for-you-list"></div>
-
-            <div id="because-you-played"></div>
-
-            <div class="section-header" id="unexplored-header" style="display:none;">Unexplored Sounds</div>
-            <div id="unexplored-clusters"></div>
+            <div id="playlists-list" class="playlist-tiles"></div>
         </div>
     </div>
-
-    <div class="panel" id="panel-songs"></div>
-    <div class="panel" id="panel-albums"></div>
-    <div class="panel" id="panel-browse">
-        <div id="browse-tiles" class="discover-tiles browse-tiles"></div>
-        <div class="section-header" id="playlist-header">
-            <span>Playlists</span>
-            <div class="section-actions">
-                <button class="action-btn" onclick="window._app.showPlaylistCreator()">+ New</button>
-            </div>
-        </div>
-        <div id="playlists-list" class="playlist-tiles"></div>
-    </div>
-    <div class="panel" id="panel-recs">
-        <div class="recs-toolbar">
-            <div class="section-header">
-                <span>Up Next</span>
-                <div class="section-actions">
-                    <label class="rec-toggle-label">
-                        <input type="checkbox" id="recToggle" checked onchange="window._app.toggleRec(this.checked)">
-                        <span class="rec-toggle-slider"></span>
-                        <span class="rec-toggle-text">AI</span>
-                    </label>
-                    <button class="action-btn" onclick="window._app.refreshRecs()">Refresh</button>
-                </div>
-            </div>
-            <div class="session-label" id="recs-session-label" style="display:none;"></div>
-        </div>
-        <div class="recs-list-wrap" id="recs-list-wrap">
-            <div id="recs-list"></div>
-        </div>
-    </div>
-    <div class="panel" id="panel-history" style="display:none;">
+    <!-- panel-history is hidden / out-of-tab; not part of the snap strip. -->
+    <div class="panel panel-floating" id="panel-history" style="display:none;">
         <div id="history-list"></div>
+    </div>
+
+    <!-- 2026-05-10 follow-up #12: universal search results overlay.
+         Shown whenever the top-bar search input has any text. Covers
+         the panel-strip; X button (or empty input) hides it and reveals
+         the previously-active tab unchanged. -->
+    <div class="search-overlay" id="searchOverlay" style="display:none;">
+        <div class="search-section">
+            <div class="search-section-header"><span>Songs</span><span class="search-section-count" id="searchCountSongs"></span></div>
+            <div id="search-results-songs" class="search-results-list"></div>
+        </div>
+        <div class="search-section">
+            <div class="search-section-header"><span>Albums</span><span class="search-section-count" id="searchCountAlbums"></span></div>
+            <div id="search-results-albums" class="search-results-list"></div>
+        </div>
+        <div class="search-empty" id="searchEmpty" style="display:none;">No matches</div>
     </div>
 </div>
 

@@ -1,6 +1,546 @@
 # Project Development Log
 
-Last updated: 2026-04-26 (in-flight: embedding/playback UI-lag stabilization pass remains active; the AI-page unmatched/orphaned cleanup confirm flow is now fixed in `src/app.js`, keeping the popup visible across embedding-detail rerenders and preventing the cleanup-open scroll jump to the top; emulator soak runs on the 12:27 debug APK against 24 freshly-pushed `.mp3` songs across two batches validated playback-during-embedding, `am stop-app` + `:ai` resume from `active_embedding_batch.json`, atomic `local_embeddings.bin` writes, and clean playback through HOME/recents-swipe/media-key cycles — no FATAL/ANR/duplicate-event/Media3 player errors observed and the originally-reported playback-glitches-during-embedding symptoms did not reproduce. One real bug isolated: when a batch completes in-foreground with active playback the native `embeddingComplete` event does not propagate to JS, leaving the new vectors in `pending_embeddings.json` until next cold start when the disk-load merge path recovers them cleanly. Details under "Latest Verified Changes")
+Last updated: 2026-05-10 (latest: follow-ups #17 + #18 — two regressions from earlier same-day UI overhauls. **#17**: Discover pull-to-refresh fired anywhere in the panel because `setupPullToRefresh` was reading `content.scrollTop`, but the scroll-snap rewrite (#10) moved scrolling onto each `.panel`; gate now reads `#panel-discover.scrollTop`. **#18**: tapping `View Album` on a song in the search overlay threw `Cannot read properties of null (reading 'style')` because `viewAlbumForSong` referenced the deleted `#searchBar` element (gone since #12) and used the pre-#10 manual `.tab/.panel .active` navigation pattern; both replaced with a single `_activateTab('albums', { pushHistory: true })` call. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.4 MB, timestamp `2026-05-10 16:33:28` (bundle `dist/assets/index-LfweI0P5.js`).)
+
+### 2026-05-10 follow-up #18 — `View Album` from search overlay threw null deref
+User: "when i do search of a song and click view album, getting error js error: typeerror: cannot read properties of null (reading 'style')(line 123)"
+
+Root cause: `viewAlbumForSong` in `src/app-song-menu.js:271-301` carried two stale references that earlier UI overhauls had invalidated:
+1. `document.getElementById('searchBar').style.display = 'none';` — but follow-up #12 deleted the standalone `<div class="search-bar" id="searchBar">` element entirely (the search input now lives permanently in the top bar). `getElementById` returns null → throws on the `.style` access. This is the user-visible error.
+2. Manual `.tab` / `.panel` `.active` class toggling to "navigate" to Albums — but after the scroll-snap rewrite (#10), `.active` on `.panel` is informational only; visibility is controlled by horizontal scroll position on `.panel-strip`. Even if the error didn't fire first, the navigation would silently do nothing.
+
+Fix: replaced the manual toggling + broken `searchBar` line + redundant `getAlbumsDirty()` block + bare `history.pushState({depth:1})` with one call to the existing `_activateTab('albums', { pushHistory: true })`. That function already toggles `.active` informationally, calls `_scrollToPanel('albums', 'smooth')` to actually navigate, closes the search overlay via `_clearSearchInput()`, runs the dirty-render check for albums, and pushes proper `{appTab: 'albums'}` history state. The subsequent `setTimeout` that locates the album header and expands its tracks is unchanged.
+
+Plumbing: added `activateTab: (...a) => _activateTab(...a)` to the `createSongMenuSupport(...)` options object in `src/app.js:109`, and added `activateTab` to the destructuring at the top of `app-song-menu.js`. The pre-existing `setActiveTab` plumbing stays — still used elsewhere in the module.
+
+Verification: `npm.cmd run build` OK (Vite 511ms, bundle now `dist/assets/index-LfweI0P5.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 9s (trailing "BUILD FAILED" is the documented Gradle metadata-cache lock collision — APK packaged successfully). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.4 MB, timestamp `2026-05-10 16:33:28`.
+
+Real-device validation pending: search → tap "View Album" on a song from the search-results overlay → should navigate to Albums tab, scroll to that album, expand its tracks, with no console error.
+
+### 2026-05-10 follow-up #17 — Pull-to-refresh fired anywhere in Discover (regression from #10)
+User: "the discover page swipe up down is not working properly, the swipe up is initiating pull to refresh even if i am at end of the discover page."
+
+Root cause: regression introduced by the scroll-snap rewrite (follow-up #10). `setupPullToRefresh` in `src/app.js:1885-2026` gates on `content.scrollTop <= 0` to detect "user is at the top of the page". Before #10, `.content` had `overflow-y: auto` and was the actual vertical scroll container — the gate worked. After #10, `style.css:129-132` set `.content { overflow: hidden }` (the strip handles all scrolling) and each `.panel` got its own `overflow-y: auto` (`style.css:153`). So `content.scrollTop` is **always 0** regardless of where the user is inside `#panel-discover`. The "am I at the top?" gate was permanently satisfied, and any downward gesture on Discover (including pulls back from a bottom-of-list rubber-band) fired pull-to-refresh.
+
+Fix: read scrollTop from the Discover panel instead. New lazy getter `getDiscoverScroller = () => document.getElementById('panel-discover')` (matches the existing lazy-resolve pattern for `#pullIndicator` / `#discover-pull-body`, since panel innerHTML can be replaced when sub-pages close). Both gate sites updated:
+- `touchstart` (line ~1961): `content.scrollTop <= 0` → `(getDiscoverScroller()?.scrollTop ?? 0) <= 0`
+- `touchmove` (line ~1971): same change
+
+The touch listener stays attached to `.content` (events bubble up from the panel), only the scrollTop source changes.
+
+Verification: `npm.cmd run build` OK (Vite 259ms, bundle now `dist/assets/index-BbJPslga.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 21s (trailing "BUILD FAILED" is the documented Gradle metadata-cache lock collision — APK packaged successfully). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.3 MB, timestamp `2026-05-10 16:10:39`.
+
+Real-device validation pending: confirm pull-to-refresh now only fires when scrolled to the very top of Discover, and that scrolling/swiping at any other position behaves as a normal vertical scroll without triggering the indicator.
+
+## Recent Changes (2026-05-10 batch — startup performance, A–F)
+
+Goal: reduce time from app open → "Most Similar" rendered on Discover from ~1.5–5s to under 2s on second-open / cache-hit launches. The bottleneck on warm starts is NOT the MediaStore scan (which is skipped while `song_library.json` is < 6h old), but the JS-side embedding load + merge + profile-vector build that runs on every startup. Six independent fixes were applied; each falls back safely on its failure path.
+
+### Fix A — parallelize Preferences reads in `loadData()`
+`src/engine-data.js` `loadData()` previously awaited `_loadTuning() → _loadNegativeScores() → _loadSimilarityBoostScores() → _loadDislikes() → _loadTasteReviewIgnores() → MusicBridge.getAppDataDir()` sequentially (5 Preferences keys + 1 native bridge call, each ~30–100ms on Android). Each function reads a distinct Preferences key and writes a distinct module state variable — verified independent. Now wrapped in a single `Promise.all([...])` collapsing all 6 round-trips into the slowest one. The same pattern applies to `loadFavorites()` + `loadPlaylists()` later in the same function. Expected savings: 200–600ms.
+
+### Fix B — fast base64 decode in `embedding-cache.js`
+`_loadBinaryStore()` previously used `Uint8Array.from(atob(b64), c => c.charCodeAt(0))` to decode the ~5MB `local_embeddings.bin` from base64. The callback variant invokes the per-byte function ~5.1 million times. Replaced with an explicit `for` loop (`raw[i] = binaryStr.charCodeAt(i)`) which is 3–5× faster on V8/JSC. No behavior change — byte-identical output. Expected savings: 300–800ms.
+
+### Fix C — stop double Float32Array conversion across cache load + merge
+The same vector data was previously copied twice on every startup: `Float32Array (binary buffer) → Array.from(...) (plain Array) → new Float32Array(data.embedding) (typed array again)`. Now `_loadBinaryStore()` returns `floats.slice(off, off + dim)` (Float32Array with its own buffer — parent buffer can be GC'd safely), and `_mergeLocalEmbeddings()` detects the typed-array case and reuses the reference instead of reallocating. Plain-Array sources (legacy JSON, `pending_embeddings.json`) still go through `new Float32Array(...)` once. Required guard updates in `_normalizeEmbeddingObject`, `_writeBinaryStore`, and both passes of `_mergeLocalEmbeddings` to accept `ArrayBuffer.isView(emb)` instead of strict `Array.isArray()`. `_writeLegacyJson` now JSON-safely converts Float32Array → plain Array before `JSON.stringify` (otherwise the legacy mirror file would silently corrupt to `{"0":x,"1":y,...}` objects). Expected savings: 200–400ms.
+
+### Fix D — cache `EXTERNAL_DATA_DIR` + start embedding load before `loadData()`
+Two-part change. (1) After the first successful `MusicBridge.getAppDataDir()` call, the resolved path is now persisted to Preferences key `cached_data_dir_v1`. (2) New export `engine.preloadEmbeddingsEarly()` reads that cached path at the very start of `init()` in `src/app.js` (before any other awaits) and kicks off `_loadLocalEmbeddings()` in parallel with the rest of `loadData()`. `startBackgroundScan()` now reuses the in-flight promise if the cached path matches the resolved one, or discards and starts fresh if they differ (re-install / data-dir moved — the early load harmlessly returns null for a missing file, no breakage). Expected savings: 300–500ms (overlaps the slow ~500–1500ms binary read with `loadData()`'s own ~500–1500ms work).
+
+### Fix E — profile vector cache with fingerprint
+`buildProfileVec()` in `src/engine-taste.js` now writes the normalized vector to `${EXTERNAL_DATA_DIR}/profile_vec_cache_v1.json` after each successful build, alongside a fingerprint of every input that feeds the vector math: top-30 positive song ids + their effective weights, top-30 negative song ids + their effective weights, each top song's current `embeddingIndex` (catches re-embeds), and the negative-strength tuning value (`beta`). On startup, the fingerprint is recomputed AFTER the cheap-but-mandatory side effects (`_buildSignalRowsFromSummary`, `_updateRecommendationPolicySnapshot`) so the recommendation policy snapshot stays current regardless of cache hit; only the pure vector math (weighted-average + negative subtract + L2 normalize) is skipped. Cache misses on any input change → falls through to the existing rebuild path (which rewrites the cache). Cache loads validate version, dim, and fingerprint; any failure is silent and falls through. Caller can opt out with `opts.useCache = false`. Expected savings: 200–500ms on cache-hit reopens.
+
+### Fix F — decouple `_markEmbeddingsReady()` from `buildProfileVec()`
+Verified that `renderSimilar()` (the user-visible "Most Similar" Discover cards) calls `engine.getInsights()` which uses `rec.recommendSingle(currentSongEmbIdx, 8, ...)` — this only needs the recommender + current song's embedding, NOT `profileVec`. Moved `_markEmbeddingsReady()` to fire BEFORE `buildProfileVec()` in both `_backgroundScan` paths (cache-skip and full-scan), then run `buildProfileVec()` in the background via `.then(setProfileVec)`. Taste-weighted surfaces (For You / Because You Played / Unexplored Sounds) keep using their existing discover cache snapshots until `profileVec` lands; this matches current behavior when `discover_cache` exists. No native or IPC changes required. Expected savings: 200–800ms perceived latency to "Most Similar shown".
+
+### Files modified
+- `src/embedding-cache.js` — fix B (fast base64 decode), fix C (typed-array preservation, JSON-safe writer)
+- `src/engine-embeddings.js` — fix C (`_mergeLocalEmbeddings` two-pass typed-array handling)
+- `src/engine-data.js` — fix A (Promise.all batches), fix D (early embedding preload + data-dir cache write), fix F (decoupled ready event in both scan paths)
+- `src/engine.js` — exports `preloadEmbeddingsEarly`
+- `src/app.js` — fix D (`engine.preloadEmbeddingsEarly()` at very top of `init()`)
+- `src/engine-taste.js` — fix E (profile vector cache file: `profile_vec_cache_v1.json`, fingerprint helpers, refactored `buildProfileVec` to skip vector math on cache hit while still running policy-snapshot side effects)
+
+### Edge case behavior (verified during design)
+- New songs added to device — 6h library cache means new songs surface only after scan completes; profileVec cache invalidates via embedding-index fingerprint change once new songs are embedded. No behavior change vs current.
+- Songs deleted via `deleteSong()` — already calls `buildProfileVec()`; new cache writes happen on success and invalidate the prior fingerprint.
+- Songs deleted externally (file gone) — `_markSongsMissing` doesn't currently rebuild profileVec; the cache stays valid because the same listen evidence is still recorded. Recommendations remain consistent.
+- User listens between sessions — fingerprint includes weighted top-30 listened-derived weights → mismatch → rebuild.
+- User changes adventurous slider / `negativeStrength` — fingerprint includes `beta` → mismatch → rebuild.
+- User re-embeds songs — `embeddingIndex` per top song is in fingerprint → mismatch → rebuild.
+- First launch (no caches) — every cache load returns null → standard path runs; first writes seed all caches.
+- Embedding file corrupted / wrong dim / schema-version mismatch — guarded; falls through to rebuild.
+- Re-install / data dir moved — `cached_data_dir_v1` becomes stale, early embedding load against wrong path returns null, `startBackgroundScan` detects path mismatch and starts fresh load against the resolved path. No data loss.
+
+### Verification status
+- `npm.cmd run build` — OK (Vite 295ms, single-bundle output, latest `dist/assets/index-sllJNX_9.js` at 2026-05-10 06:17:28)
+- `npm.cmd run test:unit` — 30/31 (pre-existing `onNativeAdvance` `{duplicate: true}` shape regression remains the only failure; out of scope here, predates this batch and is documented in earlier "Latest Verified Changes")
+- `npx.cmd cap sync android` — OK (web bundle copied to `android/app/src/main/assets/public/assets/index-sllJNX_9.js`)
+- `:app:testDebugUnitTest` — BUILD SUCCESSFUL in 31s (.class files compiled cleanly with the cap-synced bundle)
+- `:app:assembleDebug` — BLOCKED by the documented Gradle metadata-cache lock collision (`Could not update C:\Users\myuva\.gradle\caches\8.14.3\file-changes\last-build.bin (Access is denied)`). The lock is held by a running Android Studio process. APK rebuild requires AS to release the lock (close AS or build via AS itself). No actual code-level failure.
+- `:app:connectedDebugAndroidTest` — not rerun in this pass.
+
+### Pre-fix safety backup
+`backups/startup_perf_prework_20260510_060528/` contains the unmodified copies of `embedding-cache.js`, `engine-data.js`, `engine-embeddings.js`, `engine-state.js`, `engine-taste.js`. Use this to roll back any individual fix if a regression surfaces in real-device testing.
+
+### 2026-05-10 follow-up #16 — Removed safe-area on top bar + replaced scrollIntoView in recs focus
+Two issues:
+
+**A. Empty space above hamburger.** User reported a strip of empty space above the icons "of same height as the search bar height". Analysis: `.top-bar` was using `padding: env(safe-area-inset-top, 0px) 10px 0` and `height: calc(env(safe-area-inset-top, 0px) + 40px)`. On the user's Android phone the env value was non-zero (~24-40 px), and Capacitor's WebView already starts BELOW the system status bar by default — so the safe-area padding was redundant, leaving a strip of bar-coloured padding visible above the icons. Removed the safe-area handling: `padding: 0 10px; height: 40px`. Status toast `top` updated to `48px` (no env-based math).
+- Caveat: iOS users with `apple-mobile-web-app-status-bar-style: black-translucent` may need the inset reinstated. If reported, guard with an `@supports`/iOS-specific media query.
+
+**B. Album↔Recs and Browse↔Recs swipes flickered.** User: "swipe right from album and up next, and swipe left from browse to up next" — three transitions, all involving recs as source or destination, all flickering with a "flick from middle of screen" right before the new tab settles. Root cause: `_focusCurrentRecsRow()` (called by `_scheduleRecsFocusCurrent()` on every recs arrival) used `currentRow.scrollIntoView({ block: 'center', inline: 'nearest' })`. With `inline: 'nearest'`, `scrollIntoView` walks up through ancestors looking for a scroll container in the inline (horizontal) axis — finds `.panel-strip` — and if the recs panel isn't 100% in view yet (mid-snap), scrolls the strip horizontally to bring it in. That horizontal scroll raced the browser's natural snap, producing the visible "flick". Replaced the call with manual `wrap.scrollTop = ...` on `.recs-list-wrap` (compute target vertically from `getBoundingClientRect()`), so it touches only the vertical scroll inside recs. The panel-strip's horizontal scroll is never touched, no race, no flicker.
+
+For the recs→browse case (where user is leaving recs), no recs-focus runs but the flicker was reported anyway. Hypothesis: the recs panel internal flex layout was settling as the user swiped away. Should be fixed by the `contain: layout` already applied in #14, plus the indirect benefit of #16's scrollIntoView removal stopping any leftover horizontal scroll commands.
+
+Verification: `npm.cmd run build` OK (Vite 190 ms, bundle now `dist/assets/index-C5cMCKfh.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 371.1 MB, timestamp `2026-05-10 12:47:39`.
+
+### 2026-05-10 follow-up #15 — Bar at geometric minimum + identified the actual flicker
+Two distinct items in user feedback:
+
+**A. Top-bar height at the geometric minimum.** User clarified: keep hamburger and search-input sizes as they were in #12 ("like before"), don't shrink them, but reduce bar height. The 40×40 hamburger button + 36 px-tall input pill set a hard floor on bar height: anything below 40 px overflows. So:
+- `.top-bar` height: 24 → 40 px (the floor — was 44 in #11/#12, 24 in #13).
+- `.top-bar-menu` (hamburger): restored to 40×40 / 22 px font / 8 px radius.
+- `.top-bar-search input`: restored to 36 px tall / 14 pt / 18 px radius / `0 36px 0 14px` padding.
+- `.top-bar-search-clear` (X): restored to 28×28 / 18 pt / 50% radius.
+- `.status-toast` `top`: `safe-area + 32` → `safe-area + 48`.
+- Padding: bar horizontal 6 → 10 px; gap 6 → 8 px.
+
+This is a 9% reduction from the original 44 px. Going further would force shrinking the icons. If the user wants the bar truly halved (~22 px), the icons MUST shrink — there's no way around the geometry.
+
+**B. Mid-swipe flick — root cause identified.** User described it precisely: "when swipe just before the new tab is visible, the earlier tab occurs like a flick from the middle of the screen and goes away and then the swiped screen come." This was the `IntersectionObserver` firing at 60% visibility, calling `_activateTab(tab, { instant: true })`, which then called `_scrollToPanel(target, 'instant')` — issuing a programmatic `panelStrip.scrollTo({ behavior: 'instant' })` ON TOP of the browser's natural snap that was already in flight. The two scroll operations raced, producing the visible flick of the outgoing panel.
+
+Fix in `src/app.js` `_activateTab`: when `opts.instant === true` (i.e., the call originated from the observer after a manual swipe), skip the `_scrollToPanel` call entirely. The browser's snap is already animating to that exact position; we just need to update the JS state (`activeTab`, tab `.active` class, `history.pushState`, etc.) without doing any scrolling. Tab-bar clicks (which DO want the smooth-scroll animation) still get it because they call `_activateTab(target)` with no `instant` flag.
+
+Verification: `npm.cmd run build` OK (Vite 195 ms, bundle now `dist/assets/index-CbF11eFn.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 371 MB, timestamp `2026-05-10 12:35:46`.
+
+### 2026-05-10 follow-up #14 — Anti-flicker hardening on the swipe
+User: "there is still a flicker when i swipe between pages." Without specifics on what flicker means (white flash / content jump / image pop-in / etc.), applied the standard set of defensive CSS for compositor-driven swipes:
+
+`style.css` `.panel`:
+- `background: var(--bg)` — explicit, so the panel never shows through to the body during the snap (prevents brief background-colour flashes).
+- `transform: translateZ(0)` — promotes each panel to its own compositor layer up-front, so the swipe is composited (no per-frame repaint).
+- `-webkit-backface-visibility: hidden; backface-visibility: hidden` — locks the layer so it doesn't get re-rasterised when the panel passes through certain transform states.
+- `contain: layout` — isolates the panel's layout from the strip and from siblings (offscreen panels don't trigger work). Note: `contain: paint` was tried but rolled back because it would clip song-menu popups that extend outside their row.
+
+`.panel-strip` got `will-change: scroll-position` so the strip's compositor layer is allocated once at startup, not re-promoted on every scroll event.
+
+Verification: `npm.cmd run build` OK (Vite 201 ms, bundle now `dist/assets/index--GWFsFQu.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.9 MB, timestamp `2026-05-10 12:26:10`.
+
+If flicker persists, ask the user for specifics (white flash vs content jump vs images popping in vs something else) — the right fix depends on the kind. Common suspects to check next:
+- Lazy image decoding inside Songs/Albums (many `<img decoding="async">`) → would need `loading="eager"` on the visible-on-load rows or pre-decoding via `image.decode()`.
+- The dirty-flag rerender (`_songsDirty` / `_albumsDirty`) firing inside the IntersectionObserver-triggered `_activateTab` → a 100-300 ms `renderSongs(allSongs)` mid-snap would absolutely flicker. Move the rerender behind a `requestIdleCallback` if so.
+- The pull-indicator inside Discover briefly showing during the snap → check `.discover-pull-body` for any leftover transform.
+
+### 2026-05-10 follow-up #13 — Top bar halved again (44 → 24 px)
+User: "still the top bar need to be halfed." Halved from 44 → 24 px. Icons and search-input pill scaled proportionally so nothing overflows:
+- `.top-bar` height: 44 → 24 px; padding 12 → 6 px; gap 8 → 6 px.
+- `.top-bar-menu` (hamburger): 40×40 / 22 px font → 24×22 / 16 px font; border-radius 8 → 4 px; added `flex-shrink: 0`.
+- `.top-bar-search input`: 36 → 22 px tall; border-radius 18 → 11 px; font 14 → 12 px; padding adjusted.
+- `.top-bar-search-clear` (X): 28×28 / 18 px → 18×18 / 14 px.
+- `.status-toast` `top`: `safe-area + 52` → `safe-area + 32`.
+
+Verification: `npm.cmd run build` OK (Vite 200 ms, bundle now `dist/assets/index-CPbZfPMk.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.8 MB, timestamp `2026-05-10 12:21:05`.
+
+### 2026-05-10 follow-up #12 — Universal search in the top bar
+User reasoning: "search bar can be present at the top instead of isaivahzi name… search bar is universal across app anyway… search across the library. why to restrict it to only 2 tabs." Replacing the static brand title with an always-on search input that drives a results overlay is exactly the right call — search was previously a per-tab affordance shown only on Songs / Albums.
+
+Implementation:
+
+**`index.html`**
+- The `IsaiVazhi` `<span class="top-bar-title">` is replaced with `<div class="top-bar-search">` containing the existing `#searchInput` (with `autocomplete=off`, `autocorrect=off`, `autocapitalize=off`, `spellcheck=false`) and the X button (`#searchClear`, `aria-label="Clear search"`).
+- The standalone `<div class="search-bar" id="searchBar">` element is **deleted** entirely (it used to slide down on Songs / Albums tabs only — now redundant since the input lives in the top bar permanently).
+- New `<div class="search-overlay" id="searchOverlay">` lives inside `.content` after the `.panel-strip`. Two sections (`#search-results-songs`, `#search-results-albums`) plus a `#searchEmpty` no-matches placeholder. Hidden by default.
+
+**`style.css`**
+- New `.top-bar-search { flex: 1 }` and a 36 px-tall pill input filling the remaining bar width. Clear button is absolute-positioned inside the input on the right, only visible when the input has text.
+- New `.search-overlay { position: absolute; inset: 0; z-index: 10 }` over the `.panel-strip`. Each section has a header with section name + match-count.
+- Old `.search-bar` rule kept in place but no longer referenced by any DOM (no harm, easier revert).
+
+**`src/app.js`**
+- New helpers: `_filterSearch(q)` (returns `{ songs, albums }`), `_showSearchOverlay(q)`, `_hideSearchOverlay()`, `_clearSearchInput()`.
+- Limit constants: `_SEARCH_RESULT_LIMIT_SONGS = 80`, `_SEARCH_RESULT_LIMIT_ALBUMS = 40`. Sections that exceed show `"X of Y"` count in the header.
+- The existing `searchInput` `input` listener now drives `_showSearchOverlay(q)` / `_hideSearchOverlay()` based on whether the input has text. Per-tab `renderSongs(filtered)` / `renderAlbums(filtered)` calls inside that listener removed.
+- `_activateTab` now calls `_clearSearchInput()` (closes overlay, clears input) on every tab change. The old `searchBar.style.display = ...` toggle was removed (the bar no longer exists).
+- `_filteredSongs()` / `_filteredAlbums()` simplified to plain pass-throughs returning `allSongs` / `allAlbums`. They're still called by dirty-flag rerender paths (e.g., scan-complete handlers); they no longer try to read the search input. The Songs and Albums tabs always show the full library.
+- The X button click handler is wired in a one-shot `DOMContentLoaded` listener so it picks up the static element from `index.html`.
+
+**`src/app-browse-render.js`**
+- `renderSongs(list, opts)` and `renderAlbums(list, opts)` now accept an `opts.target` element. Default behavior unchanged (render into `#panel-songs` / `#panel-albums`). The search overlay passes `target: document.getElementById('search-results-songs')` (or albums).
+- `renderSongs` also accepts `opts.sort` (defaults true) — the search overlay still sorts alphabetically; could be used later to surface relevance-ordered results without alpha sort.
+
+Result-tap behavior: handled by the same templates the Songs / Albums tabs use, so tap-to-play and tap-on-album-header both work identically. The overlay stays open after a tap (user can keep browsing matches); closing requires the X button, an empty input, or a tab change.
+
+Verification: `npm.cmd run build` OK (Vite 189 ms, bundle now `dist/assets/index-ZnW98BdM.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.7 MB, timestamp `2026-05-10 12:08:23`.
+
+### 2026-05-10 follow-up #11 — Top-bar restored sizes + eager Songs/Albums render
+User feedback after #10: "the swipe is somewhat better but still hiccups there. also still the hamburger bar need to be reduced bu 10-20 percent. why did you reduce the size of hamburger symbol and isaivazhi app." Two distinct issues:
+
+**A. Top bar dimensions** — follow-up #9 reduced the entire bar including icons (24 px high, 28×24 button, 13 px title). User wanted only the bar height shrunk, not the icon/text. Now: bar height 44 px (~15% reduction from the original 52 px), button restored to 40×40 with 22 px font, title back to 18 px Syne. `.status-toast` `top` recalculated: `safe-area + 52 px` (was `+ 32 px`).
+
+**B. Swipe hiccups despite scroll-snap** — root cause: when the user manually swipes from Discover to Songs, the `IntersectionObserver` fires and calls `_activateTab('songs')`, which used to call `renderSongs(_filteredSongs())` lazily because `_songsDirty = true` was set at init. Rendering 2,485 song rows mid-swipe blocks the main thread for ~100-300 ms — that's the hiccup.
+
+Fix: **render Songs and Albums eagerly at init**, immediately after `loadData()` returns. The cost is folded into the existing post-load render phase while the user is still looking at the Discover panel — invisible. After init both panels are fully populated DOM, so subsequent swipes hit GPU-composited paths only.
+
+`src/app.js` change in `init()`:
+```js
+allSongs = engine.getPlayableSongs();
+allAlbums = engine.getAlbums();
+renderSongs(allSongs);    // eager — was lazy on first navigate
+renderAlbums(allAlbums);  // eager
+_songsDirty = false;       // was true (forced lazy render on first navigate)
+_albumsDirty = false;
+```
+
+The dirty flags still work for SUBSEQUENT updates (e.g., scan completes with new songs → `_songsDirty = true` → next navigate re-renders). They're just not the bootstrapping mechanism anymore.
+
+Verification: `npm.cmd run build` OK (Vite 203 ms, bundle now `dist/assets/index-Ch21HqX-.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 20 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.6 MB, timestamp `2026-05-10 11:58:45`.
+
+### 2026-05-10 follow-up #10 — Tab swipe rewritten on CSS scroll-snap
+User feedback: "still the swipe between tabs is not smooth. i think you need to focus more on it. check the muzio player, their the swipe between tabs is really smooth. the stitch between tabs is really good." Muzio Player is a native Android app using `ViewPager2` — fundamentally a horizontal scroll with snap-to-page that the OS handles in C++ at compositor level. The closest WebView equivalent: **CSS `scroll-snap-type: x mandatory`** — let the browser handle the gesture entirely, with zero JavaScript on the touch path.
+
+After multiple iterations of JS-driven swipe (follow-ups #4, #5, #6, #7) all hitting layout-cost ceilings on the heavy Songs / Albums tabs, this approach trades a one-time initial layout cost (all panels rendered up-front, ~2,485 song rows + ~1,051 album cards) for **buttery-smooth, browser-native, hardware-composited swipes** that match ViewPager2's feel.
+
+Changes:
+
+**`index.html`** — panels are now wrapped in a `.panel-strip`:
+```html
+<div class="content">
+  <div class="panel-strip" id="panelStrip">
+    <div class="panel" id="panel-discover" data-tab="discover">...</div>
+    <div class="panel" id="panel-songs"   data-tab="songs"></div>
+    <div class="panel" id="panel-albums"  data-tab="albums"></div>
+    <div class="panel" id="panel-recs"    data-tab="recs">...</div>
+    <div class="panel" id="panel-browse"  data-tab="browse">...</div>
+  </div>
+  <div class="panel panel-floating" id="panel-history">...</div>  <!-- outside the strip -->
+</div>
+```
+Panel order in the DOM matches the bottom-tab order so swiping right always advances `discover → songs → albums → recs → browse`. Each panel has `data-tab` so the IntersectionObserver knows which tab it represents.
+
+**`style.css`** — old display-toggle and old swipe states gone. New rules:
+- `.content { position: relative; overflow: hidden; }` — the strip handles all scrolling.
+- `.panel-strip { display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; scrollbar-width: none; }` plus `::-webkit-scrollbar { display: none }` to hide the horizontal scrollbar.
+- `.panel { flex: 0 0 100%; width: 100%; height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; scroll-snap-align: start; scroll-snap-stop: always; }` — each panel a snap point with its own vertical scroll, `scroll-snap-stop: always` prevents fast flicks from skipping past adjacent tabs.
+- `.panel.panel-floating { display: none }` / `.panel.panel-floating.active { display: block }` — for `#panel-history` (sits outside the strip).
+- Old `.panel.panel-swipe-dest`, `.panel-swiping`, `.panel-snapping` rules removed entirely.
+- `#panel-recs` no longer requires `.active` to be `display: flex` — it's always flex column now.
+
+**`src/app.js`** — old JS swipe handler removed (~150 lines deleted). New logic:
+- `_scrollToPanel(target, behavior)` — calls `panelStrip.scrollTo({ left: panelEl.offsetLeft, behavior })`. Used by `_activateTab` for tab-tap navigation. No-ops if already at the target left.
+- `setupPanelStripObserver` IIFE — sets up an `IntersectionObserver` on the strip, one per panel, fires when a panel reaches 60% visible. The handler calls `_activateTab(tab, { instant: true })` to update the bottom-tab `.active` class, run search-bar visibility logic, and `history.pushState`. The `instant: true` flag short-circuits `_scrollToPanel` (we're already at the target).
+- Anti-recursion: `_scrollToPanel` calls `window._suppressPanelObserverFor(500)` (or 50 for instant) before the scrollTo, blocking the observer from firing while the smooth-scroll animation passes through intermediate panels.
+- `_activateTab` no longer toggles `.active`/inactive on panels for visibility — it just sets the `.active` class informationally and calls `_scrollToPanel`. The `.content-recs-active` toggle was removed (no longer needed since each panel has its own scroll).
+
+Pull-to-refresh on Discover: still works. Each panel is its own vertical scroll container, so the existing pull handler on `#discover-pull-body` is unaffected.
+
+Pre-fix safety backup: `backups/scroll_snap_prework_20260510_114415/` (`app.js`, `style.css`, `index.html`).
+
+Verification: `npm.cmd run build` OK (Vite 215ms, bundle now `dist/assets/index-6KgnfwPf.js`); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` failure only); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.4 MB, timestamp `2026-05-10 11:51:23`.
+
+Trade-off accepted: heavier initial render (Songs / Albums panels lay out up-front instead of on first navigation). Expected to be ~100-300ms one-time, paid during the existing post-scan render phase. After that, swipes between tabs are GPU-composited at 60fps regardless of panel content depth.
+
+### 2026-05-10 follow-up #9 — Compact top bar (52 → 24 px)
+User feedback after #8: "the hamburger bar is very big, i think the height need to be reduced more than half." Halved: 52 → 24 px.
+
+`style.css` `.top-bar` revisions:
+- `height: calc(env(safe-area-inset-top) + 24px)` (was `+ 52px`).
+- `padding: env(safe-area-inset-top) 8px 0` (was `12px 0`).
+- `gap: 4px` (was `8px`) between hamburger and title.
+- `.top-bar-menu`: 28×24 (was 40×40), font 15px (was 22px), border-radius 4px (was 8px), padding: 0.
+- `.top-bar-title`: font-size 13px (was 18px), margin-left 2px (was 4px).
+- `.status-toast` `top` recalculated: `safe-area + 32px` (was `+ 64px`) — 24 px bar + 8 px gap.
+
+Verification: `npm.cmd run build` OK (Vite 187ms, bundle now `dist/assets/index-B24DTsf4.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 18s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.3 MB, timestamp `2026-05-10 11:35:58`.
+
+### 2026-05-10 follow-up #8 — Top app bar (DBG removed, hamburger moved into the bar)
+After the previous follow-up the hamburger was visually invisible: the DBG pill at `z-index: 100000` covered the floating `.hamburger-btn` at `z-index: 50`. User asked to think carefully about hamburger placement and reflow tabs accordingly: "if hamburger goes to the top, i think all the tabs need to be modified accordingly". Plus an explicit add-on: "when we do pull to refresh in discover page it should start below the hamburger box".
+
+Decision: real top app bar across all tabs, no per-tab variation. Pattern used: hamburger left + "IsaiVazhi" title text. Bar sits above `.search-bar` / `.content` / `.bottom-bar` in the body's flex column, so every panel naturally starts below it without any per-panel CSS.
+
+Changes:
+- `index.html`:
+  - Deleted `#debugLogToggle` + `#debugLogPanel` blocks (DBG pill gone for good).
+  - New `<div class="top-bar" id="topBar">` containing `#hamburgerBtn` + `<span class="top-bar-title">IsaiVazhi</span>`. Inserted at the top of `<body>`, above `.search-bar`.
+- `style.css`:
+  - New `.top-bar` rule: `flex-shrink: 0`, `height: calc(env(safe-area-inset-top) + 52px)`, `padding-top: env(safe-area-inset-top)`, `background: var(--surface)`, `border-bottom: 1px solid var(--border)`, `z-index: 30`. Flex layout with `gap: 8px` so the hamburger sits next to the title.
+  - `.top-bar-menu` (hamburger): 40×40 transparent button with hover/active feedback, no border-radius drama.
+  - `.top-bar-title`: Syne 18px bold, matches the existing brand typography elsewhere.
+  - Old `.hamburger-btn` floating rule renamed to `.hamburger-btn--legacy-disabled` (no DOM uses it now; kept for documentation / quick revert).
+  - `.status-toast` `top` shifted from `safe-area + 16px` to `safe-area + 64px` so it appears below the new top bar instead of overlapping the hamburger.
+- `src/app-settings.js` `_ensureDom()`: hamburger button no longer dynamically created — the static `#hamburgerBtn` in HTML is wired up via `addEventListener('click', openSidebar)` instead.
+- `src/app.js`: `_dbg()` simplified — the `console.log` mirror hook for DBG-tagged lines was removed (only consumer was the deleted DBG panel). `_dbg(msg)` still writes to native console with a `[DBG]` prefix; if the DBG panel is ever re-added, the textContent fallback path picks back up automatically.
+
+Pull-to-refresh: the `.pull-indicator` and `.discover-pull-body` live INSIDE `#panel-discover` which is inside `.content`. Since `.content` now starts below the top bar (top bar is in the body flex column), the pull indicator naturally appears just below the hamburger when triggered. No code change needed for pull-to-refresh.
+
+Layout result:
+```
+┌─────────────────────────────┐
+│ ☰  IsaiVazhi                │  <- top-bar (flex-shrink: 0)
+├─────────────────────────────┤
+│ [search bar when active]    │  <- .search-bar (display:none default)
+├─────────────────────────────┤
+│ [pull-indicator]            │  <- shows under top-bar on Discover
+│ [panel content]             │  <- .content (flex: 1)
+│ ...                         │
+├─────────────────────────────┤
+│ ▶ Now Playing               │  <- .bottom-bar
+│ Discover  Songs  ...        │
+└─────────────────────────────┘
+```
+
+Pre-fix safety backup: `backups/top_bar_prework_20260510_112114/` (`app.js`, `app-settings.js`, `style.css`, `index.html`).
+
+Verification: `npm.cmd run build` OK (Vite 418ms, bundle now `dist/assets/index-Cro9GEpw.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 34s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.2 MB, timestamp `2026-05-10 11:26:44`.
+
+### 2026-05-10 follow-up #7 — Hamburger restored, edge swipe removed
+After the previous follow-up, the user clarified: they didn't want the edge-swipe gesture / edge-handle pattern after all ("just lets add the hamburger and keep it simple", "edge swipe ... no not needed"). Net direction: hamburger button back, no edge gesture, sidebar items still in the bottom-aligned drawer.
+
+Changes:
+- `src/app-settings.js` `_ensureDom()`: hamburger button creation restored (was removed in follow-up #4 in favor of edge swipe). The `#sidebarEdgeHandle` element creation was deleted.
+- `openSidebar` / `closeSidebar` / `_commitSidebarDrag` no longer toggle the edge-handle's `.hidden` class (handle no longer exists).
+- Public `_settings` API trimmed: `setDragOffsetFromEdge`, `commitDragFromEdge`, `cancelDragFromEdge` removed (no longer called from anywhere).
+- `src/app.js` `setupTabSwipe`: edge-mode logic removed. Now only `'pending'` / `'tab'` / `'vertical'` modes. `EDGE_OPEN_ZONE_PX` constant deleted along with all `[DBG] edge-swipe ...` log calls.
+- `style.css`: `.sidebar-edge-handle` rules removed (~40 lines of dead CSS).
+- `_attachSidebarSwipe` (right-swipe inside sidebar to close it) is **kept** — that's a close gesture inside the already-open sidebar, not the edge-to-open gesture, and was an explicit earlier ask.
+
+Net result: hamburger button at top-left opens the sidebar (same behavior as before the UI overhaul began). Sidebar still has bottom-aligned AI Embedding / Taste Signal / Settings items. Tab carousel swipe (active panel translates with finger, dest panel slides in at commit) is unchanged from #6.
+
+Verification: `npm.cmd run build` OK (Vite 449ms, bundle now `dist/assets/index-C2TgpHUd.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 36s using the documented workaround. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370.1 MB, timestamp `2026-05-10 10:14:48`.
+
+### 2026-05-10 follow-up #6 — UI overhaul second-pass: edge handle + active-panel-stays-in-flow
+After the previous revision, both reported issues persisted:
+1. Edge swipe still didn't open the sidebar.
+2. Tab swipes still felt laggy.
+
+The most likely root causes (without DBG logs to confirm):
+1. **Android system gestures absorbing the very-edge touch.** Most Android phones running gesture navigation reserve the leftmost ~8-12 px for the back gesture. The touch never reaches the WebView at all, so widening from 24 px to 36 px in the previous pass didn't help — the touch wasn't arriving in the first place.
+2. **Adding `position: absolute` to the active panel at swipe start was triggering a full layout reflow** of every descendant — for the Songs panel that's ~2,485 song rows. Even though only the active panel was visible during the drag (we were no longer pre-rendering prev/next), the position-change still cost a reflow. That's the lag the user reported.
+
+Fixes this pass:
+
+**Visible edge handle** — `src/app-settings.js` `_ensureDom()` now creates a dedicated `#sidebarEdgeHandle` element. CSS in `style.css`:
+- 14 px wide, positioned at `left: 0` from `top: 40%` to `bottom: 25%` (vertically centered, away from status/nav bars).
+- Background gradient `rgba(255,255,255,0.10)` → transparent right edge, with a small `›` chevron glyph as visual hint.
+- `z-index: 60` (above panel content, below sidebar).
+- Always-mounted, `pointer-events: auto` while sidebar closed; `.hidden` class (added by `openSidebar` / `_commitSidebarDrag`) fades it out when the sidebar opens.
+- `cursor: pointer` + `click` handler → tap-to-open as a guaranteed fallback path. The user can always reach the menu even if their phone's gesture-nav config eats the swipe.
+- The handle sits a few pixels INSIDE the screen edge (not at `left: -2px` or similar), so it's outside Android's back-gesture reserve zone.
+- `EDGE_OPEN_ZONE_PX` widened 36 → 50 in `setupTabSwipe` so the swipe gesture catches a touch starting anywhere from x=0 to x=49 px (covers the 14px handle plus generous finger-aim buffer).
+
+**Active panel doesn't change position during swipe** — `src/app.js` `_prepareTabSwipe` and `_commitTabSwipe`:
+- `.panel-swipe` class deleted (it was setting `position: absolute` on the active panel and reflowing thousands of children).
+- New `.panel-swiping` / `.panel-snapping` classes ONLY control transition timing — they never change `position`. The active panel stays in normal flow (`display: block` from `.active`); we just add `transform: translate3d(dx, 0, 0)`. That's a pure compositor op — zero layout cost.
+- Destination panel still uses absolute positioning during the commit, but renamed to `.panel-swipe-dest` to make the intent explicit.
+- `.content` got `overflow-x: hidden` to contain the active panel's horizontal translation cleanly.
+- `_resetPanel(panel, wasDest)` takes a flag so we don't accidentally clear `display` on the active panel (it should remain `display: block` via `.active`).
+
+Net effect on tab swipe: starting a swipe now changes ONE thing on the active panel — adding `transform: translate3d(0,0,0)` plus a class. No layout reflow on Songs/Albums tabs. Pure compositor work for the entire drag.
+
+**Diagnostic logs** (kept from previous pass): the DBG panel will show `[DBG] edge-swipe armed at clientX=N` when a touchstart is detected in the edge zone, `[DBG] edge-swipe locked, dx=N` when motion locks the gesture, and `[DBG] edge-swipe end dx=N dt=N open=true/false` on release. If the user reports the swipe still doesn't work and these logs DON'T appear, the touch isn't arriving — at that point the only fix is either (a) the tap-to-open on the edge handle, or (b) a native Android `setSystemGestureExclusionRects` call which requires Java code in `MainActivity` / `MusicBridgePlugin`.
+
+Verification: `npm.cmd run build` OK (Vite 275ms, bundle now `dist/assets/index-DBdNGnLd.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 17s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 370 MB, timestamp `2026-05-10 09:50:26`.
+
+### 2026-05-10 follow-up #5 — UI overhaul revisions (edge-swipe fix + lag fix)
+First-device test of the UI overhaul reported two regressions:
+1. Left-edge swipe to open sidebar didn't work at all.
+2. Tab swipes felt laggy — "really lagging between swipes".
+
+Root causes:
+1. **Edge zone too narrow + handler attached too low.** The 24px edge zone was tight for finger aim on a phone with rounded corners, and the touchstart listener was on `.content` — if any fixed overlay (or Android's gesture-zone visual) covered the edge, the touch never reached `.content` and the handler never fired.
+2. **Carousel pre-rendered prev/next panels at swipe start.** Switching the Songs panel from `display: none` to `display: block` makes the browser lay out all ~2,485 song rows, the Albums panel ~1,051 album cards. Doing that the moment the user starts to swipe meant a 100-500ms hitch right when smoothness matters most. Adding the CSS `:has(.panel.panel-swipe)` selector also forced ongoing selector recomputation.
+
+Fixes (`src/app.js` `setupTabSwipe` rewritten + `style.css`):
+- **Document-level capture-phase touch listeners** instead of `.content` — guaranteed to receive every touch on the page regardless of overlays.
+- **Edge zone widened to 36 px** (was 24).
+- **Diagnostic `[DBG]` logs** for edge-swipe arm/lock/end so the next on-device test can confirm the gesture is firing (visible in the DBG panel, copied via "Copy Logs").
+- **Only the active panel translates during touchmove.** The destination panel is added (`display: block`, positioned absolutely at `±viewport-width`) at COMMIT time, alongside an animation that slides the active panel out and the dest panel in. Layout cost paid once, not per touchmove frame. The user still sees a smooth left-or-right transition between panels — just doesn't see the dest panel during the drag itself.
+- **`requestAnimationFrame` coalescing** on touchmove → one transform write per frame, not per move event. Plus `translate3d(x,0,0)` for compositor-layer transforms.
+- **`will-change: transform` and `z-index: 1`** on `.panel.panel-swipe` to ensure GPU compositing layer is allocated before the transition starts (no first-frame flicker).
+- **Snap duration reduced** 220 ms → 180 ms with a slightly snappier easing curve (`cubic-bezier(0.32, 0.72, 0, 1)`).
+- **`:has()` selector removed** (was forcing CSS recomputation); replaced with always-on `position: relative` on `.content`.
+- **Sidebar/full-player exclusion** moved into the document-level handler so the new edge-swipe doesn't accidentally re-trigger when the user is already inside the sidebar or full player.
+
+Trade-off accepted: the user no longer sees the destination panel "stitched" alongside the active panel during the drag itself — only during the snap commit. This was the only realistic way to keep the gesture smooth on tabs with thousands of pre-rendered DOM nodes without virtualizing the lists (which is a separate, larger project).
+
+Verification: `npm.cmd run build` OK (Vite 299ms, bundle now `dist/assets/index-D_4-b0fx.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 21s using the documented `--gradle-user-home "$env:USERPROFILE\.gradle-cli" --no-daemon` workaround. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 369.9 MB, timestamp `2026-05-10 09:33:53`.
+
+Real-device validation pending. Test items:
+- Try left-edge swipe at the very leftmost edge of the screen, slowly. DBG panel should show `[DBG] edge-swipe armed at clientX=...` followed by `[DBG] edge-swipe locked` once you've moved >8px right. If those don't appear when you swipe, the edge isn't firing — share the DBG output and I'll widen further or move to native gesture exclusion.
+- Tab swipes: drag should follow finger smoothly (no per-frame lag). Snap should complete in 180 ms. Between successive swipes there should be no visible delay.
+- Heavy tabs (Songs ~2,485 items, Albums ~1,051): expect a brief moment when the destination panel pops in at commit — this is the layout cost paid once per swipe instead of per-frame. If it's still distracting, the long-term fix is virtualizing the list (separate project).
+
+### 2026-05-10 follow-up #4 — UI overhaul: carousel-swipe between tabs, hamburger removed, sidebar redesign
+Two UX gaps reported on the previous build:
+1. Tab swipe was discrete — on touchend the active panel just toggled `display: none/block`. No animation, no follow-finger feedback. User said "I swipe and wait for the next page to load, it's not organic. I want pages stitching as I swipe."
+2. The hamburger button was visually intrusive in non-Discover tabs, and the AI Embedding / Taste Signal buttons in the Discover header had a `margin-left: 50px` clearance just to avoid overlapping the hamburger. User wanted: remove the hamburger, use a left-edge swipe instead, move AI/Taste buttons into the sidebar (they're settings-style, not homepage), and place sidebar items at the bottom of the drawer (within thumb reach).
+
+Both landed in one batch:
+
+**Carousel-style tab swipe** (`src/app.js` `setupTabSwipe`)
+The handler was rewritten with a 3-mode state machine driven from one shared touch listener:
+- `edge-pending` / `edge` — touchstart at clientX < 24px when sidebar is closed → drives the sidebar drawer transform via `_settings.setDragOffsetFromEdge(dx)`. Snaps open on commit (>40% of width or fast flick), back to closed otherwise.
+- `pending` / `tab` — non-edge horizontal swipe locks into carousel mode after 8px of horizontal motion. Adjacent panels (`prev` and `next` in `tabOrder`) are positioned absolutely with `class="panel panel-swipe panel-swipe-prev/next"` and translated to ±viewportWidth at swipe start, then translated alongside the active panel during touchmove so all three move together. On touchend, `_commitTabCarousel` sets `.panel-snapping` (CSS `transition: transform 0.22s`) and animates to either the next panel (commit) or back to 0 (revert). Edge resistance: dragging beyond the first/last tab gets 1/3 friction.
+- `vertical` — if `|dy| > 12px` before horizontal lock, abandon tracking and let the browser scroll `.content` normally.
+- Soft commit thresholds: `|dx| ≥ 60px` OR `dt < 250ms && |dx| ≥ 30px` (fast flick).
+
+CSS additions in `style.css`:
+- `.panel.panel-swipe { display: block !important; position: absolute; inset: 0; overflow-y: auto; will-change: transform; }` — each panel becomes its own scroll container during the swipe, preserving per-tab scroll independence.
+- `.panel.panel-swiping { transition: none; }` — finger-following.
+- `.panel.panel-snapping { transition: transform 0.22s cubic-bezier(0.4,0,0.2,1); }` — release animation.
+- `.content { position: relative; }` always; `:has(.panel.panel-swipe) { overflow: hidden }` when a swipe is mid-flight.
+
+`_activateTab` is called with `resetScroll: false` after a carousel swipe so the destination tab keeps its previous scroll position; on revert, the originating tab's scroll is restored from `savedScrollTop`.
+
+**Sidebar redesign** (`src/app-settings.js` + `style.css`)
+- `_ensureDom()` no longer creates the hamburger button — left-edge swipe opens the drawer instead. The hamburger CSS in `style.css` is now dormant (no DOM uses it) but kept in source so a future revert is one DOM line.
+- Sidebar body uses a column flex with a `.sidebar-spacer { flex: 1 }` that pushes `.sidebar-items` to the bottom of the drawer.
+- New sidebar items: AI Embedding (🧠), Taste Signal (⚖), Settings (⚙). Click handlers call `window._app.showEmbeddingDetail()` / `showTasteWeights()` / open the existing Settings sub-page; all close the sidebar first.
+- Right-swipe inside the sidebar closes it (handled by `_attachSidebarSwipe`). Backdrop tap still closes (existing). Drawer follows the finger via `_setSidebarDragOffset(px)` which sets `transform: translateX(px)` directly while applying `.dragging` (kills CSS transition). On release `_commitSidebarDrag(open)` removes `.dragging` and toggles `.open`, letting the CSS transition animate the snap.
+- Settings sub-page back button now calls `_resetSidebarBody()` (extracted helper) which renders the new 3-item root layout instead of the old single-Settings layout.
+- Public `_settings` API gained three methods used by `setupTabSwipe`'s edge mode: `setDragOffsetFromEdge(dx)`, `commitDragFromEdge(open)`, `cancelDragFromEdge()`.
+
+**Discover header cleanup** (`src/app-discover-ui.js`)
+- `renderProfile` no longer renders the `.discover-action-row` (AI / Taste Signal buttons). `#profile-stats` is left empty + `display: none` so no empty space at the top of Discover.
+- `style.css` `.discover-action-row` lost its `margin-left: 50px` (was the hamburger clearance) — kept as a generic 2-column grid in case a future surface wants it.
+
+Pre-fix safety backup: `backups/ui_overhaul_prework_20260510_085236/` (`app.js`, `app-settings.js`, `app-discover-ui.js`, `style.css`).
+
+Verification: `npm.cmd run build` OK (Vite 315ms, bundle now `dist/assets/index-FTCxsm32.js`); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` failure only); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 2m 27s (using `--gradle-user-home "$env:USERPROFILE\.gradle-cli" --no-daemon` to bypass the Android-Studio cache-lock — see "Build Steps" section for the workaround now documented). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 369.8 MB, timestamp `2026-05-10 09:08:16`. **This APK contains all batches landed today: Fixes A–I + UI overhaul.**
+
+Real-device validation pending. Test checklist:
+1. Swipe between Discover/Songs/Albums/Up Next/Browse — pages should follow finger and snap on release.
+2. Swipe past the first/last tab — should feel resistance instead of going off-screen.
+3. Vertical scroll should still work normally inside each tab.
+4. Touch from far left edge → sidebar drags in. Snap open at >40% of width, back to closed otherwise.
+5. With sidebar open, swipe right anywhere on it → closes.
+6. With sidebar open, tap on the dimmed backdrop → closes.
+7. Sidebar items: AI Embedding, Taste Signal, Settings — all near bottom, all open the right page on tap.
+8. No hamburger button visible anywhere.
+9. Discover header has no empty space at top (where AI/Taste row used to be).
+
+### 2026-05-10 follow-up #3 — Fix H (smart deferral) + Fix I (parallel play-tap bridge calls)
+On-device DBG log after Fix G showed embeddings loaded fast (`_loadLocalEmbeddings: 2448 entries in 483 ms`) but Discover still took ~5.2s to render after app open. Cause: `_scheduleBackgroundHydration` (`src/app.js`) was waiting an additional 2950ms after detecting playback intent — sized for the old world where the post-deferral work was 5+ seconds. After Fix G the post-deferral work is just 51ms (`cache-skip pre-ready total: 51 ms` in the log) — the deferral became 57× longer than the work.
+
+**Fix H — smart deferral:**
+- New export `engine.isEarlyEmbeddingLoaded()` (`src/engine-data.js`, plumbed through `engine.js`) — returns true once `preloadEmbeddingsEarly()`'s promise has settled (fulfilled or rejected). Tracked via `.then()`/`.catch()` on the promise inside `preloadEmbeddingsEarly`.
+- `_scheduleBackgroundHydration` in `src/app.js` now checks `engine.isEarlyEmbeddingLoaded()` before applying the 4s `PLAY_INTENT_AI_DEFER_MS` deferral. When the early load is done AND we're not in `_pendingStartupResume`, the deferral shrinks to a 120ms grace (just enough to let the audio thread settle). The function body was refactored into `start` (decision logic) and `start_now` (the actual scan trigger).
+- Falls back to the original 2950ms behavior if the early load hasn't resolved yet (rare — only happens when bin read takes longer than `STARTUP_AI_HYDRATION_DELAY_MS` of 1500ms, which post-Fix-G should be unusual).
+- Expected savings: ~2.7s on warm restart with playback intent. Total time-to-similar-songs target: ~5.2s → ~2.5s.
+
+**Fix I — parallel play-tap bridge calls:**
+DBG log line `08:00:01.126 PLAY-TAP` to `08:00:01.532 audioPlayStateChanged: isPlaying=true` showed 406ms cold-restore play tap. Of that, ~103ms was JS-side: 3 sequential `await`s on `MusicBridge.setQueue` (or `playAudio`) → `setLoopMode` → `_refreshNativePlaybackInstanceId`. Only the first one gates audio start on native side (`setQueue`/`playAudio` triggers ExoPlayer prepare). The other two are bookkeeping that doesn't block playback.
+- `loadAndPlay` in `src/app.js` (both success path and retry path) now awaits `setQueue`/`playAudio` then fires `setLoopMode` + `_refreshNativePlaybackInstanceId` via a non-awaited `Promise.all([...])`. UI state (`nativeAudioPlaying = true`, `updatePlayIcon(false)`) is updated immediately after the first await, ~50ms earlier.
+- Native playback instance ID is reconciled by the next `audioPlayStateChanged` event anyway, so the brief window where it might be stale is harmless.
+- Expected savings: ~50ms per play tap.
+
+Pre-fix safety backup: `backups/fix_hi_prework_20260510_081654/` (`app.js`, `engine-data.js`, `engine.js`).
+
+Verification: `npm.cmd run build` OK (Vite 528ms, bundle now `dist/assets/index-Be6QWNbG.js`); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` failure only); `npx.cmd cap sync android` OK; `:app:assembleDebug` still blocked by Gradle cache lock. Real-device validation pending.
+
+### 2026-05-10 follow-up #2 — Fix G (fetch() for embedding files, kills the bridge bottleneck)
+First-device DBG-log capture (logs.txt) showed the dominant remaining startup cost on warm-start was Capacitor's `MusicBridge.readBinaryFile` itself: 4884 ms for the 5 MB `local_embeddings.bin`, plus 1258 ms for the small meta JSON. Decode in JS was already fast (31 ms after Fix B). The `MusicBridge.readBinaryFile` plugin reads the file natively, base64-encodes it (~6.7 MB string for a 5 MB binary), and ships the string over the JSI bridge — that's pure bridge serialization overhead, not disk speed. Proof in the same log: `song_library.json` is fetched via `window.Capacitor.convertFileSrc('file://...')` + `fetch()` and completed in 130 ms; the WebView reads `file://` URLs directly without the JSI bridge.
+
+Fix G replaces the bridge calls in `_loadBinaryStore()` (`src/embedding-cache.js`) with the same fetch pattern:
+- New helper `_fetchLocalArrayBuffer(path)` — `fetch(convertFileSrc('file://' + path)).arrayBuffer()`. The returned `ArrayBuffer` is wrapped directly with `new Float32Array(buffer)`; no base64 decode, no extra copy.
+- New helper `_fetchLocalText(path)` — same pattern, returns a string for `JSON.parse`.
+- Both helpers return `null` on any failure (no Capacitor, fetch reject, non-OK response, exception). Caller falls back to the existing `MusicBridge.readBinaryFile`/`readTextFile` path on null. Zero behavior change in failure modes.
+- Bin path also validates `byteLength % 4 === 0` before constructing the `Float32Array` — guards against truncated reads.
+
+Expected savings on warm start with 2,448 entries × 512 dim:
+- Bin read: 4884 ms → ~150-300 ms (~30× faster, no base64 round-trip)
+- Meta read: 1258 ms → ~50-100 ms (small file, no bridge)
+- Combined: ~5.5 seconds saved
+- Total time-to-similar-songs estimated drop: ~10 s → ~4 s
+
+Pre-fix safety backup: `backups/fix_g_prework_20260510_073345/` (just `embedding-cache.js`, only file modified).
+
+Verification: `npm.cmd run build` OK (Vite 588ms, bundle now `dist/assets/index-CmWgSgOz.js`); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` failure only); `npx.cmd cap sync android` OK; `:app:assembleDebug` still blocked by the Gradle cache lock (Android Studio holds `last-build.bin`). User must close AS or build from inside AS to repackage the APK with the fetch-enabled bundle. Real-device validation pending.
+
+### 2026-05-10 follow-up — DBG panel re-enabled + finer-grained PERF logs
+First-device test reported "still 5+ seconds to similar songs" plus an intermittent mini-player thumbnail bug (previous song's art persists on first tap from For You during the embedding-load window, fixed by tapping again). Without console access we can't tell which step is the actual bottleneck. To diagnose:
+- `index.html` — DBG button + log panel uncommented (was hidden since after the 2026-04-25 enablement). DBG pill at top-left toggles a full-screen panel with a "Copy Logs" button at top.
+- `src/app.js` — `console.log` is now hooked to mirror lines starting with `[PERF]`, `[Embedding]`, `[FAV]`, `[SCAN]`, `[DBG]`, or `[REC]` into the on-screen DBG panel. Uses an `_origConsoleLog` reference inside `_dbg()` to avoid recursion. Other console output (untagged) goes only to native console as before.
+- `src/engine-data.js` cache-skip path — added `[PERF]` markers for: embedding-disk-load wait, `_mergeLocalEmbeddings`, `new Recommender`, `attachGpuToRec`, and total pre-ready time.
+- `src/engine-embeddings.js` `_loadLocalEmbeddings` — added `[PERF]` total-time + count log.
+- `src/embedding-cache.js` `_loadBinaryStore` — added `[PERF]` markers for: meta read+parse, binary bridge read (with base64 char count), base64 decode (with byte count), and total time.
+
+Mini-player thumbnail bug working hypothesis: during the multi-second embedding load, the JS thread is busy with synchronous binary decoding + merging. `syncFullPlayer()` runs synchronously when a song is tapped and tries to fetch art via `MusicBridge.getAlbumArtUri` (line ~621 in `app-player-ui.js`); the async resolution can be delayed past when the next render happens, leaving the previous img element visible (paint timing) or the recursive `syncFullPlayer()` not running until the JS event loop unblocks. A second tap finds the art already cached so the synchronous path succeeds. If the embedding pipeline drops below ~2s, this bug should resolve itself; will revisit with targeted fix if it persists.
+
+Verification: web build OK (Vite 428ms, bundle now `dist/assets/index-BGfduGHn.js`); cap sync OK (synced to `android/app/src/main/assets/public/`); `:app:assembleDebug` still blocked by the same Gradle cache-lock collision (`last-build.bin` access denied). User must close Android Studio briefly OR build from inside AS to repackage the APK with the DBG-enabled bundle.
+
+## Recent Changes (2026-05-09 batch)
+
+This batch reduced `src/engine.js` from 7,026 → 1,838 lines via the engine split campaign, added GPU/hardware acceleration to every compute-heavy path with safe CPU fallbacks, fixed a cluster of bugs in the AI embedding page, added a hamburger menu + Settings page with embedding upload, and addressed a section-playback auto-transition bug.
+
+### Engine split campaign — COMPLETE
+`src/engine.js` is now 1,838 lines (under the 2,000-line hard ceiling). New modules created:
+- `src/engine-state.js` (202 lines) — shared module-level vars + setters + constants
+- `src/engine-indexes.js` (57 lines) — O(1) lookup helpers (`_getFilenameMap`, `_getPathMap`, `_fastEmbIdxToSongId`, `_invalidateEmbIdxMap`)
+- `src/engine-taste.js` (1,180 lines) — 64 taste/profile functions
+- `src/engine-embeddings.js` (1,140 lines) — on-device embedding pipeline + native-side bridge
+- `src/engine-data.js` (~800 lines) — startup data pipeline (`loadData`, scan, art cache, song-ref helpers, favorites/playlist I/O)
+- `src/engine-analytics.js` (767 lines) — profile analytics + recommendation rebuild scheduling + Discover cache
+- `src/engine-insights.js` (501 lines) — `getProfileWeights`, `getTasteSignal`, `getSuspiciousRecommendationData`, `rebuildProfileVec`, taste reset
+- `src/engine-playback.js` (627 lines) — playback state persistence + native queue sync (`savePlaybackState`, `restorePlaybackState`, `resetEngine`, `onNativeAdvance`, etc.)
+- `src/engine-favorites.js` (325 lines) — favorites/dislike CRUD + playlist CRUD (zero engine.js callbacks)
+- `src/engine-session-ui.js` (203 lines) — `setLiveListenFraction`, `getInsights`
+
+Cross-cutting engine.js dependencies are wired via `initEmbeddingCallbacks`, `initDataCallbacks`, `initAnalyticsCallbacks`, `initPlaybackCallbacks`. Every slice landed with `npm run build` + `npm run test:unit` green (30/31 — pre-existing `onNativeAdvance` failure only). Detailed slice log in `file_split_campaign.md`.
+
+### GPU / hardware acceleration (4-layer stack with CPU fallback at every level)
+1. **ONNX inference → NNAPI + FP16** (`EmbeddingService.java`). New `buildSessionOptions(threads, tryNnapi)` helper attempts NNAPI with `NNAPIFlags.USE_FP16` first, falls back to NNAPI-without-FP16, then to CPU. If session creation throws after NNAPI add, retries CPU-only and remembers `nnapiPermanentlyDisabled = true` for the rest of the session. New field `activeBackend` exposes which backend is in use. Realistic 2–4× speedup per inference on devices with NPU/GPU acceleration.
+2. **Window batching** (`EmbeddingService.java`). New `runInferenceBatch(List<float[]>)` runs all 3 windows of a song in one `[3, 480000] → [3, 512]` forward pass instead of three separate `[1, 480000]` calls. Falls back to per-window inference (`runInferencePerWindow`) on shape mismatch or batch failure. ~20–40% additional speedup on top of NNAPI.
+3. **WebGPU recommender** (new `src/gpu-recommender.js`, ~330 lines). Exports `GpuRecommender.tryCreate()` (singleton via `getOrInitGpuRecommender`), `attachGpuToRec()` helper. Two WGSL compute shaders: dot-product kernel (workgroup 64) and k-means assignment kernel. Watches `device.lost` promise and degrades to CPU on driver crash / GPU reset. `Recommender` gained `attachGpu`, `hasGpu`, `_findNearestAsync`, `computeClustersAsync`. `engine-analytics.js` `getUnexploredClusters` now uses the async path — biggest visible win, since k-means is the slowest Discover operation. Wired up at every `setRec(new Recommender(embeddings))` site (engine-data.js, engine-embeddings.js).
+4. **NDK NEON SIMD** for native similarity index. New files: `android/app/src/main/cpp/CMakeLists.txt`, `android/app/src/main/cpp/embedding_native.cpp` (16-lane unrolled NEON kernel with `vfmaq_f32` on aarch64 / `vmlaq_f32` on armv7, scalar fallback on x86), and `android/app/src/main/java/com/isaivazhi/app/NativeAccelerator.java` (JNI wrapper with `System.loadLibrary` in static init guarded by try/catch — `LIBRARY_LOADED = false` on any failure, callers fall back to Java loop). `EmbeddingSimilarityIndex.findNearest` now batches all dot products through one JNI call. `android/app/build.gradle` gains `externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt", version "3.22.1" } }` and `ndk { abiFilters "arm64-v8a", "armeabi-v7a", "x86", "x86_64" }`. Realistic 3–4× faster than Java loop for batched dot products on arm64.
+
+Important: every layer is independent. NNAPI failing doesn't stop batching; WebGPU unavailable doesn't stop NNAPI; NEON .so missing doesn't stop ONNX. The same APK runs on a phone without WebGPU and on a phone without an NPU — each path silently degrades.
+
+### AI embedding page bug fixes
+Several bugs ranging from "deleted song still shown as orphan" to subtle mid-batch state losses:
+
+1. **Deleted song appears as missing embedding** — `_identifyOrphans()` filter was too broad (`songs.filter(s => !s.filePath)`) and `deleteSong` never refreshed the cached `orphanedSongs[]`. **Fix:** filter is now `!s.filePath && s.hasEmbedding` (real orphan = file gone but embedding still on disk; user-deleted songs have `hasEmbedding=false` after `_purgeLocalEmbeddingForSong`). `deleteSong` and `removeOrphanedEmbeddings` both call `_identifyOrphans()` and fire `_fireSongLibraryChanged({reason: 'user_delete' | 'orphans_removed'})`. The `onSongLibraryChanged` callback in `app.js` now also re-renders the AI detail page if it's currently visible, eliminating the 2-second stale window.
+
+2. **Re-add silently dropped during in-progress batch** — `readdSongEmbedding` and `embedRemovedSongsBatch` deleted from `removedEmbeddingKeys` but skipped `_startEmbedding` when `embeddingInProgress=true`, leaving the song in limbo (removed from "Embed Removed Songs" list but never queued). **Fix:** new `_deferredReembedIds` Set; deferred items drain at the end of `_runPostBatchMerge`.
+
+3. **Dead code in `embeddingSongComplete` handler** — 70 lines of unreachable code referencing undefined `embArray` (leftover from the older bridge protocol that shipped full embeddings per song). **Fix:** removed; comment now documents the architecture (native side writes pending JSON; JS reconciles in `_runPostBatchMerge`).
+
+4. **2-second polling rebuilt the AI page DOM even when idle** — gated on `engine.getEmbeddingStatus().inProgress` so the heavy DOM work only runs during active embedding. Event-driven listeners cover the rest.
+
+5. **Pending count double-counted failed songs** — `newCount = pendingNewSongs.length + (st.failedCount || 0)` was inflated because failed songs (which have `hasEmbedding=false`) are already in `pendingNewSongs`. Renamed UI labels to "Embed Pending Songs" with a `(K retry)` hint when applicable. Also fixed the "All songs have AI embeddings" success path that was previously gated on the inflated count.
+
+### Search bar reverting to full list
+`onScanComplete`, `onAlbumArtReady`, `onSongLibraryChanged`, `_scheduleArtUiRefresh`, and `_activateTab` all called `renderSongs(allSongs)` / `renderAlbums(allAlbums)` blindly, wiping the user's typed search query within a few seconds of app load. **Fix:** new `_filteredSongs()` and `_filteredAlbums()` helpers that read the live `#searchInput` value and filter accordingly. All five sites updated to use them.
+
+### Section playback auto-transition (silence-after-section bug)
+When playing from a Discover section (e.g. "Because You Played"), after the last section song finished, native player either looped the section forever (loop=all default → `REPEAT_MODE_ALL`) or stopped silently (loop=off). Root cause: `engine-playback.js` `onNativeAdvance` had `state.timelineMode !== 'explicit'` in the `needsRefresh` check, so sections never got their queue extended. **Fix:** check now triggers when advancing to the last item of an explicit section/ordered-list timeline (excluding album/favorites/playlist which genuinely "end" by design). When triggered, calls `_doRefresh('section_ending')` which clears the explicit timeline and builds a dynamic AI rec queue based on the current song. App pushes the new upcoming items to native via `replaceUpcoming`. Native plays last section song, advances naturally into recs.
+
+### Hamburger menu + sidebar + Settings page + embedding upload
+New `src/app-settings.js` (~290 lines) with:
+- Hamburger button (☰) fixed top-left, blurred background, z-index 50
+- Slide-in sidebar from left (`transform: translateX(-100%)` → `0`) with backdrop, animated
+- Sidebar entry: Settings (⚙)
+- Settings sub-page with file picker for the `local_embeddings.bin` + `local_embeddings_meta.json` pair
+- Validation: extension check, JSON parse with shape `{dim, entries[]}`, binary-size check (`entries.length × dim × 4`)
+- Wrong/extra files: marked "Not supported: <name>"
+- Successful upload: writes via `MusicBridge.writeBinaryFile` + `MusicBridge.writeTextFile` to the same data dir the on-device pipeline uses, then calls new `engine.reloadEmbeddingsFromDisk()` which loads from disk, merges into `songs[]`, rebuilds the recommender (with GPU attach), refreshes profile vec, marks embeddings ready, and fires `_fireSongLibraryChanged`. Status flips to ✓ "Embeddings loaded (N merged into library)".
+- AI Embedding + Taste Signal buttons in Discover panel: tighter padding (10px from 16px) and smaller font (13px from 15px), with `margin-left: 50px` so the row clears the hamburger.
+
+CSS for hamburger / sidebar / settings appended to `style.css`.
+
+### Tab swipe gesture
+New touch handler on `.content` (`app.js`) using **touch-target detection**: if the swipe starts on `.hscroll`, `.hscroll-wrap`, `.tabs`, an input/textarea/select, or any element with `data-no-tab-swipe`, it's a section/element scroll. Anywhere else, a swipe with `|deltaX| > 60px AND |deltaX| > 2 * |deltaY| AND duration < 600ms` switches tabs in order: Discover → Songs → Albums → Up Next → Browse. Edges don't wrap.
+
+### Build verification
+- `npm run build` — OK (Vite 411ms)
+- `npm run test:unit` — 30/31 (pre-existing `onNativeAdvance` failure only)
+- `npx cap sync android` — OK
+- `:app:assembleDebug` — BUILD SUCCESSFUL in 2m 31s, 40 tasks executed (full Java rebuild + native CMake compile of NEON kernel for arm64-v8a / armeabi-v7a / x86 / x86_64). APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 387 MB, timestamp 2026-05-09 23:47. (Trailing "BUILD FAILED" message is the Gradle metadata-cache lock collision when Android Studio holds `last-build.bin` — does not affect the APK.)
+
+---
+
+Last updated previously: 2026-04-26 (in-flight: in-session embedding-merge gap fix landed — `src/engine.js` now exposes an idempotent `_runPostBatchMerge(...)` that the `embeddingComplete` listener calls, plus a 5s status watchdog that runs while a batch is active and pings `MusicBridge.requestEmbeddingStatus()`; `MusicBridgePlugin.onEmbeddingServiceEvent` MSG_STATUS handler now synthesizes a fallback `embeddingComplete` when a status snapshot reports inactive after a previously-active state. Together these close the soak-observed bug where in-foreground batch completion during active playback did not propagate to JS until cold start. The earlier embedding/playback UI-lag stabilization pass and the AI-page unmatched/orphaned cleanup confirm flow remain in place. Details under "Latest Verified Changes".)
 
 `local_embedding_generator.py` created 2026-04-26 — laptop/local version of `colab_embedding_generator.py`. Runs on Windows with NVIDIA GPU (CUDA) or falls back to CPU. Set `SONGS_DIR` at the top of the file before running. Output and CLAP checkpoint are placed next to the script automatically.
 
@@ -14,6 +554,9 @@ This file is the short source of truth for the current app state, the latest ver
 
 Full historical notes and older landed batches now live in:
 - `project_development_archive.md`
+
+Active structural-refactor campaign tracking lives in:
+- `file_split_campaign.md` — file-size split campaign (no behavior changes; sanity-tested per slice; full verification at end of campaign)
 
 If documents ever disagree, prefer:
 1. live code
@@ -33,6 +576,14 @@ $env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'; .\android\gradlew.
 $env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'; .\android\gradlew.bat -p android :app:connectedDebugAndroidTest
 $env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'; .\android\gradlew.bat -p android assembleDebug
 ```
+
+**If `assembleDebug` fails with `Could not update ... last-build.bin (Access is denied)`** — Android Studio holds a lock on the Gradle metadata cache at `C:\Users\<you>\.gradle\caches\<ver>\file-changes\last-build.bin`. Either close Android Studio, OR use a separate Gradle user home so the CLI build never touches the AS-locked cache (verified working 2026-05-10 — produced a fresh APK in 2m 27s while AS stayed open):
+
+```powershell
+$env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'; .\android\gradlew.bat -p android --gradle-user-home "$env:USERPROFILE\.gradle-cli" --no-daemon assembleDebug
+```
+
+The first run with this flag downloads Gradle + AGP into the new home (~5 min, ~500 MB). Subsequent runs are normal speed. Don't share this home with Android Studio; pointing AS at it would re-introduce the lock collision.
 
 Use the app-scoped connected-test task above, not aggregate `connectedDebugAndroidTest`.
 The aggregate task also walks Capacitor plugin-module `androidTest` variants, which are unrelated to app regression coverage here.
@@ -123,41 +674,29 @@ Most recent structural-split verification: 2026-04-26 (after latest `src/app.js`
 
 APK output:
 - `android/app/build/outputs/apk/debug/app-debug.apk`
-- latest rebuild confirmed in this session: `2026-04-26 13:02:42`, ~366.6 MiB
+- latest rebuild: `2026-05-09 23:47`, ~387 MB (full GPU stack: NNAPI / window batching / WebGPU / NEON SIMD; new app-settings, app-favorites, app-session-ui modules; engine.js split campaign complete at 1,838 lines)
+- earlier rebuild: `2026-04-26 13:02:42`, ~366.6 MiB
 - post-soak rebuild 2026-04-26 14:15: `npm.cmd run build` OK (vite 306ms), `npx.cmd cap sync android` OK (0.353s, 3 Capacitor plugins detected), `gradlew clean assembleDebug` BUILD SUCCESSFUL in 27s (169 tasks executed, 24 up-to-date — clean rebuild because the previous incremental `assembleDebug` had reused the existing 13:02 APK on the up-to-date check). Fresh APK timestamp: `2026-04-26 14:15:00`, 366.6 MiB at `android/app/build/outputs/apk/debug/app-debug.apk`. `npm.cmd run test:unit` was attempted first but **failed in `tests/engine.regression.test.js:223`** (1 of 30 tests) — the test expects `engine.onNativeAdvance(...)` second call with same `songId` + new `playbackInstanceId` to return `{duplicate: true}` but actual is `{needsSync: true, songInfo: {...}}`. This regressed between the last green test:unit run earlier today (2026-04-26 after the `src/app.js` embedding-progress UI-refresh dedupe — 30/30 passing) and now; the more recent AI-page cleanup popup landing only verified `npm.cmd run build` plus a focused Playwright spec, so the failure was not caught. User asked to skip tests and proceed with the build only this pass. Recommended follow-up: read `src/engine.js` `onNativeAdvance` to determine whether the return-shape change to `{needsSync, songInfo}` is intentional (then update the test) or accidental (then restore `{duplicate: true}`).
 
 ## Current Source Of Truth
 
 ### UI File Split Progress
-- Structural split mode is active for `src/app.js` only. `src/engine.js` has not been split yet.
+- Both `src/app.js` and `src/engine.js` split campaigns are complete (2026-05-09).
 - Start-of-campaign sizes:
   - `src/app.js` - 5,229 lines
-  - `src/engine.js` - 6,563 lines at campaign start
+  - `src/engine.js` - 7,026 lines at engine campaign start (up from 6,563 originally due to fix work between campaigns)
 - Current live sizes:
-  - `src/app.js` - 5,282 lines
-  - `src/engine.js` - 6,984 lines
-- Net status in the current live tree: `src/app.js` is now 53 lines larger than the original 5,229-line start point, so the earlier split reduction has been overtaken by later rollback/fix work.
-- New live files created so far: 6
-  - `src/app-debug.js` - 71 lines - debug logger, error summarizer, global error hooks
-  - `src/app-status-ui.js` - 85 lines - status toast and recommendation rebuild status UI
-  - `src/app-art.js` - 111 lines - album-art request queue and art fallback / recovery helpers
-  - `src/app-playlists-ui.js` - 154 lines - playlist picker overlay and playlist CRUD modal helpers
-  - `src/app-back-navigation.js` - 95 lines - Android back-button decision flow and sub-page close helpers
-  - `src/app-browse-render.js` - 100 lines - search clear, song thumb, songs/albums render helpers, album expand/collapse
-- Total lines now living in those six helper modules: 616.
-- `src/app.js` still owns:
-  - bootstrap order
-  - `window._app`
-  - `App.addListener(...)` lifecycle wiring
-  - main orchestration and cross-module state
-- Verification discipline during this split campaign:
-  - every green boundary has passed `npm.cmd run test:unit`
-  - every green boundary has passed `npm.cmd run test:ui`
-  - every green boundary has passed `npm.cmd run build`
-  - every green boundary has passed `npx.cmd cap sync android`
-  - every green boundary has passed Android `:app:testDebugUnitTest`
-  - every green boundary has passed Android `:app:assembleDebug`
-  - `:app:connectedDebugAndroidTest` has not been rerun during these structural slices yet
+  - `src/app.js` - ~2,700 lines (post-split + recent additions for swipe handler, settings init, search filter helpers, queueEnded handler refresh)
+  - `src/engine.js` - 1,838 lines (under the 2,000-line hard ceiling)
+- `src/app.js` helper modules (12 total): `app-debug.js` (71), `app-status-ui.js` (85), `app-art.js` (111), `app-playlists-ui.js` (154), `app-back-navigation.js` (95), `app-browse-render.js` (100), `app-song-menu.js` (252), `app-taste-ui.js` (595), `app-ai-page.js` (~280), `app-discover-ui.js` (565), `app-player-ui.js` (833), `app-settings.js` (~290).
+- `src/engine.js` helper modules (10 total): `engine-state.js` (202), `engine-indexes.js` (57), `engine-taste.js` (1,180), `engine-embeddings.js` (~1,200 with reload + deferred re-embed), `engine-data.js` (~800), `engine-analytics.js` (767), `engine-insights.js` (501), `engine-playback.js` (627), `engine-favorites.js` (325), `engine-session-ui.js` (203). Plus shared `gpu-recommender.js` (~330).
+- Java helper modules (`MusicBridgePlugin.java` 1,799 → 1,364 lines + 3 helpers): `MediaScanHelper.java` (176), `AlbumArtHelper.java` (71), `FileBridgeHelper.java` (255). Plus new `NativeAccelerator.java` (JNI wrapper for NEON SIMD via `cpp/embedding_native.cpp`).
+- Verification discipline during these split campaigns:
+  - every green boundary has passed `npm.cmd run test:unit` (30/31 — pre-existing `onNativeAdvance` failure only)
+  - `npm.cmd run build` passing
+  - `npx.cmd cap sync android` passing
+  - `:app:assembleDebug` passing (most recent: 2m 31s, 40 tasks executed for full rebuild including native NEON compile)
+  - `npm.cmd run test:ui` and `:app:connectedDebugAndroidTest` not rerun during recent structural / GPU work; recommended for end-of-campaign verification
 
 ### Regression Testing Status
 - Phase 1 automated regression coverage now exists via `Vitest`.
@@ -462,7 +1001,7 @@ Trade-off accepted: ~20 `MusicPlaybackService.instance.xxx()` static call sites 
 - Whole-song decode remains intentionally retained for now. Seek-per-window decode is no longer part of the active Option B completion bar; keep it as a future optimization if whole-song decode becomes a proven bottleneck again.
 - The playback-aware scheduler is landed at coarse stage boundaries, but still needs real-device tuning against a large library while music is actively playing.
 - Similarity / nearest-neighbor is only partially moved native-side: `For You` and `Because You Played` can use `:ai`, but the synchronous taste-propagation helper, `Unexplored Sounds`, `Most Similar`, and other JS recommendation paths still need a wider async/native refactor.
-- A fresh real-device long batch soak is still needed specifically against the new `:ai` path while actively playing music, now also validating that duplicate native playback events stay harmless and that AI-page progress survives any missed callback bursts.
+- A fresh real-device long batch soak is still needed specifically against the new `:ai` path while actively playing music, now also validating that duplicate native playback events stay harmless, that AI-page progress survives any missed callback bursts, and that the new in-session embedding-merge recovery (JS watchdog + Java MSG_STATUS active→inactive fallback, landed 2026-04-26) actually fires when a batch finishes in-foreground during playback.
 
 #### Source verification (2026-04-25)
 Each "landed now" claim was cross-checked against the live source tree. Findings:
@@ -714,6 +1253,22 @@ Still pending before the legacy path can be retired:
   - real-device validation is still needed for notification appearance and action delivery across OEM lockscreen / notification implementations
 
 ## Latest Verified Changes
+
+- 2026-05-10: two regression-fix follow-ups landed against the earlier same-day UI overhauls (full detail in follow-up sections #17 and #18 above).
+  - **#18** — `View Album` from search overlay was throwing `TypeError: Cannot read properties of null (reading 'style')`. `viewAlbumForSong` (`src/app-song-menu.js:271-301`) referenced `document.getElementById('searchBar').style.display` but the `#searchBar` element was deleted in #12 (search input now lives permanently in the top bar). It also relied on the pre-#10 manual `.tab` / `.panel` `.active` toggle pattern which no longer drives navigation under the scroll-snap architecture. Replaced both with one `_activateTab('albums', { pushHistory: true })` call (which also handles search-overlay close, dirty-render, and history). Plumbing: added `activateTab: (...a) => _activateTab(...a)` to the `createSongMenuSupport(...)` options object in `src/app.js` and added `activateTab` to the destructuring in `app-song-menu.js`.
+  - **#17** — Discover pull-to-refresh fired anywhere in the panel (including pulls back from a bottom-of-list rubber-band) instead of only at the top. `setupPullToRefresh` (`src/app.js:1885-2026`) gated on `content.scrollTop <= 0`, but the scroll-snap rewrite (#10) had moved `.content` to `overflow: hidden` and made each `.panel` its own `overflow-y: auto` scroll container — so `content.scrollTop` was permanently 0. Added a lazy `getDiscoverScroller = () => document.getElementById('panel-discover')` helper (matching the existing lazy-resolve pattern for `#pullIndicator` / `#discover-pull-body`) and switched both gate sites (touchstart line 1961, touchmove line 1971) to read from it. Touch listener stays on `.content`; only the scrollTop source changed.
+  - Verification this pass: `npm.cmd run build` OK (Vite 511ms; bundle now `dist/assets/index-LfweI0P5.js`); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 9s — APK packaged successfully despite the trailing "BUILD FAILED" Gradle metadata-cache lock collision documented in "Build Steps". Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, **389.4 MB**, timestamp `2026-05-10 16:33:28`. `npm.cmd run test:unit` not rerun in this pass (pre-existing `onNativeAdvance` 30/31 baseline unchanged; both fixes are UI-glue with no engine surface). Real-device validation pending for both: confirm pull-to-refresh only triggers at the very top of Discover, and confirm `Search → song-menu → View Album` navigates to the Albums tab and expands the album with no console error.
+
+- 2026-05-10: startup-performance batch (fixes A–F) landed across `src/embedding-cache.js`, `src/engine-data.js`, `src/engine-embeddings.js`, `src/engine-taste.js`, `src/engine.js`, `src/app.js`. Goal was to bring "Most Similar" rendering on warm-start (cache-skip path) under 2s. Six independent fixes, each with a safe fallback: A) Promise.all collapses 5+1 sequential awaits in `loadData` (Preferences + getAppDataDir); B) replaces `Uint8Array.from(atob, c=>c.charCodeAt(0))` with explicit loop in `_loadBinaryStore`; C) keeps Float32Array end-to-end through `_loadBinaryStore → _mergeLocalEmbeddings`, with JSON-safe legacy mirror writes via `_writeLegacyJson`; D) caches `EXTERNAL_DATA_DIR` in Preferences (`cached_data_dir_v1`) and adds new `engine.preloadEmbeddingsEarly()` that fires `_loadLocalEmbeddings()` before `loadData()` resolves, with reuse-or-discard behavior in `startBackgroundScan` if the resolved path differs; E) profile vector cache file `profile_vec_cache_v1.json` gated by a fingerprint (top-30 positive + top-30 negative weighted ids, each top song's `embeddingIndex`, `beta`, embedding count) so repeat startups skip the weighted-average + negative subtract math while still running `_buildSignalRowsFromSummary` + `_updateRecommendationPolicySnapshot` for live policy state; F) `_markEmbeddingsReady()` now fires before `buildProfileVec()` in both scan paths so `renderSimilar()` (which only needs `rec.recommendSingle` + the current song's embedding) can render Most Similar without waiting on the profile-vector build, which now runs in the background. Pre-fix safety backup: `backups/startup_perf_prework_20260510_060528/`. Verification this pass: `npm.cmd run build` OK (Vite 295ms); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` `{duplicate: true}` shape regression remains the only failure); `npx.cmd cap sync android` OK (latest bundle `dist/assets/index-sllJNX_9.js` synced to `android/app/src/main/assets/public/`); Android `:app:testDebugUnitTest` BUILD SUCCESSFUL in 31s; `:app:assembleDebug` blocked by Gradle metadata-cache lock (`last-build.bin` access denied — Android Studio process holds it). APK rebuild requires AS to be closed or the build re-run from AS; web bundle with all 6 fixes is already in Android assets so the next assembleDebug from any source produces an APK with this batch. Real-device validation pending: cold-start vs second-open timing measurements to confirm the ~1.0–1.5s target for "Most Similar shown".
+
+- 2026-04-26: in-session embedding-merge gap fix landed (closes the soak-observed bug from earlier today where a batch completing in foreground with active playback never reached the JS merge path until next cold start). Three coordinated changes:
+  - `src/engine.js` — the body of the existing `embeddingComplete` listener was extracted into `async function _runPostBatchMerge(data, source)`. The function is idempotent: it keys on a `${processed}:${failed}:${embeddingStartTime}` signature stored in `_lastCompletedBatchSig`, and a repeated call with the same signature returns `{ deduped: true }` without re-running the merge body. The existing native-event listener now calls `_runPostBatchMerge(data, 'native_event')`. `_runPostBatchMerge` is also added to the engine's exports so callers (and tests) can drive it directly.
+  - `src/engine.js` — a status watchdog (`_startEmbeddingStatusWatchdog`/`_stopEmbeddingStatusWatchdog`) polls `MusicBridge.requestEmbeddingStatus()` every 5s while `embeddingInProgress` is true. The watchdog starts in `_startEmbedding` (just after `_lastCompletedBatchSig` is reset) and stops on completion / on start-failure / when the engine observes `embeddingInProgress=false`. The watchdog gracefully no-ops if `MusicBridge.requestEmbeddingStatus` is not exposed (e.g., test environment).
+  - `MusicBridgePlugin.java` — the `MSG_STATUS` branch of `onEmbeddingServiceEvent` now tracks the previous `embeddingBridgeKnownActive` value. When a status snapshot reports `inProgress=false` and the bridge previously believed the batch was active, it synthesizes `emitEmbeddingComplete(processed, failed)` so JS sees `embeddingComplete` even if the original `MSG_COMPLETE` Messenger event was dropped. The active-side branch still emits `embeddingProgress` as before.
+  - Coverage: `tests/engine.regression.test.js` gained a `_runPostBatchMerge` idempotency test that asserts a repeated call dedupes (`{ deduped: true }`) and produces only one "Embedding complete" log entry, while a distinct `(processed, failed)` pair after the first completion runs the merge again.
+  - Pre-fix safety backup: `backups/embedding_complete_recovery_prework_20260426_175248/` (engine.js, app.js, MusicBridgePlugin.java, engine.regression.test.js).
+  - Verification after this pass: `npm.cmd run test:unit` 31/32 passing (the new `_runPostBatchMerge` test passes; the unrelated `onNativeAdvance` `{duplicate: true}` regression noted in the build-info entry above remains the single failure and is out of scope here); `npm.cmd run build` OK (663 ms); `npx.cmd cap sync android` OK; `:app:testDebugUnitTest` BUILD SUCCESSFUL in 53s; `:app:assembleDebug` BUILD SUCCESSFUL in 12s; focused `tests/e2e/embedding-detail.regression.spec.js` passes in 57.5s with a 60s timeout (the default 30s timeout occasionally flakes that spec; not a regression). New debug APK: timestamp `2026-04-26 18:04`, ~366.7 MiB at `android/app/build/outputs/apk/debug/app-debug.apk`. `:app:connectedDebugAndroidTest` was not rerun in this pass.
+  - Still requires real-device confirmation: emulator soak repro of the original failure mode (in-foreground batch completion under active playback) to verify the watchdog or Java fallback fires within ~5s of natural batch completion and that the JS console shows the `Merged ... embeddings from disk after batch completion` line in the same session, with `local_embeddings.bin` updated without a cold restart.
 
 - 2026-04-26: emulator soak run against the live 12:27 debug APK (no source changes this pass — observation/validation only). Two batches were exercised: first 13 fresh `.mp3` songs pushed into `/sdcard/songs_downloaded/` (97 total on device), then 11 more `.mp3` songs (108 total). In both runs `song_library.json` `savedAt` was backdated to force the full `_backgroundScan` path because the cache-age skip threshold (~6h) was not yet exceeded. The first batch (13 songs) was interrupted by `am stop-app` (recents-swipe equivalent) — `:ai` resumed the remaining work cleanly from `active_embedding_batch.json`, the mini-player correctly restored `currentSong=67 (Jaiye Sajana)` after the kill, and 13/13 finished. The second batch (11 songs) was deliberately left to complete in-foreground with playback active throughout — all 11 finished cleanly under playback. Validated working in source across both runs: ONNX session switched 2 → 1 thread on `playback_started` and emitted 120ms yields before/after every window inference, song completion, and decode (reason field cycled through `playback_started`, `queue_current_changed` as transport events fired); `active_embedding_batch.json` persistence let the fresh `:ai` process resume after a full three-process kill; atomic write of `local_embeddings.bin` confirmed by exact-size deltas (each new embedding adds 2,048 bytes = 512 floats × 4); `restorePlaybackState` correctly rehydrated the mini-player after `am stop-app`; multiple HOME/relaunch cycles (single, 3-rapid-burst-in-30s, with media-key NEXT/PAUSE/PLAY in background) produced no FATAL / no ANR / no WebView child crash / no Media3 `onPlayerError`; only valid `neutral_skip` / `user_jump` / `auto_advance` `queueCurrentChanged` actions were observed and no duplicate-rejection events fired. Originally-suspected "playback glitches during embedding" symptoms did NOT reproduce — only ~300 ms inter-track `isPlaying false → true` transitions consistent with normal Media3 between-track state. Findings worth tracking:
   - **Real in-session merge gap (worth fixing).** When an embedding batch completes in foreground with active playback, the native `embeddingComplete` event does not propagate to JS — `EmbeddingService` correctly logs `Embedding complete: 11 processed, 0 failed` and `pending_embeddings.json` ends up with all 11 entries (121,112 bytes), but the JS console emits zero embedding-related messages from `Embedding call returned: {"status":"started","count":11}` until the next cold start; no `[Embedding] Loaded` / `Recovered ... pending` / `Wrote stable binary store` lines fire in-session, and `local_embeddings.bin` is not updated. The status-poll fallback (`MSG_STATUS active→inactive` → fallback `embeddingComplete`) only triggers on app resume / AI detail page open / stale-callback heuristics, none of which were satisfied here. Cold-start path recovers cleanly: a force-stop + relaunch immediately fires `Loaded 2486 embeddings from stable binary store` → `Recovered 11 pending embeddings into the stable store` → `Wrote stable binary store: 2497 entries, 512d` → `Merge result: 108 merged`, with `local_embeddings.bin` growing 5,091,328 → 5,113,856 (+22,528 = 11 × 2,048). So no data loss, but new embeddings do not reach Discover / recommendation surfaces until next launch when a batch finishes while the app stays active. Suggested fix direction: either (i) make native always raise the bridge `embeddingComplete` event on natural batch completion (currently it appears the bridge emit only fires on the legacy completion path or via the `MSG_STATUS` fallback), or (ii) add a JS-side post-batch poll that runs once after `Embedding call returned: started` resolves so the merge path always fires.

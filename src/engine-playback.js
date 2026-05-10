@@ -1,0 +1,643 @@
+import { Preferences } from '@capacitor/preferences';
+import { SessionLogger } from './logger.js';
+import { flushActivityLog } from './activity-log.js';
+
+import {
+  PENDING_LISTEN_KEY, SIMILARITY_BOOST_KEY, TASTE_REVIEW_IGNORE_KEY,
+  LISTEN_SKIP_THRESHOLD, NEUTRAL_SKIP_CAPTURE_THRESHOLD,
+  songs, favorites, recToggle, log, state,
+  _setRecToggle, _setQueueShuffleEnabled,
+  setCurrentPlaybackInstanceId, setCapturedPlaybackInstanceId,
+  setLastLoggedPlaybackStartInstanceId, setLastLoggedPlaybackStartSongId,
+  _lastLoggedPlaybackStartInstanceId, _lastLoggedPlaybackStartSongId,
+  _recommendationRebuildTimer, setRecommendationRebuildTimer,
+  setRecommendationRebuildInFlight, setRecommendationRebuildPending,
+  setRecommendationRebuildReason, setRecommendationRebuildOpts,
+  setFavorites, setNegativeScores, setSimilarityBoostScores,
+  setDislikedFilenames, setTasteReviewIgnores, setLastTasteReviewSnapshot,
+  setRecentPlaybackSignalEvents, setProfileVec, setRecommendationPolicySnapshot, setLog,
+} from './engine-state.js';
+import { _getFilenameMap } from './engine-indexes.js';
+import { _copySessionEntry, _activity, _songRef, _ensurePlaybackStartLogged } from './engine-taste.js';
+import { _resolveSongIdFromNativePayload, _getPlaylistById } from './engine-data.js';
+
+let _pcbs = {};
+export function initPlaybackCallbacks(cbs) { _pcbs = cbs; }
+
+export function _filenameToId(fn) {
+  if (!fn) return null;
+  const fnMap = _getFilenameMap();
+  const sid = fnMap[fn.toLowerCase()];
+  return sid != null ? sid : null;
+}
+
+export async function savePlaybackState(currentTimeSec, durationSec) {
+  try {
+    // Save by filename for cross-session stability (IDs can shift)
+    const currentFn = state.current != null && songs[state.current] ? songs[state.current].filename : null;
+    const currentSong = state.current != null ? songs[state.current] : null;
+    const data = {
+      currentFilename: currentFn,
+      currentFilePath: currentSong ? currentSong.filePath : null,
+      currentTitle: currentSong ? currentSong.title : '',
+      currentArtist: currentSong ? currentSong.artist : '',
+      currentAlbum: currentSong ? currentSong.album : '',
+      currentSource: state.currentSource,
+      historyFilenames: state.history.map(id => songs[id] ? songs[id].filename : null).filter(Boolean),
+      historyPos: state.historyPos,
+      queueFilenames: state.queue.map(q => songs[q.id] ? { filename: songs[q.id].filename, similarity: q.similarity } : null).filter(Boolean),
+      listenedFilenames: state.listened.map(entry => {
+        if (!songs[entry.id]) return null;
+        const copy = _copySessionEntry(entry);
+        return {
+          filename: songs[entry.id].filename,
+          listen_fraction: copy.listen_fraction,
+          encounters: copy.encounters,
+          totalFraction: copy.totalFraction,
+          skips: copy.skips,
+          plays: copy.plays,
+          source: copy.source,
+        };
+      }).filter(Boolean),
+      sessionLabel: state.sessionLabel,
+      playingFavorites: state.playingFavorites,
+      playingAlbum: state.playingAlbum,
+      playingPlaylist: state.playingPlaylist,
+      currentPlaylistId: state.currentPlaylistId,
+      albumTrackFilenames: (state.currentAlbumTracks || []).map(id => songs[id] ? songs[id].filename : null).filter(Boolean),
+      timelineMode: state.timelineMode,
+      timelineIndex: state.timelineIndex,
+      timelineFilenames: (state.timelineItems || []).map(item => {
+        const s = songs[item.id];
+        return s ? { filename: s.filename, similarity: item.similarity, manual: !!item.manual } : null;
+      }).filter(Boolean),
+      explicitPlayedFilenames: (state.explicitPlayedIds || []).map(id => songs[id] ? songs[id].filename : null).filter(Boolean),
+      recToggle,
+      currentTime: currentTimeSec != null ? currentTimeSec : 0,
+      duration: durationSec || 0,
+      loggedPlaybackStartInstanceId: _lastLoggedPlaybackStartInstanceId || 0,
+      loggedPlaybackStartFilename: _lastLoggedPlaybackStartSongId != null && songs[_lastLoggedPlaybackStartSongId]
+        ? songs[_lastLoggedPlaybackStartSongId].filename
+        : null,
+    };
+    await Preferences.set({ key: 'playback_state', value: JSON.stringify(data) });
+  } catch (e) { /* ignore */ }
+}
+
+function _normalizePendingListenSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const filename = snapshot.filename || (snapshot.songId != null && songs[snapshot.songId] ? songs[snapshot.songId].filename : null);
+  if (!filename) return null;
+  const resolvedSongId = _filenameToId(filename);
+  const song = resolvedSongId != null ? songs[resolvedSongId] : (snapshot.songId != null ? songs[snapshot.songId] : null);
+  const playedMs = Math.max(0, Math.round(Number(snapshot.playedMs) || 0));
+  const durationMs = Math.max(0, Math.round(Number(snapshot.durationMs) || 0));
+  if (!(durationMs > 0)) return null;
+  const playbackInstanceId = Math.max(0, Math.round(Number(snapshot.playbackInstanceId) || 0));
+  const capturedAt = snapshot.capturedAt || new Date().toISOString();
+  const capturedAtMs = Date.parse(capturedAt);
+  return {
+    songId: resolvedSongId != null ? resolvedSongId : (snapshot.songId != null ? snapshot.songId : null),
+    filename,
+    title: snapshot.title || (song ? song.title : filename),
+    artist: snapshot.artist || (song ? song.artist : ''),
+    album: snapshot.album || (song ? song.album : ''),
+    playbackInstanceId,
+    playedMs: Math.min(playedMs, durationMs),
+    durationMs,
+    reason: snapshot.reason || null,
+    capturedAt,
+    capturedAtMs: Number.isFinite(capturedAtMs) ? capturedAtMs : Date.now(),
+  };
+}
+
+export async function savePendingListenSnapshot(snapshot) {
+  const normalized = _normalizePendingListenSnapshot(snapshot);
+  if (!normalized) return { saved: false, reason: 'invalid_snapshot' };
+  try {
+    const existing = await loadPendingListenSnapshot();
+    let next = normalized;
+    if (existing && existing.playbackInstanceId > 0 && existing.playbackInstanceId === normalized.playbackInstanceId) {
+      next = {
+        ...existing,
+        ...normalized,
+        playedMs: Math.max(existing.playedMs || 0, normalized.playedMs || 0),
+        durationMs: Math.max(existing.durationMs || 0, normalized.durationMs || 0),
+        capturedAt: normalized.capturedAt,
+        capturedAtMs: normalized.capturedAtMs,
+      };
+    }
+    await Preferences.set({ key: PENDING_LISTEN_KEY, value: JSON.stringify(next) });
+    return { saved: true, snapshot: next };
+  } catch (e) {
+    return { saved: false, reason: 'preferences_write_failed' };
+  }
+}
+
+export async function loadPendingListenSnapshot() {
+  try {
+    const { value } = await Preferences.get({ key: PENDING_LISTEN_KEY });
+    if (!value) return null;
+    return _normalizePendingListenSnapshot(JSON.parse(value));
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function clearPendingListenSnapshot(match = null) {
+  try {
+    if (!match) {
+      await Preferences.remove({ key: PENDING_LISTEN_KEY });
+      return true;
+    }
+    const existing = await loadPendingListenSnapshot();
+    if (!existing) return false;
+    const matchPlayback = match.playbackInstanceId == null || Number(match.playbackInstanceId) === Number(existing.playbackInstanceId);
+    const matchFilename = !match.filename || match.filename === existing.filename;
+    if (!matchPlayback || !matchFilename) return false;
+    await Preferences.remove({ key: PENDING_LISTEN_KEY });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Quick read of display info — no song resolution needed, works before loadData
+export async function getLastPlayedDisplay() {
+  try {
+    const { value } = await Preferences.get({ key: 'playback_state' });
+    if (!value) return null;
+    const data = JSON.parse(value);
+    if (!data.currentFilename) return null;
+    return {
+      title: data.currentTitle || data.currentFilename,
+      artist: data.currentArtist || '',
+      album: data.currentAlbum || '',
+      filename: data.currentFilename,
+      filePath: data.currentFilePath || null,
+      currentTime: data.currentTime || 0,
+      duration: data.duration || 0,
+    };
+  } catch (e) { return null; }
+}
+
+export async function restorePlaybackState() {
+  try {
+    const { value } = await Preferences.get({ key: 'playback_state' });
+    if (!value) return null;
+    const data = JSON.parse(value);
+
+    // Restore by filename (stable) — fall back to old ID-based format for migration
+    let currentId = null;
+    if (data.currentFilename) {
+      currentId = _filenameToId(data.currentFilename);
+    } else if (data.current != null && data.current < songs.length) {
+      currentId = data.current; // legacy ID-based format
+    }
+    if (currentId == null) return null;
+
+    state.current = currentId;
+    state.currentSource = data.currentSource || 'restored';
+
+    if (data.historyFilenames) {
+      state.history = data.historyFilenames.map(fn => _filenameToId(fn)).filter(id => id != null);
+    } else {
+      state.history = (data.history || []).filter(id => id < songs.length);
+    }
+    state.historyPos = Math.min(data.historyPos ?? state.history.length - 1, state.history.length - 1);
+
+    if (data.queueFilenames) {
+      state.queue = data.queueFilenames.map(q => { const id = _filenameToId(q.filename); return id != null ? { id, similarity: q.similarity } : null; }).filter(Boolean);
+    } else {
+      state.queue = (data.queue || []).filter(q => q.id < songs.length);
+    }
+
+    if (data.listenedFilenames) {
+      state.listened = data.listenedFilenames.map(entry => {
+        const id = _filenameToId(entry.filename);
+        if (id == null) return null;
+        const listenFraction = (typeof entry.listen_fraction === 'number' && !Number.isNaN(entry.listen_fraction))
+          ? entry.listen_fraction
+          : 0;
+        const encounters = Number.isFinite(Number(entry.encounters))
+          ? Number(entry.encounters)
+          : (entry.listen_fraction != null ? 1 : 0);
+        const totalFraction = Number.isFinite(Number(entry.totalFraction))
+          ? Number(entry.totalFraction)
+          : (encounters > 0 ? listenFraction : 0);
+        const skips = Number.isFinite(Number(entry.skips))
+          ? Number(entry.skips)
+          : (encounters > 0 && (listenFraction != null && listenFraction <= LISTEN_SKIP_THRESHOLD) ? 1 : 0);
+        const plays = Number.isFinite(Number(entry.plays))
+          ? Number(entry.plays)
+          : (encounters > 0 && !(listenFraction != null && listenFraction <= LISTEN_SKIP_THRESHOLD) ? 1 : 0);
+        return {
+          id,
+          listen_fraction: listenFraction,
+          encounters,
+          totalFraction,
+          skips,
+          plays,
+          source: entry.source || null,
+        };
+      }).filter(Boolean);
+    } else {
+      state.listened = (data.listened || []).filter(s => s.id < songs.length);
+    }
+
+    state.sessionLabel = data.sessionLabel || '';
+    state.playingFavorites = data.playingFavorites || false;
+    state.playingAlbum = data.playingAlbum || false;
+    state.playingPlaylist = data.playingPlaylist || false;
+    state.currentPlaylistId = data.currentPlaylistId || null;
+
+    if (data.albumTrackFilenames) {
+      state.currentAlbumTracks = data.albumTrackFilenames.map(fn => _filenameToId(fn)).filter(id => id != null);
+    } else {
+      state.currentAlbumTracks = (data.currentAlbumTracks || []).filter(id => id < songs.length);
+    }
+    if (data.timelineFilenames) {
+      state.timelineItems = data.timelineFilenames.map(item => {
+        const id = _filenameToId(item.filename);
+        return id != null ? { id, similarity: item.similarity, manual: !!item.manual } : null;
+      }).filter(Boolean);
+      state.timelineIndex = Math.min(data.timelineIndex ?? -1, state.timelineItems.length - 1);
+      state.timelineMode = data.timelineMode || null;
+      if (data.explicitPlayedFilenames) {
+        _pcbs.setExplicitPlayedIds(data.explicitPlayedFilenames.map(fn => _filenameToId(fn)).filter(id => id != null));
+      } else {
+        _pcbs.setExplicitPlayedIds([]);
+      }
+    } else {
+      _pcbs.clearTimelineContext();
+    }
+    if (data.recToggle !== undefined) _setRecToggle(data.recToggle);
+    setLastLoggedPlaybackStartInstanceId(Math.max(0, Math.round(Number(data.loggedPlaybackStartInstanceId) || 0)));
+    setLastLoggedPlaybackStartSongId(data.loggedPlaybackStartFilename
+      ? _filenameToId(data.loggedPlaybackStartFilename)
+      : null);
+    if (state.playingPlaylist && !_getPlaylistById(state.currentPlaylistId)) {
+      state.playingPlaylist = false;
+      state.currentPlaylistId = null;
+    }
+    if (state.timelineMode !== 'explicit') {
+      _pcbs.setExplicitPlayedIds([]);
+      state.timelineMode = null;
+      _pcbs.syncDynamicTimelineFromState();
+    } else if (state.timelineIndex < 0 && state.current != null) {
+      state.timelineIndex = state.timelineItems.findIndex(item => item.id === state.current);
+    }
+
+    const s = songs[state.current];
+    const isFav = favorites.has(s.id);
+    console.log('[FAV] restorePlaybackState: song', s.id, s.filename, 'isFavorite =', isFav, 'favorites set:', [...favorites]);
+    return {
+      id: s.id,
+      title: s.title,
+      artist: s.artist,
+      album: s.album,
+      filename: s.filename,
+      filePath: s.filePath,
+      artPath: s.artPath,
+      hasEmbedding: s.hasEmbedding,
+      isFavorite: isFav,
+      currentTime: data.currentTime || 0,
+      duration: data.duration || 0,
+    };
+  } catch (e) {
+    console.error('[FAV] restorePlaybackState error:', e);
+    return null;
+  }
+}
+
+export async function resetEngine() {
+  _activity('app', 'engine_reset', 'Engine reset requested', {}, { important: true, tags: ['reset'] });
+  state.current = null;
+  state.currentSource = null;
+  state.history = [];
+  state.historyPos = -1;
+  state.queue = [];
+  state.listened = [];
+  state.sessionLabel = '';
+  state.playingFavorites = false;
+  state.playingAlbum = false;
+  state.playingPlaylist = false;
+  state.currentPlaylistId = null;
+  state.currentAlbumTracks = [];
+  _pcbs.clearTimelineContext();
+  _setRecToggle(true);
+  _setQueueShuffleEnabled(false);
+  setCurrentPlaybackInstanceId(0);
+  setCapturedPlaybackInstanceId(null);
+  setLastLoggedPlaybackStartInstanceId(0);
+  setLastLoggedPlaybackStartSongId(null);
+  if (_recommendationRebuildTimer) {
+    clearTimeout(_recommendationRebuildTimer);
+    setRecommendationRebuildTimer(null);
+  }
+  setRecommendationRebuildInFlight(false);
+  setRecommendationRebuildPending(false);
+  setRecommendationRebuildReason(null);
+  setRecommendationRebuildOpts({ refreshQueue: false, refreshDiscover: false });
+
+  // Clear saved state and logs
+  await Preferences.remove({ key: 'playback_state' });
+  await Preferences.remove({ key: 'favorites' });
+  await Preferences.remove({ key: 'profile_summary_v2' });
+  await Preferences.remove({ key: 'profile_summary_v1' });
+  await Preferences.remove({ key: 'profile_reset_markers_v1' });
+  await Preferences.remove({ key: 'negative_scores' });
+  await Preferences.remove({ key: SIMILARITY_BOOST_KEY });
+  await Preferences.remove({ key: 'disliked_songs' });
+  await Preferences.remove({ key: TASTE_REVIEW_IGNORE_KEY });
+  await Preferences.remove({ key: PENDING_LISTEN_KEY });
+  setFavorites(new Set());
+  setNegativeScores({});
+  setSimilarityBoostScores({});
+  setDislikedFilenames(new Set());
+  setTasteReviewIgnores({});
+  setLastTasteReviewSnapshot('');
+  setRecentPlaybackSignalEvents([]);
+
+  // Clear session logs
+  try {
+    const { value } = await Preferences.get({ key: 'session_logs_index' });
+    if (value) {
+      const index = JSON.parse(value);
+      for (const key of index) {
+        await Preferences.remove({ key });
+      }
+      await Preferences.remove({ key: 'session_logs_index' });
+    }
+  } catch (e) { /* ignore */ }
+
+  setProfileVec(null);
+  setRecommendationPolicySnapshot({
+    rowsById: new Map(),
+    hardExcludeSongIds: new Set(),
+    fingerprint: '',
+    version: 0,
+    updatedAt: 0,
+  });
+  setLog(new SessionLogger());
+}
+
+export async function clearPlaybackSession() {
+  state.current = null;
+  state.currentSource = null;
+  state.queue = [];
+  state.sessionLabel = '';
+  state.playingFavorites = false;
+  state.playingAlbum = false;
+  state.playingPlaylist = false;
+  state.currentPlaylistId = null;
+  state.currentAlbumTracks = [];
+  _pcbs.clearTimelineContext();
+  setCurrentPlaybackInstanceId(0);
+  setCapturedPlaybackInstanceId(null);
+  setLastLoggedPlaybackStartInstanceId(0);
+  setLastLoggedPlaybackStartSongId(null);
+  await Preferences.remove({ key: 'playback_state' });
+}
+
+export function shutdown() {
+  if (log) log.shutdown();
+  savePlaybackState();
+  flushActivityLog().catch(() => {});
+}
+
+export function getNativeQueueSnapshot() {
+  const items = [];
+  let startIndex = 0;
+  if (state.timelineIndex >= 0 && Array.isArray(state.timelineItems) && state.timelineItems.length > 0) {
+    for (let i = 0; i < state.timelineItems.length; i++) {
+      const entry = state.timelineItems[i];
+      const s = songs[entry.id];
+      if (!s || !s.filePath) continue;
+      items.push({
+        songId: s.id,
+        filePath: s.filePath,
+        title: s.title || 'Unknown',
+        artist: s.artist || '',
+        album: s.album || '',
+      });
+      if (i === state.timelineIndex) startIndex = items.length - 1;
+    }
+    if (items.length > 0) {
+      return { items, startIndex };
+    }
+  }
+
+  if (state.current != null && songs[state.current]) {
+    const s = songs[state.current];
+    items.push({
+      songId: s.id,
+      filePath: s.filePath || '',
+      title: s.title || 'Unknown',
+      artist: s.artist || '',
+      album: s.album || '',
+    });
+  }
+  for (const q of state.queue) {
+    const s = songs[q.id];
+    if (s && s.filePath) {
+      items.push({
+        songId: s.id,
+        filePath: s.filePath,
+        title: s.title || 'Unknown',
+        artist: s.artist || '',
+        album: s.album || '',
+      });
+    }
+  }
+  return { items, startIndex: 0 };
+}
+
+export function getNativeQueueItems() {
+  return getNativeQueueSnapshot().items;
+}
+
+export function getUpcomingNativeItems() {
+  const items = [];
+  for (const q of state.queue) {
+    const s = songs[q.id];
+    if (s && s.filePath) {
+      items.push({
+        songId: s.id,
+        filePath: s.filePath,
+        title: s.title || 'Unknown',
+        artist: s.artist || '',
+        album: s.album || '',
+      });
+    }
+  }
+  return items;
+}
+
+export function syncCurrentFromNativeState(data, opts = {}) {
+  const songId = _resolveSongIdFromNativePayload(data);
+  if (songId == null || !songs[songId]) return null;
+  state.current = songId;
+  if (opts.currentSource) state.currentSource = opts.currentSource;
+  if (state.history.length === 0 || state.history[state.history.length - 1] !== songId) {
+    state.history.push(songId);
+  }
+  state.historyPos = state.history.length - 1;
+  _pcbs.syncDynamicTimelineFromState();
+  if (opts.ensurePlaybackStart === true) {
+    _ensurePlaybackStartLogged(songId, state.currentSource || 'native_restore', null, null, {
+      playbackInstanceId: opts.playbackInstanceId,
+    });
+  }
+  return _pcbs.currentSongInfo();
+}
+
+export function syncQueueFromNativeSnapshot(queueState, opts = {}) {
+  const items = Array.isArray(queueState && queueState.items) ? queueState.items : [];
+  if (items.length === 0) return null;
+
+  const rawIndex = queueState && Number.isInteger(queueState.currentIndex) ? queueState.currentIndex : 0;
+  const currentIndex = Math.max(0, Math.min(rawIndex, items.length - 1));
+  const currentId = _resolveSongIdFromNativePayload(items[currentIndex]);
+  if (currentId == null || !songs[currentId]) return null;
+
+  if (opts.appendHistory === true) {
+    if (state.historyPos < state.history.length - 1) {
+      state.history = state.history.slice(0, state.historyPos + 1);
+    }
+    if (state.history.length === 0 || state.history[state.history.length - 1] !== currentId) {
+      state.history.push(currentId);
+    }
+    state.historyPos = state.history.length - 1;
+  }
+
+  state.current = currentId;
+  if (opts.currentSource) state.currentSource = opts.currentSource;
+
+  const resolvedTimeline = [];
+  let resolvedCurrentIndex = -1;
+  for (let i = 0; i < items.length; i++) {
+    const sid = _resolveSongIdFromNativePayload(items[i]);
+    if (sid == null || !songs[sid] || !songs[sid].filePath) continue;
+    resolvedTimeline.push({ id: sid, similarity: 1.0, manual: false });
+    if (i === currentIndex) resolvedCurrentIndex = resolvedTimeline.length - 1;
+  }
+  if (resolvedCurrentIndex >= 0) {
+    state.timelineItems = resolvedTimeline;
+    state.timelineIndex = resolvedCurrentIndex;
+    if (state.timelineMode !== 'explicit') state.timelineMode = 'dynamic';
+  }
+
+  const upcoming = [];
+  for (let i = currentIndex + 1; i < items.length; i++) {
+    const sid = _resolveSongIdFromNativePayload(items[i]);
+    if (sid == null || !songs[sid] || !songs[sid].filePath) continue;
+    upcoming.push({ id: sid, similarity: 1.0 });
+  }
+  state.queue = upcoming;
+  if (opts.ensurePlaybackStart === true) {
+    _ensurePlaybackStartLogged(currentId, state.currentSource || 'native_restore', null, null, {
+      playbackInstanceId: opts.playbackInstanceId,
+    });
+  }
+  return _pcbs.currentSongInfo();
+}
+
+export function onNativeAdvance(data, nativeQueueState = null) {
+  const prevFraction = (data.prevFraction != null && data.prevFraction >= 0) ? data.prevFraction : null;
+  const action = data.action || '';
+
+  _pcbs.markExplicitCurrentPlayed();
+  const shouldRecordListen = !(action === 'neutral_skip' && (prevFraction == null || prevFraction <= NEUTRAL_SKIP_CAPTURE_THRESHOLD));
+  if (shouldRecordListen) _pcbs.recordListen(prevFraction, { transitionAction: action });
+
+  const songId = _resolveSongIdFromNativePayload(data);
+  if (songId == null || !songs[songId]) return null;
+
+  _activity('native', 'native_queue_advanced', `Native advanced queue via ${data.action || 'unknown'} to "${songs[songId].title}"`, {
+    action: data.action || null,
+    prevFraction,
+    ..._songRef(songId),
+    nativeSongId: data.songId,
+    nativeFilePath: data.filePath || null,
+  }, { important: true, tags: ['native', 'queue'] });
+
+  if (action === 'user_prev') {
+    let targetHistoryPos = -1;
+    for (let i = Math.max(0, state.historyPos - 1); i >= 0; i--) {
+      if (state.history[i] === songId) {
+        targetHistoryPos = i;
+        break;
+      }
+    }
+    if (targetHistoryPos >= 0) {
+      state.historyPos = targetHistoryPos;
+    } else {
+      if (state.historyPos < state.history.length - 1) {
+        state.history = state.history.slice(0, state.historyPos + 1);
+      }
+      if (state.history.length === 0 || state.history[state.history.length - 1] !== songId) {
+        state.history.push(songId);
+      }
+      state.historyPos = state.history.length - 1;
+    }
+  } else {
+    if (state.historyPos < state.history.length - 1) {
+      state.history = state.history.slice(0, state.historyPos + 1);
+    }
+    if (state.history.length === 0 || state.history[state.history.length - 1] !== songId) {
+      state.history.push(songId);
+    }
+    state.historyPos = state.history.length - 1;
+  }
+  state.current = songId;
+  state.currentSource = 'native_' + (data.action || 'advance');
+
+  if (nativeQueueState && Array.isArray(nativeQueueState.items) && nativeQueueState.items.length > 0) {
+    syncQueueFromNativeSnapshot(nativeQueueState, { appendHistory: false, currentSource: state.currentSource });
+  } else if (action.startsWith('auto_') || action === 'user_next' || action === 'neutral_skip') {
+    const idx = state.queue.findIndex(q => q.id === songId);
+    if (idx !== -1) {
+      state.queue.splice(0, idx + 1);
+    } else if (state.queue.length > 0 && state.queue[0].id !== songId) {
+      state.queue.shift();
+    }
+    if (state.timelineMode !== 'explicit') {
+      _pcbs.syncDynamicTimelineFromState();
+    }
+  }
+  _pcbs.beginPlaybackInstance();
+
+  _ensurePlaybackStartLogged(songId, state.currentSource, null, prevFraction, {
+    playbackInstanceId: Number(data && data.currentPlaybackInstanceId) || 0,
+  });
+
+  // Decide whether to extend the queue with fresh AI recommendations.
+  //
+  // Two triggers:
+  //   (a) Dynamic mode + queue running low (existing behavior).
+  //   (b) Explicit section / ordered-list mode AND we just advanced to the
+  //       LAST item of the timeline. Without this, sections silently end
+  //       (with loop=off) or loop forever (with loop=all default — which
+  //       prevents the queueEnded path entirely on the native side). Albums,
+  //       favorites, and playlists are excluded — those genuinely "end" by
+  //       design and the user expects them to stop / loop themselves.
+  const isContextThatEnds = state.playingAlbum || state.playingFavorites || state.playingPlaylist;
+  const queueLow = state.queue.length < 5;
+  const explicitAtLast = state.timelineMode === 'explicit'
+      && Array.isArray(state.timelineItems)
+      && state.timelineItems.length > 0
+      && songId === state.timelineItems[state.timelineItems.length - 1].id;
+  const needsRefresh = recToggle
+      && !isContextThatEnds
+      && (
+          (state.timelineMode !== 'explicit' && queueLow)
+          || explicitAtLast
+      );
+  if (needsRefresh) {
+    _pcbs.cleanQueue();
+    _pcbs.doRefresh(explicitAtLast ? 'section_ending' : 'queue_low');
+  }
+
+  return { songInfo: _pcbs.currentSongInfo(), needsSync: needsRefresh };
+}

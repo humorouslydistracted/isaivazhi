@@ -108,7 +108,43 @@ export async function recoverPendingToStable() {
   return true;
 }
 
+// Fix G: fetch a local file via the WebView's `file://` URL through
+// `Capacitor.convertFileSrc`. This bypasses the JSI bridge entirely — the
+// WebView reads the file directly, with no base64 round-trip. ~30-40× faster
+// than `MusicBridge.readBinaryFile` for multi-MB files.
+//
+// Falls back to null on any failure (no Capacitor, fetch reject, non-OK
+// response). Caller falls back to the bridge path.
+async function _fetchLocalArrayBuffer(path) {
+  try {
+    if (typeof window === 'undefined') return null;
+    const conv = window.Capacitor && window.Capacitor.convertFileSrc;
+    if (typeof conv !== 'function') return null;
+    const url = conv('file://' + path);
+    const resp = await fetch(url);
+    if (!resp || !resp.ok) return null;
+    return await resp.arrayBuffer();
+  } catch (e) {
+    return null;
+  }
+}
+
+async function _fetchLocalText(path) {
+  try {
+    if (typeof window === 'undefined') return null;
+    const conv = window.Capacitor && window.Capacitor.convertFileSrc;
+    if (typeof conv !== 'function') return null;
+    const url = conv('file://' + path);
+    const resp = await fetch(url);
+    if (!resp || !resp.ok) return null;
+    return await resp.text();
+  } catch (e) {
+    return null;
+  }
+}
+
 async function _loadBinaryStore() {
+  const t0 = performance.now();
   try {
     const [binInfo, metaInfo] = await Promise.all([
       MusicBridge.getFileModified({ path: _path(STABLE_BIN) }),
@@ -116,24 +152,56 @@ async function _loadBinaryStore() {
     ]);
     if (!binInfo.exists || !metaInfo.exists) return null;
 
-    const metaResult = await MusicBridge.readTextFile({ path: _path(STABLE_META) });
-    if (!metaResult.exists || !metaResult.content) return null;
-    const meta = JSON.parse(metaResult.content);
+    // ---- Meta read (Fix G: prefer fetch over the bridge) ----
+    const tMeta = performance.now();
+    let metaText = await _fetchLocalText(_path(STABLE_META));
+    let metaSource = 'fetch';
+    if (metaText == null) {
+      metaSource = 'bridge';
+      const metaResult = await MusicBridge.readTextFile({ path: _path(STABLE_META) });
+      if (!metaResult.exists || !metaResult.content) return null;
+      metaText = metaResult.content;
+    }
+    const meta = JSON.parse(metaText);
+    console.log(`[PERF] readBinaryStore meta ${metaSource} read+parse: ${Math.round(performance.now() - tMeta)} ms`);
 
-    const binResult = await MusicBridge.readBinaryFile({ path: _path(STABLE_BIN) });
-    if (!binResult.exists || !binResult.data) return null;
-
-    const raw = Uint8Array.from(atob(binResult.data), c => c.charCodeAt(0));
-    const floats = new Float32Array(raw.buffer);
     const dim = meta.dim;
     if (!dim || !Array.isArray(meta.entries)) return null;
+
+    // ---- Binary read (Fix G: prefer fetch + arrayBuffer over the bridge) ----
+    const tBin = performance.now();
+    let floats = null;
+    const fetchedBuffer = await _fetchLocalArrayBuffer(_path(STABLE_BIN));
+    if (fetchedBuffer && fetchedBuffer.byteLength > 0 && fetchedBuffer.byteLength % 4 === 0) {
+      // Direct typed-array view on the fetched buffer — no base64 step at all.
+      floats = new Float32Array(fetchedBuffer);
+      console.log(`[PERF] readBinaryStore bin fetch: ${fetchedBuffer.byteLength} bytes in ${Math.round(performance.now() - tBin)} ms`);
+    } else {
+      // Fallback to the original bridge + base64 path.
+      const binResult = await MusicBridge.readBinaryFile({ path: _path(STABLE_BIN) });
+      if (!binResult.exists || !binResult.data) return null;
+      console.log(`[PERF] readBinaryStore bin bridge read: ${Math.round(performance.now() - tBin)} ms (b64 chars=${binResult.data.length})`);
+
+      const tDec = performance.now();
+      const binaryStr = atob(binResult.data);
+      const rawLen = binaryStr.length;
+      const raw = new Uint8Array(rawLen);
+      for (let i = 0; i < rawLen; i++) raw[i] = binaryStr.charCodeAt(i);
+      console.log(`[PERF] readBinaryStore base64 decode: ${rawLen} bytes in ${Math.round(performance.now() - tDec)} ms`);
+      floats = new Float32Array(raw.buffer);
+    }
 
     const result = { _path_index: meta.pathIndex || {} };
     for (let i = 0; i < meta.entries.length; i++) {
       const entry = meta.entries[i];
       const off = i * dim;
+      // floats.slice() returns a Float32Array that owns its own buffer
+      // (parent ArrayBuffer can be GC'd). Keeping the Float32Array end-to-end
+      // avoids the previous `Array.from(...)` plain-Array allocation here and
+      // the corresponding `new Float32Array(arr)` reconversion in
+      // _mergeLocalEmbeddings — saves 2 full copies of every vector at startup.
       result[entry.key] = {
-        embedding: Array.from(floats.subarray(off, off + dim)),
+        embedding: floats.slice(off, off + dim),
         filepath: entry.filepath || '',
         content_hash: entry.contentHash || '',
         contentHash: entry.contentHash || '',
@@ -144,6 +212,7 @@ async function _loadBinaryStore() {
       };
     }
     console.log(`Loaded ${meta.entries.length} embeddings from stable binary store`);
+    console.log(`[PERF] _loadBinaryStore total: ${meta.entries.length} entries dim=${dim} in ${Math.round(performance.now() - t0)} ms`);
     return result;
   } catch (e) {
     console.log('Stable binary read failed:', e.message);
@@ -158,7 +227,7 @@ async function _writeBinaryStore(embObj) {
 
   for (const [key, data] of Object.entries(normalized)) {
     if (key === '_path_index') continue;
-    if (!data.embedding || !Array.isArray(data.embedding)) continue;
+    if (!_isValidEmbedding(data.embedding)) continue;
     if (dim === 0) dim = data.embedding.length;
     entries.push({
       key,
@@ -208,10 +277,23 @@ async function _writeBinaryStore(embObj) {
 
 async function _writeLegacyJson(embObj) {
   const normalized = _normalizeEmbeddingObject(embObj);
+  // Convert Float32Array entries to plain arrays for JSON. JSON.stringify on a
+  // Float32Array yields {"0":x,"1":y,...} (an object, not an array), which
+  // would silently corrupt the legacy mirror once binary-loaded vectors
+  // (Float32Array after fix C) flow through saveToDisk.
+  const jsonSafe = { _path_index: normalized._path_index || {} };
+  for (const [key, data] of Object.entries(normalized)) {
+    if (key === '_path_index') continue;
+    const emb = data.embedding;
+    jsonSafe[key] = {
+      ...data,
+      embedding: ArrayBuffer.isView(emb) ? Array.from(emb) : emb,
+    };
+  }
   const tmpJson = _path(`${LEGACY_JSON}.tmp`);
   await MusicBridge.writeTextFile({
     path: tmpJson,
-    content: JSON.stringify(normalized),
+    content: JSON.stringify(jsonSafe),
   });
   await _replaceFile(tmpJson, _path(LEGACY_JSON));
   console.log(`Wrote local_embeddings.json mirror: ${_countEmbeddings(normalized)} entries`);
@@ -231,11 +313,24 @@ async function _readEmbeddingsJson(filename) {
   }
 }
 
+// Embeddings can flow through this module as either plain JS Arrays (from JSON
+// stores like pending_embeddings.json) or Float32Array (from the binary store
+// loader after fix C). Treat both as valid — anything indexable with a length
+// > 0 is acceptable. The array-like guard avoids both the legacy
+// `Array.isArray()` rejection of typed arrays and the older `length === 0`
+// false-positive on plain non-array objects.
+function _isValidEmbedding(emb) {
+  return emb != null
+    && typeof emb.length === 'number'
+    && emb.length > 0
+    && (Array.isArray(emb) || ArrayBuffer.isView(emb));
+}
+
 function _normalizeEmbeddingObject(embObj) {
   const normalized = { _path_index: embObj && embObj._path_index ? embObj._path_index : {} };
   for (const [key, data] of Object.entries(embObj || {})) {
     if (key === '_path_index') continue;
-    if (!data || !Array.isArray(data.embedding) || data.embedding.length === 0) continue;
+    if (!data || !_isValidEmbedding(data.embedding)) continue;
 
     const contentHash = data.contentHash || data.content_hash || key;
     normalized[contentHash] = {

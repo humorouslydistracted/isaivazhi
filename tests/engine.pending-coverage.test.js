@@ -508,6 +508,13 @@ describe('Discover cache fingerprint invalidation', () => {
 describe('external file deletion reconciliation', () => {
   it('markSongMissingByPath removes the song from playable list and playlists, preserves orphan embedding state', async () => {
     const engine = await loadFreshEngine();
+    // Simulate alpha having an active embedding so its file going missing
+    // qualifies it for the orphan bucket. Songs without embeddings have
+    // nothing to orphan and don't surface in the AI page's orphan section
+    // (this is the corrected behavior — previously deleted songs without
+    // embeddings would incorrectly appear there).
+    engine.getSongs()[0].hasEmbedding = true;
+
     // Seed a playlist and favorite so we can verify cleanup.
     await engine.createPlaylist('Mix');
     const pl = engine.getPlaylists()[0];

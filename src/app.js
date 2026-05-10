@@ -24,19 +24,340 @@ import { App } from '@capacitor/app';
 import * as engine from './engine.js';
 import { MusicBridge } from './music-bridge.js';
 import { initActivityLog, logActivity } from './activity-log.js';
+import { createStatusUi } from './app-status-ui.js';
+import { createBrowseRenderSupport } from './app-browse-render.js';
+import { createPlaylistUi } from './app-playlists-ui.js';
+import { createArtSupport } from './app-art.js';
+import { createBackNavigationSupport } from './app-back-navigation.js';
+import { createSongMenuSupport } from './app-song-menu.js';
+import { createTasteUiSupport } from './app-taste-ui.js';
+import { createAiPageSupport } from './app-ai-page.js';
+import { createDiscoverUiSupport } from './app-discover-ui.js';
+import { createPlayerUiSupport } from './app-player-ui.js';
+import { createSettingsSupport } from './app-settings.js';
 
-// On-screen debug logger — writes to #debugLogText + console
+const _statusUi = createStatusUi();
+const showStatusToast = _statusUi.showStatusToast;
+const hideStatusToast = _statusUi.hideStatusToast;
+function _handleRecommendationRebuildStatus(state) {
+  return _statusUi.handleRecommendationRebuildStatus(state, {
+    refreshStateUI: () => refreshStateUI(),
+    showTasteWeightsOverlay: () => showTasteWeightsOverlay(),
+  });
+}
+
+const _browseRender = createBrowseRenderSupport({
+  esc: (...a) => esc(...a),
+  getArtUrl: (...a) => getArtUrl(...a),
+  resolveSongForArt: (...a) => _resolveSongForArt(...a),
+  artOnErrorAttr: (...a) => _artOnErrorAttr(...a),
+  getCurrentSongId: () => currentSong,
+  isNativeAudioPlaying: () => nativeAudioPlaying,
+  getSongsMap: () => engine.getSongs(),
+});
+const clearSearch = _browseRender.clearSearch;
+const songThumb = _browseRender.songThumb;
+const renderSongs = _browseRender.renderSongs;
+const renderAlbums = _browseRender.renderAlbums;
+const toggleAlbumUI = _browseRender.toggleAlbumUI;
+
+const _playlistsUi = createPlaylistUi({
+  esc: (...a) => esc(...a),
+  showStatusToast: (...a) => showStatusToast(...a),
+  refreshPlaylistViews: () => refreshPlaylistViews(),
+  openPlaylist: (id) => openPlaylistUI(id),
+  closeViewAll: () => closeViewAll(),
+  getCurrentPlaylistViewId: () => _currentPlaylistViewId,
+});
+const closePlaylistPicker = _playlistsUi.closePlaylistPicker;
+const showPlaylistPicker = _playlistsUi.showPlaylistPicker;
+const createPlaylistFromModal = _playlistsUi.createPlaylistFromModal;
+const addSongToPlaylistUI = _playlistsUi.addSongToPlaylistUI;
+const removeSongFromPlaylistUI = _playlistsUi.removeSongFromPlaylistUI;
+const renamePlaylistUI = _playlistsUi.renamePlaylistUI;
+const deletePlaylistUI = _playlistsUi.deletePlaylistUI;
+
+const _artSupport = createArtSupport({
+  getArtUrl: (song, opts) => getArtUrl(song, opts),
+  musicBridge: MusicBridge,
+  onArtReady: () => _scheduleArtUiRefresh(),
+  resolveSong: (input) => _resolveSongForArt(input),
+});
+const _enqueueSongArt = _artSupport.enqueueSongArt;
+const handleArtErrorUI = _artSupport.handleArtErrorUI;
+const _artOnErrorAttr = _artSupport.artOnErrorAttr;
+
+const _backNav = createBackNavigationSupport({
+  activateTab: (target, opts) => _activateTab(target, opts),
+  getActiveTab: () => activeTab,
+  closeTasteWeights: () => closeTasteWeightsOverlay(),
+  hasDiscoverBackup: () => _hasDiscoverBackup(),
+  closeViewAll: () => closeViewAll(),
+  flushQueuedDiscoverRefresh: () => _flushQueuedDiscoverRefresh(),
+  renderDiscoverSnapshotFromCache: (opts) => renderDiscoverSnapshotFromCache(opts),
+  getActiveMenu: () => _songMenu.getActiveMenu(),
+  closeSongMenu: () => _closeSongMenu(),
+  getFullPlayerOpen: () => fullPlayerOpen,
+  closeFullPlayer: () => closeFullPlayer(),
+  minimizeApp: () => App.minimizeApp(),
+});
+const _switchToDiscover = _backNav.switchToDiscover;
+const _isOnSubPage = _backNav.isOnSubPage;
+const _closeActiveSubPage = _backNav.closeActiveSubPage;
+const _handleBackButton = _backNav.handleBackButton;
+
+const _songMenu = createSongMenuSupport({
+  esc: (...a) => esc(...a),
+  showStatusToast: (...a) => showStatusToast(...a),
+  refreshStateUI: () => refreshStateUI(),
+  refreshBrowseCollectionsUI: () => refreshBrowseCollectionsUI(),
+  refreshPlaylistViews: () => refreshPlaylistViews(),
+  showPlaylistPicker: (...a) => showPlaylistPicker(...a),
+  removeSongFromPlaylistUI: (...a) => removeSongFromPlaylistUI(...a),
+  showEmbeddingDetail: () => showEmbeddingDetail(),
+  syncUpcomingNativeQueue: () => syncUpcomingNativeQueue(),
+  getLastProfile: () => _lastProfile,
+  renderDiscoverTiles: (...a) => renderDiscoverTiles(...a),
+  playOnlyUI: (...a) => playOnlyUI(...a),
+  closeFullPlayer: () => closeFullPlayer(),
+  getFullPlayerOpen: () => fullPlayerOpen,
+  getCurrentPlaylistViewId: () => _currentPlaylistViewId,
+  loadAndPlay: (...a) => loadAndPlay(...a),
+  getListenFraction: () => getListenFraction(),
+  getCurrentSong: () => currentSong,
+  setNativeAudioPlaying: (v) => { nativeAudioPlaying = v; },
+  setNativeFileLoaded: (v) => { nativeFileLoaded = v; },
+  updatePlayIcon: (...a) => updatePlayIcon(...a),
+  pruneSongFromDiscoverCaches: (id) => _pruneSongFromDiscoverCaches(id),
+  rerenderCachedDiscoverViews: () => _rerenderCachedDiscoverViews(),
+  saveVisibleDiscoverCache: () => _saveVisibleDiscoverCache(),
+  getActiveTab: () => activeTab,
+  setActiveTab: (v) => { activeTab = v; },
+  activateTab: (...a) => _activateTab(...a),
+  renderSongs: (...a) => renderSongs(...a),
+  renderAlbums: (...a) => renderAlbums(...a),
+  getAllAlbums: () => allAlbums,
+  getAlbumsDirty: () => _albumsDirty,
+  setAlbumsDirty: (v) => { _albumsDirty = v; },
+});
+const _closeSongMenu = _songMenu.closeSongMenu;
+const showSongMenu = _songMenu.showSongMenu;
+const confirmDeleteSong = _songMenu.confirmDeleteSong;
+const showSongDetailsModal = _songMenu.showSongDetailsModal;
+const viewAlbumForSong = _songMenu.viewAlbumForSong;
+
+const _tasteUi = createTasteUiSupport({
+  esc: (...a) => esc(...a),
+  showStatusToast: (...a) => showStatusToast(...a),
+  songThumb: (...a) => songThumb(...a),
+  getAllSongs: () => allSongs,
+  getActiveTab: () => activeTab,
+  getCurrentSong: () => currentSong,
+  getNativeAudioPlaying: () => nativeAudioPlaying,
+  getFullPlayerOpen: () => fullPlayerOpen,
+  openFullPlayer: () => openFullPlayer(),
+  getListenFraction: () => getListenFraction(),
+  loadAndPlay: (...a) => loadAndPlay(...a),
+  refreshStateUI: () => refreshStateUI(),
+  loadFavorites: () => loadFavorites(),
+  loadPlaylistsUI: () => loadPlaylistsUI(),
+  renderDiscoverTiles: (...a) => renderDiscoverTiles(...a),
+  renderDiscoverSnapshotFromCache: (opts) => renderDiscoverSnapshotFromCache(opts),
+  refreshDiscoverPrimaryState: () => refreshDiscoverPrimaryState(),
+  flushQueuedDiscoverRefresh: () => _flushQueuedDiscoverRefresh(),
+  getLastProfile: () => _lastProfile,
+  activityEntriesToCopyText: (entries) => _activityEntriesToCopyText(entries),
+  copyTextToClipboard: (text, label) => _copyTextToClipboard(text, label),
+  getViewAllMeta: (type) => getViewAllMeta(type),
+  getDiscoverBackup: () => discoverContentBackup,
+  setDiscoverBackup: (v) => { discoverContentBackup = v; },
+  getDiscoverBackupPanelId: () => discoverContentBackupPanelId,
+  setDiscoverBackupPanelId: (v) => { discoverContentBackupPanelId = v; },
+  getViewAllItems: () => _viewAllItems,
+  setViewAllItems: (v) => { _viewAllItems = v; },
+  getCurrentViewAllType: () => _currentViewAllType,
+  setCurrentViewAllType: (v) => { _currentViewAllType = v; },
+  getCurrentPlaylistViewId: () => _currentPlaylistViewId,
+  setCurrentPlaylistViewId: (v) => { _currentPlaylistViewId = v; },
+});
+const _renderActivityLogHtml = _tasteUi.renderActivityLogHtml;
+const showTasteWeightsOverlay = _tasteUi.showTasteWeightsOverlay;
+const closeTasteWeightsOverlay = _tasteUi.closeTasteWeightsOverlay;
+const resetTasteWeightUI = _tasteUi.resetTasteWeightUI;
+const copyTasteLogsUI = _tasteUi.copyTasteLogsUI;
+const copyTastePlaybackSignalsUI = _tasteUi.copyTastePlaybackSignalsUI;
+const playTasteSignalRowUI = _tasteUi.playTasteSignalRowUI;
+const setTasteSignalFilterUI = _tasteUi.setTasteSignalFilterUI;
+const setTasteSignalSortUI = _tasteUi.setTasteSignalSortUI;
+const showMoreTasteSignalUI = _tasteUi.showMoreTasteSignalUI;
+const toggleTasteResetInfoUI = _tasteUi.toggleTasteResetInfoUI;
+const viewAllUI = _tasteUi.viewAllUI;
+const refreshCurrentViewAllUI = _tasteUi.refreshCurrentViewAllUI;
+const refreshBrowseCollectionsUI = _tasteUi.refreshBrowseCollectionsUI;
+const openPlaylistUI = _tasteUi.openPlaylistUI;
+const closeViewAll = _tasteUi.closeViewAll;
+
+const _aiPage = createAiPageSupport({
+  esc: (...a) => esc(...a),
+  showStatusToast: (...a) => showStatusToast(...a),
+  getAllSongs: () => allSongs,
+  getDiscoverBackup: () => discoverContentBackup,
+  setDiscoverBackup: (v) => { discoverContentBackup = v; },
+  getDiscoverBackupPanelId: () => discoverContentBackupPanelId,
+  setDiscoverBackupPanelId: (v) => { discoverContentBackupPanelId = v; },
+  activityEntriesToCopyText: (entries) => _activityEntriesToCopyText(entries),
+  copyTextToClipboard: (text, label) => _copyTextToClipboard(text, label),
+  renderActivityLogHtml: (entries) => _renderActivityLogHtml(entries),
+  getEmbDetailExpanded: () => _embDetailExpanded,
+});
+const showEmbeddingDetail = _aiPage.showEmbeddingDetail;
+const _embToggleSection = _aiPage.embToggleSection;
+const _setEmbLogTab = _aiPage.setEmbLogTab;
+const _setEmbConfirm = _aiPage.setEmbConfirm;
+
+const _settings = createSettingsSupport({
+  showStatusToast: (...a) => showStatusToast(...a),
+});
+const _embScrollToPending = _aiPage.embScrollToPending;
+const _copyEmbLogs = _aiPage.copyEmbLogs;
+
+const _discoverUi = createDiscoverUiSupport({
+  esc: (...a) => esc(...a),
+  showStatusToast: (...a) => showStatusToast(...a),
+  getArtUrl: (s, opts) => getArtUrl(s, opts),
+  artOnErrorAttr: (...a) => _artOnErrorAttr(...a),
+  getLastProfile: () => _lastProfile,
+  setLastProfile: (v) => { _lastProfile = v; },
+  getCachedFavorites: () => _cachedFavorites,
+  setCachedFavorites: (v) => { _cachedFavorites = v; },
+  getCachedRecentlyPlayed: () => _cachedRecentlyPlayed,
+  setCachedRecentlyPlayed: (v) => { _cachedRecentlyPlayed = v; },
+  getCachedForYou: () => _cachedForYou,
+  setCachedForYou: (v) => { _cachedForYou = v; },
+  getCachedSimilar: () => _cachedSimilar,
+  setCachedSimilar: (v) => { _cachedSimilar = v; },
+  getCachedBecauseYouPlayed: () => _cachedBecauseYouPlayed,
+  setCachedBecauseYouPlayed: (v) => { _cachedBecauseYouPlayed = v; },
+  getCachedUnexplored: () => _cachedUnexplored,
+  setCachedUnexplored: (v) => { _cachedUnexplored = v; },
+  getViewAllItems: () => _viewAllItems,
+  setViewAllItems: (v) => { _viewAllItems = v; },
+  getCurrentViewAllType: () => _currentViewAllType,
+  getCurrentPlaylistViewId: () => _currentPlaylistViewId,
+  getActiveTab: () => activeTab,
+  getCurrentSong: () => currentSong,
+  getNativeAudioPlaying: () => nativeAudioPlaying,
+  viewAllUI: (...a) => viewAllUI(...a),
+  isOnSubPage: () => _isOnSubPage(),
+  hasDiscoverBackup: () => _hasDiscoverBackup(),
+});
+const renderSimilar = _discoverUi.renderSimilar;
+const toggleSimilarFreezeUI = _discoverUi.toggleSimilarFreezeUI;
+const toggleSectionUI = _discoverUi.toggleSectionUI;
+const renderProfile = _discoverUi.renderProfile;
+const renderDiscoverTiles = _discoverUi.renderDiscoverTiles;
+const renderBecauseYouPlayed = _discoverUi.renderBecauseYouPlayed;
+const renderCachedBecauseYouPlayed = _discoverUi.renderCachedBecauseYouPlayed;
+const _renderBecauseYouPlayedSections = _discoverUi.renderBecauseYouPlayedSections;
+const renderCachedUnexplored = _discoverUi.renderCachedUnexplored;
+const renderDiscoverSnapshotFromCache = _discoverUi.renderDiscoverSnapshotFromCache;
+const refreshDiscoverPrimaryState = _discoverUi.refreshDiscoverPrimaryState;
+const refreshVisibleDiscoverCardState = _discoverUi.refreshVisibleDiscoverCardState;
+const renderUnexploredClusters = _discoverUi.renderUnexploredClusters;
+const _saveVisibleDiscoverCache = _discoverUi.saveVisibleDiscoverCache;
+const _saveVisibleDiscoverCacheDebounced = _discoverUi.saveVisibleDiscoverCacheDebounced;
+const _pruneSongFromDiscoverCaches = _discoverUi.pruneSongFromDiscoverCaches;
+const _rerenderCachedDiscoverViews = _discoverUi.rerenderCachedDiscoverViews;
+
+const _playerUi = createPlayerUiSupport({
+  getCurrentSong: () => currentSong,
+  getCurrentIsFav: () => currentIsFav,
+  setCurrentIsFav: (v) => { currentIsFav = v; },
+  getNativeAudioPlaying: () => nativeAudioPlaying,
+  getNativeFileLoaded: () => nativeFileLoaded,
+  getNativeAudioDur: () => nativeAudioDur,
+  getNativeAudioPos: () => nativeAudioPos,
+  setNativeAudioPos: (v) => { nativeAudioPos = v; },
+  getShuffleOn: () => shuffleOn,
+  setShuffleOn: (v) => { shuffleOn = v; },
+  getLoopMode: () => loopMode,
+  setLoopMode: (v) => { loopMode = v; },
+  getFullPlayerOpen: () => fullPlayerOpen,
+  setFullPlayerOpen: (v) => { fullPlayerOpen = v; },
+  getActiveTab: () => activeTab,
+  getRecsShouldFocusCurrent: () => _recsShouldFocusCurrent,
+  getInitRestoreComplete: () => _initRestoreComplete,
+  getQuickRestoreInfo: () => _quickRestoreInfo,
+  setPendingStartupResume: (v) => { _pendingStartupResume = v; },
+  getCachedForYou: () => _cachedForYou,
+  getCachedSimilar: () => _cachedSimilar,
+  getCachedFavorites: () => _cachedFavorites,
+  getCachedBecauseYouPlayed: () => _cachedBecauseYouPlayed,
+  getCachedUnexplored: () => _cachedUnexplored,
+  getViewAllItems: () => _viewAllItems,
+  getCurrentViewAllType: () => _currentViewAllType,
+  esc: (...a) => esc(...a),
+  showStatusToast: (...a) => showStatusToast(...a),
+  loadAndPlay: (...a) => loadAndPlay(...a),
+  refreshStateUI: (...a) => refreshStateUI(...a),
+  getListenFraction: () => getListenFraction(),
+  persistPlaybackState: (...a) => persistPlaybackState(...a),
+  songThumb: (...a) => songThumb(...a),
+  dbg: (...a) => _dbg(...a),
+  notePlaybackIntent: () => _notePlaybackIntent(),
+  shouldBlockRapidNav: (...a) => _shouldBlockRapidNav(...a),
+  scheduleRecsFocusCurrent: () => _scheduleRecsFocusCurrent(),
+  resolveSongForArt: (...a) => _resolveSongForArt(...a),
+  enqueueSongArt: (...a) => _enqueueSongArt(...a),
+  activateTab: (...a) => _activateTab(...a),
+  syncUpcomingNativeQueue: () => syncUpcomingNativeQueue(),
+  updateModeIndicator: () => updateModeIndicator(),
+  updateHeartIcon: (...a) => updateHeartIcon(...a),
+  getViewAllMeta: (...a) => getViewAllMeta(...a),
+});
+const playFromFavoritesUI = _playerUi.playFromFavoritesUI;
+const playFromPlaylistUI = _playerUi.playFromPlaylistUI;
+const updateProgressUI = _playerUi.updateProgressUI;
+const updatePlayIcon = _playerUi.updatePlayIcon;
+const toggleShuffleUI = _playerUi.toggleShuffleUI;
+const toggleLoopUI = _playerUi.toggleLoopUI;
+const goToQueueUI = _playerUi.goToQueueUI;
+const toggleRecUI = _playerUi.toggleRecUI;
+const renderRecs = _playerUi.renderRecs;
+const renderHistory = _playerUi.renderHistory;
+const playSongUI = _playerUi.playSongUI;
+const playFromQueueUI = _playerUi.playFromQueueUI;
+const playTimelineIndexUI = _playerUi.playTimelineIndexUI;
+const playFromAlbumUI = _playerUi.playFromAlbumUI;
+const playFromSectionUI = _playerUi.playFromSectionUI;
+const playOnlyUI = _playerUi.playOnlyUI;
+const togglePauseUI = _playerUi.togglePauseUI;
+const nextUI = _playerUi.nextUI;
+const prevUI = _playerUi.prevUI;
+const seekUI = _playerUi.seekUI;
+const setupSeekDrag = _playerUi.setupSeekDrag;
+const getArtUrl = _playerUi.getArtUrl;
+const openFullPlayer = _playerUi.openFullPlayer;
+const closeFullPlayer = _playerUi.closeFullPlayer;
+const syncFullPlayer = _playerUi.syncFullPlayer;
+const updateFullPlayerProgress = _playerUi.updateFullPlayerProgress;
+const setupFullPlayerGestures = _playerUi.setupFullPlayerGestures;
+const formatTime = _playerUi.formatTime;
+
+// On-screen debug logger — writes to #debugLogText if it exists + console.
+// The DBG panel was removed from index.html, so the textContent path below
+// is a no-op now; kept so internal _dbg() calls throughout the codebase
+// continue to write [DBG]-prefixed lines to native console without any extra
+// changes. Re-uncomment the panel in index.html to bring on-screen logs back.
 function _dbg(msg) {
-  const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
-  const line = ts + ' ' + msg;
   console.log('[DBG] ' + msg);
   try {
     const el = document.getElementById('debugLogText');
-    if (el) {
-      el.textContent += line + '\n';
-      const panel = document.getElementById('debugLogPanel');
-      if (panel) panel.scrollTop = panel.scrollHeight;
-    }
+    if (!el) return;
+    const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
+    el.textContent += ts + ' ' + msg + '\n';
+    const panel = document.getElementById('debugLogPanel');
+    if (panel) panel.scrollTop = panel.scrollHeight;
   } catch (e) { /* ignore */ }
 }
 
@@ -51,11 +372,6 @@ let loopMode = 'all';
 let nextSongInfo = null;
 let _recsShouldFocusCurrent = false;
 let _artUiRefreshTimer = null;
-const _artRequestQueue = [];
-const _artRequestState = new Map();
-let _artRequestActive = 0;
-const ART_REQUEST_CONCURRENCY = 4;
-
 // Native audio state — updated by audioTimeUpdate events from native service
 let nativeAudioPos = 0;   // seconds
 let nativeAudioDur = 0;   // seconds
@@ -72,6 +388,20 @@ let _pendingStartupResume = false; // play was tapped before authoritative resto
 let _aiHydrationState = 'cold'; // cold -> playback_ready -> ai_hydrating -> ai_ready
 let _scanCompleted = false;
 let _embeddingsReadyEvent = false;
+let discoverContentBackup = null;
+let discoverContentBackupPanelId = null;
+let _lastProfile = null;
+let _cachedRecentlyPlayed = [];
+let _cachedBecauseYouPlayed = [];
+let _cachedForYou = [];
+let _cachedSimilar = [];
+let _cachedFavorites = [];
+let _cachedPlaylists = [];
+let _cachedUnexplored = [];
+let _viewAllItems = [];
+let _currentViewAllType = null;
+let _currentPlaylistViewId = null;
+let fullPlayerOpen = false;
 let _aiReadyCommitted = false;
 let _lastPlaybackIntentAt = 0;
 let _lastPlaybackPersistAt = 0;
@@ -310,7 +640,22 @@ async function _refreshNativePlaybackInstanceId() {
 function _focusCurrentRecsRow() {
   const currentRow = document.querySelector('#recs-list .song-item.playing');
   if (!currentRow) return;
-  currentRow.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+  // 2026-05-10 follow-up #16: do NOT use `scrollIntoView` here. With the
+  // scroll-snap panel-strip above us, `inline: 'nearest'` walked up through
+  // ancestors and scrolled the .panel-strip horizontally if the recs panel
+  // wasn't yet 100% in view (mid-snap arrival from a swipe). That second
+  // horizontal scroll raced the browser's natural snap and produced the
+  // "flick" the user reported on album→recs and browse→recs swipes.
+  // Manual scrollTop on the .recs-list-wrap touches only the vertical scroll,
+  // never the strip's horizontal scroll.
+  const wrap = document.getElementById('recs-list-wrap');
+  if (!wrap) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  const rowRect = currentRow.getBoundingClientRect();
+  // Position the row at the vertical centre of the wrap.
+  const rowOffsetWithinWrap = (rowRect.top - wrapRect.top) + wrap.scrollTop;
+  const targetTop = rowOffsetWithinWrap - (wrap.clientHeight - currentRow.offsetHeight) / 2;
+  wrap.scrollTop = Math.max(0, targetTop);
 }
 
 function _scheduleRecsFocusCurrent() {
@@ -335,6 +680,14 @@ function _resolveSongForArt(input) {
   return input;
 }
 
+// 2026-05-10 follow-up #12: universal search moved to a top-bar overlay,
+// so the Songs/Albums tabs always show the full library. These helpers used
+// to read the in-tab search query; now they pass straight through. Kept as
+// thin wrappers because many places call them — clearer than rewriting all
+// the call sites and harmless if anything else later wants to filter.
+function _filteredSongs() { return allSongs; }
+function _filteredAlbums() { return allAlbums; }
+
 function _scheduleArtUiRefresh() {
   if (_artUiRefreshTimer) return;
   _artUiRefreshTimer = setTimeout(() => {
@@ -344,11 +697,11 @@ function _scheduleArtUiRefresh() {
     _songsDirty = true;
     _albumsDirty = true;
     if (activeTab === 'songs') {
-      renderSongs(allSongs);
+      renderSongs(_filteredSongs());
       _songsDirty = false;
     }
     if (activeTab === 'albums') {
-      renderAlbums(allAlbums);
+      renderAlbums(_filteredAlbums());
       _albumsDirty = false;
     }
     if (activeTab === 'recs') {
@@ -374,100 +727,6 @@ function _scheduleArtUiRefresh() {
     }
     syncFullPlayer();
   }, 120);
-}
-
-function _pumpArtRequestQueue() {
-  while (_artRequestActive < ART_REQUEST_CONCURRENCY && _artRequestQueue.length > 0) {
-    const nextSongId = _artRequestQueue.shift();
-    const entry = _artRequestState.get(nextSongId);
-    const nextSong = _resolveSongForArt(nextSongId);
-    if (!entry || !nextSong || !nextSong.filePath) {
-      if (entry && entry.resolve) entry.resolve(false);
-      continue;
-    }
-    if (entry.status !== 'queued') continue;
-    entry.status = 'pending';
-    _artRequestActive++;
-    MusicBridge.getAlbumArtUri({ path: nextSong.filePath }).then((res) => {
-      if (res && res.exists && res.uri) {
-        nextSong.artPath = res.uri;
-        entry.status = 'ready';
-        entry.resolve(true);
-        _scheduleArtUiRefresh();
-      } else {
-        nextSong.artPath = null;
-        entry.status = 'missing';
-        entry.resolve(false);
-      }
-    }).catch(() => {
-      nextSong.artPath = null;
-      entry.status = 'missing';
-      entry.resolve(false);
-    }).finally(() => {
-      _artRequestActive = Math.max(0, _artRequestActive - 1);
-      _pumpArtRequestQueue();
-    });
-  }
-}
-
-function _enqueueSongArt(songInput, opts = {}) {
-  const song = _resolveSongForArt(songInput);
-  if (!song || song.id == null || !song.filePath) return Promise.resolve(false);
-  if (song.artPath) return Promise.resolve(true);
-
-  const existing = _artRequestState.get(song.id);
-  const retry = opts.retry === true;
-  if (existing) {
-    if (existing.status === 'pending' || existing.status === 'queued') return existing.promise;
-    if (!retry && (existing.status === 'ready' || existing.status === 'missing')) return existing.promise;
-  }
-
-  let resolvePromise = null;
-  const promise = new Promise(resolve => { resolvePromise = resolve; });
-  _artRequestState.set(song.id, { status: 'queued', promise, resolve: resolvePromise });
-  if (opts.priority) _artRequestQueue.unshift(song.id);
-  else _artRequestQueue.push(song.id);
-  _pumpArtRequestQueue();
-  return promise;
-}
-
-function _applyArtFallback(imgEl, fallbackText, fallbackClass) {
-  if (!imgEl) return;
-  const parent = imgEl.parentElement;
-  if (!parent) return;
-  if (fallbackClass) parent.classList.add(fallbackClass);
-  imgEl.remove();
-  if (!parent.querySelector('.art-fallback-text')) {
-    const span = document.createElement('span');
-    span.className = 'art-fallback-text';
-    span.textContent = fallbackText || '?';
-    parent.appendChild(span);
-  }
-}
-
-async function handleArtErrorUI(imgEl, songId, fallbackText = '?', fallbackClass = '') {
-  if (!imgEl) return;
-  if (imgEl.dataset.artRecovered === '1') {
-    _applyArtFallback(imgEl, fallbackText, fallbackClass);
-    return;
-  }
-  imgEl.dataset.artRecovered = '1';
-  const song = _resolveSongForArt(songId);
-  if (song) song.artPath = null;
-  const recovered = await _enqueueSongArt(songId, { retry: true, priority: true });
-  const recoveredSong = _resolveSongForArt(songId);
-  if (recovered && recoveredSong && recoveredSong.artPath) {
-    const recoveredUrl = getArtUrl(recoveredSong, { prime: false });
-    if (recoveredUrl) {
-      imgEl.src = recoveredUrl;
-      return;
-    }
-  }
-  _applyArtFallback(imgEl, fallbackText, fallbackClass);
-}
-
-function _artOnErrorAttr(songId, fallbackText, fallbackClass) {
-  return `onerror='window._app.handleArtError(this, ${songId}, ${JSON.stringify(fallbackText || '?')}, ${JSON.stringify(fallbackClass || '')})'`;
 }
 
 function persistPlaybackState(force = false) {
@@ -499,7 +758,22 @@ function _setAiHydrationState(next) {
 function _scheduleBackgroundHydration() {
   const start = () => {
     const recentPlaybackIntentAge = _lastPlaybackIntentAt > 0 ? (Date.now() - _lastPlaybackIntentAt) : Infinity;
+    // Fix H: the 4s playback-intent deferral was sized for the old world where
+    // the post-deferral work was 5+ seconds (binary read + merge + recommender +
+    // profile build) and could fight the audio decoder. After Fix G the binary
+    // read happens during loadData (preloadEmbeddingsEarly) and finishes in
+    // <500ms. By the time playback intent fires, the heavy work is already
+    // done — `startBackgroundScan` then just runs ~50ms of merge + Recommender
+    // + GPU-attach work, which can't meaningfully interfere with audio. So
+    // when the early load has resolved, we skip the long deferral and use a
+    // short ~120ms grace window just to let the audio thread settle.
+    const earlyDone = typeof engine.isEarlyEmbeddingLoaded === 'function' && engine.isEarlyEmbeddingLoaded();
     if (_pendingStartupResume || recentPlaybackIntentAge < PLAY_INTENT_AI_DEFER_MS) {
+      if (earlyDone && !_pendingStartupResume) {
+        _dbg('init: playback intent active but early embeddings already loaded — using short 120ms grace');
+        setTimeout(start_now, 120);
+        return;
+      }
       const remaining = _pendingStartupResume
         ? 350
         : Math.max(350, PLAY_INTENT_AI_DEFER_MS - recentPlaybackIntentAge);
@@ -507,6 +781,9 @@ function _scheduleBackgroundHydration() {
       setTimeout(start, remaining);
       return;
     }
+    start_now();
+  };
+  const start_now = () => {
     _setAiHydrationState('ai_hydrating');
     engine.startBackgroundScan();
     _dbg('init: background scan started');
@@ -589,83 +866,17 @@ function _repairDiscoverCacheOnReady() {
 
 // ===== INIT =====
 
-let _toastTimer = null;
-function showStatusToast(text, duration) {
-  const el = document.getElementById('statusToast');
-  if (!el) return;
-  el.textContent = text;
-  el.style.display = 'block';
-  el.classList.remove('hidden');
-  if (_toastTimer) clearTimeout(_toastTimer);
-  if (duration) {
-    _toastTimer = setTimeout(() => {
-      el.classList.add('hidden');
-      setTimeout(() => { el.style.display = 'none'; }, 300);
-    }, duration);
-  }
-}
-function hideStatusToast() {
-  const el = document.getElementById('statusToast');
-  if (!el) return;
-  el.classList.add('hidden');
-  setTimeout(() => { el.style.display = 'none'; }, 300);
-}
-
-let _recommendationStatusTimer = null;
-function _setRecommendationStatus(text, show) {
-  const el = document.getElementById('recommendationStatus');
-  if (!el) return;
-  if (!show || !text) {
-    el.classList.remove('is-visible');
-    el.textContent = '';
-    return;
-  }
-  el.textContent = text;
-  el.classList.add('is-visible');
-}
-
-function _formatRecommendationReason(reason) {
-  switch (reason) {
-    case 'favorite_toggle': return 'Updating recommendations after favorite...';
-    case 'dislike_toggle': return 'Updating recommendations after dislike...';
-    case 'playback_skip': return 'Updating recommendations after skip...';
-    case 'playback_complete': return 'Updating recommendations after listen...';
-    case 'queue_remove': return 'Updating recommendations after X...';
-    case 'tuning_changed': return 'Applying recommendation tuning...';
-    case 'reset_song_recommendation_history': return 'Refreshing recommendations after reset...';
-    default: return 'Updating recommendations...';
-  }
-}
-
-function _handleRecommendationRebuildStatus(state) {
-  if (!state || !state.phase) return;
-  if (state.phase === 'queued' || state.phase === 'running') {
-    if (_recommendationStatusTimer) clearTimeout(_recommendationStatusTimer);
-    const text = _formatRecommendationReason(state.reason);
-    _recommendationStatusTimer = setTimeout(() => {
-      _setRecommendationStatus(text, true);
-    }, 320);
-    return;
-  }
-
-  if (_recommendationStatusTimer) {
-    clearTimeout(_recommendationStatusTimer);
-    _recommendationStatusTimer = null;
-  }
-  _setRecommendationStatus('', false);
-
-  if (state.phase === 'completed') {
-    refreshStateUI();
-    if (document.querySelector('#panel-discover .taste-weights-page')) {
-      showTasteWeightsOverlay();
-    }
-  }
-}
-
 async function init() {
   try {
     await initActivityLog();
     logActivity({ category: 'app', type: 'app_opened', message: 'App opened', tags: ['startup'], important: true });
+    // Fix D: kick off the embedding-binary load against the cached data dir
+    // BEFORE loadData() runs. This overlaps the slow ~500-1500ms binary read
+    // with loadData()'s Preferences + library reads. The promise is consumed
+    // later by startBackgroundScan(); a fresh load is started instead if the
+    // resolved data dir doesn't match the cached one.
+    // No await — fire and continue. Failures are silent and harmless.
+    engine.preloadEmbeddingsEarly();
     // Show mini player IMMEDIATELY from cached display info (before loadData)
     const quickDisplay = await engine.getLastPlayedDisplay();
     if (quickDisplay) {
@@ -716,8 +927,17 @@ async function init() {
     _dbg('init: loadData done ' + Math.round(performance.now() - _t0) + 'ms, songs=' + engine.getPlayableSongs().length);
     allSongs = engine.getPlayableSongs();
     allAlbums = engine.getAlbums();
-    _songsDirty = true;
-    _albumsDirty = true;
+    // 2026-05-10 follow-up #11: pre-render Songs + Albums lists immediately so
+    // a horizontal swipe to those panels doesn't trigger a 100-300ms lazy
+    // render mid-gesture (the dominant cause of swipe hiccups now that
+    // scroll-snap takes the gesture itself out of the JS critical path).
+    // Done synchronously here while the user is still looking at the
+    // Discover panel — the cost gets folded into the existing post-load
+    // pause, so it's invisible.
+    renderSongs(allSongs);
+    renderAlbums(allAlbums);
+    _songsDirty = false;
+    _albumsDirty = false;
     loadPlaylistsUI();
     if (!discoverCache) hideStatusToast();
     setupNativeAudioEvents();
@@ -860,8 +1080,8 @@ async function init() {
       _songsDirty = true;
       _albumsDirty = true;
       // If user is currently on songs/albums tab, render now
-      if (activeTab === 'songs') renderSongs(allSongs);
-      if (activeTab === 'albums') renderAlbums(allAlbums);
+      if (activeTab === 'songs') renderSongs(_filteredSongs());
+      if (activeTab === 'albums') renderAlbums(_filteredAlbums());
       // If the initial restore could not resolve currentFilename because the song
       // library was not yet complete, retry now that the scan has populated it.
       if (currentSong == null && _miniPlayerFromQuickDisplay) {
@@ -913,9 +1133,17 @@ async function init() {
       allAlbums = engine.getAlbums();
       _songsDirty = true;
       _albumsDirty = true;
-      if (activeTab === 'songs') renderSongs(allSongs);
-      if (activeTab === 'albums') renderAlbums(allAlbums);
+      if (activeTab === 'songs') renderSongs(_filteredSongs());
+      if (activeTab === 'albums') renderAlbums(_filteredAlbums());
       refreshStateUI();
+      // If the AI embedding detail page is currently visible, re-render it now
+      // instead of waiting for the 2-second polling tick. Without this, a song
+      // the user just deleted from the Songs tab would linger in the AI page's
+      // orphan/pending counts for up to two seconds.
+      const discoverPanel = document.getElementById('panel-discover');
+      if (discoverPanel && discoverPanel.querySelector('.emb-detail-page')) {
+        try { showEmbeddingDetail(); } catch (e) { /* ignore */ }
+      }
     });
 
     // Embeddings ready is the AI hydration completion signal. Commit the heavy
@@ -932,8 +1160,8 @@ async function init() {
       allAlbums = engine.getAlbums();
       _songsDirty = true;
       _albumsDirty = true;
-      if (activeTab === 'songs') { renderSongs(allSongs); _songsDirty = false; }
-      if (activeTab === 'albums') { renderAlbums(allAlbums); _albumsDirty = false; }
+      if (activeTab === 'songs') { renderSongs(_filteredSongs()); _songsDirty = false; }
+      if (activeTab === 'albums') { renderAlbums(_filteredAlbums()); _albumsDirty = false; }
       syncFullPlayer();
       _scheduleArtUiRefresh();
     });
@@ -1148,39 +1376,6 @@ function refreshPlaylistViews() {
   }
 }
 
-async function playFromFavoritesUI(id) {
-  const frac = getListenFraction();
-  const info = engine.playFromFavorites(id, frac);
-  if (info) {
-    await loadAndPlay(info);
-    currentIsFav = info.isFavorite || false;
-    updateHeartIcon(currentIsFav);
-    refreshStateUI();
-  }
-}
-
-async function playFromPlaylistUI(id, playlistId) {
-  if (id === currentSong && nativeAudioPlaying) {
-    if (!fullPlayerOpen) openFullPlayer();
-    return;
-  }
-  const frac = getListenFraction();
-  const song = engine.getSongs()[id];
-  const meta = engine.getPlaylistMeta(playlistId);
-  logActivity({
-    category: 'ui',
-    type: 'playlist_song_tapped',
-    message: `Tapped "${song ? song.title : id}" from playlist "${meta ? meta.name : playlistId}"`,
-    data: { songId: id, playlistId, playlistName: meta ? meta.name : '', prevFraction: frac, title: song ? song.title : '', filename: song ? song.filename : '' },
-    tags: ['playlist', 'playback'],
-    important: true,
-  });
-  const info = engine.playFromPlaylist(playlistId, id, frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
 
 // ===== DISCOVER TAB =====
 
@@ -1300,147 +1495,6 @@ const _embDetailExpanded = {
   pendingRemoved: false,
   pendingReembed: false,
 };
-let _embLogTab = 'common';
-let _embDetailScrollTargetId = null;
-let _tastePlaybackExpanded = false;
-let _tasteEngineExpanded = false;
-let _tasteLogsExpanded = false;
-let _tastePlaybackVisibleCount = 10;
-const TASTE_PLAYBACK_PAGE_SIZE = 10;
-const TASTE_PLAYBACK_MAX = 30;
-let _tuningInfoActiveKey = null;
-let _tuningInfoTimer = null;
-let _tasteResetInfoVisible = false;
-const TUNING_INFO_AUTO_HIDE_MS = 3000;
-
-function _hideTuningInfoPopup() {
-  if (_tuningInfoActiveKey) {
-    const prev = document.getElementById('tuningHint-' + _tuningInfoActiveKey);
-    if (prev) prev.style.display = 'none';
-  }
-  if (_tuningInfoTimer) { clearTimeout(_tuningInfoTimer); _tuningInfoTimer = null; }
-  _tuningInfoActiveKey = null;
-}
-function _toggleTuningInfoPopup(key) {
-  const msg = (window._tuningHints && window._tuningHints[key]) || '';
-  if (!msg) return;
-  const wasSame = _tuningInfoActiveKey === key;
-  _hideTuningInfoPopup();
-  if (wasSame) return;
-  const el = document.getElementById('tuningHint-' + key);
-  if (!el) return;
-  el.style.display = 'block';
-  _tuningInfoActiveKey = key;
-  _tuningInfoTimer = setTimeout(_hideTuningInfoPopup, TUNING_INFO_AUTO_HIDE_MS);
-}
-
-function toggleTasteResetInfoUI() {
-  _tasteResetInfoVisible = !_tasteResetInfoVisible;
-  const el = document.getElementById('tasteResetHelp');
-  if (el) el.style.display = _tasteResetInfoVisible ? 'block' : 'none';
-}
-
-function _formatTasteScoreSnapshot(snapshot) {
-  if (!snapshot || snapshot.score == null) return '-';
-  const score = Number(snapshot.score) || 0;
-  const direction = snapshot.direction || (score > 0 ? 'positive' : (score < 0 ? 'negative' : 'neutral'));
-  return `${direction} ${score > 0 ? '+' : ''}${score.toFixed(2)}`;
-}
-
-function _formatSignedNumber(n, digits = 2) {
-  const v = Number(n) || 0;
-  return `${v > 0 ? '+' : ''}${v.toFixed(digits)}`;
-}
-
-function _formatDirectPlayLine(before, after) {
-  const beforeDirect = before && before.directScore != null ? Number(before.directScore) || 0 : 0;
-  const afterDirect = after && after.directScore != null ? Number(after.directScore) || 0 : 0;
-  const delta = afterDirect - beforeDirect;
-  return `${_formatSignedNumber(beforeDirect)} \u2192 ${_formatSignedNumber(afterDirect)} (\u0394 ${_formatSignedNumber(delta)})`;
-}
-
-function _formatSimilarityDeltaLine(after) {
-  const afterBoost = after && after.similarityBoost != null ? Number(after.similarityBoost) || 0 : 0;
-  return _formatSignedNumber(afterBoost);
-}
-
-function _formatTotalScoreLine(before, after) {
-  const beforeScore = before && before.score != null ? Number(before.score) || 0 : 0;
-  const afterScore = after && after.score != null ? Number(after.score) || 0 : 0;
-  return `${_formatSignedNumber(beforeScore)} \u2192 ${_formatSignedNumber(afterScore)}`;
-}
-
-function _formatReasonCodes(codes) {
-  return Array.isArray(codes) && codes.length > 0
-    ? codes.map(code => String(code).replace(/_/g, ' ')).join(', ')
-    : '';
-}
-
-function _formatActivityMeta(entry) {
-  const d = entry && entry.data ? entry.data : {};
-  const parts = [];
-  if (entry.type === 'profile_summary_updated') {
-    if (d.eventType) parts.push(`type ${d.eventType}`);
-    if (d.plays != null) parts.push(`starts ${d.plays}`);
-    if (d.skips != null) parts.push(`skips ${d.skips}`);
-    if (d.completions != null) parts.push(`completions ${d.completions}`);
-    if (d.fracsCount != null) parts.push(`fractions ${d.fracsCount}`);
-    parts.push(d.avgFrac != null ? `avg ${Math.round(d.avgFrac * 100)}%` : 'avg -');
-    if (d.lastFraction != null) parts.push(`last ${Math.round(d.lastFraction * 100)}%`);
-  } else if (entry.type === 'profile_summary_rebuilt') {
-    if (d.songCount != null) parts.push(`songs ${d.songCount}`);
-    if (d.totalPlays != null) parts.push(`starts ${d.totalPlays}`);
-    if (d.totalSkips != null) parts.push(`skips ${d.totalSkips}`);
-    if (d.noFractionCount != null) parts.push(`no-frac ${d.noFractionCount}`);
-  } else if (entry.type === 'session_weight_changed') {
-    if (d.after && d.after.plays != null) parts.push(`positive ${d.after.plays}`);
-    if (d.after && d.after.skips != null) parts.push(`skips ${d.after.skips}`);
-    if (d.after && d.after.encounters != null) parts.push(`encounters ${d.after.encounters}`);
-    if (d.afterFrac != null) parts.push(`session ${Math.round(d.afterFrac * 100)}%`);
-  } else if (entry.type === 'profile_weight_changed') {
-    if (d.positiveAfter != null) parts.push(`+ ${d.positiveAfter}`);
-    if (d.negativeAfter != null) parts.push(`- ${d.negativeAfter}`);
-  } else if (entry.type === 'playback_signal_applied') {
-    parts.push(`taste ${_formatTasteScoreSnapshot(d.tasteBefore)} -> ${_formatTasteScoreSnapshot(d.tasteAfter)}`);
-    if (d.summaryAfter && d.summaryAfter.avgFrac != null) parts.push(`avg ${Math.round(d.summaryAfter.avgFrac * 100)}%`);
-    if (d.summaryAfter && d.summaryAfter.fracsCount != null) parts.push(`fractions ${d.summaryAfter.fracsCount}`);
-  } else if (entry.type === 'suspicious_review_snapshot_updated') {
-    if (d.total != null) parts.push(`total ${d.total}`);
-    if (d.positive != null) parts.push(`+ ${d.positive}`);
-    if (d.negative != null) parts.push(`- ${d.negative}`);
-    if (d.uncertain != null) parts.push(`? ${d.uncertain}`);
-    if (d.suppressed != null) parts.push(`ignored ${d.suppressed}`);
-    if (d.reasons && typeof d.reasons === 'object') {
-      const reasonText = Object.entries(d.reasons).map(([key, count]) => `${key}:${count}`).join(', ');
-      if (reasonText) parts.push(reasonText);
-    }
-  } else if (entry.type === 'suspicious_review_ignored') {
-    if (d.reasonCodes) parts.push(`reasons ${_formatReasonCodes(d.reasonCodes)}`);
-    if (d.tasteScore != null) parts.push(`kept ${Number(d.tasteScore) > 0 ? '+' : ''}${Number(d.tasteScore).toFixed(2)}`);
-  } else if (entry.type === 'recommendation_reset_applied') {
-    if (d.action) parts.push(d.action === 'reset_history_and_x' ? 'reset + x' : 'reset');
-    parts.push(`taste ${_formatTasteScoreSnapshot(d.tasteBefore)} -> ${_formatTasteScoreSnapshot(d.tasteAfter)}`);
-    if (d.xScoreBefore != null || d.xScoreAfter != null) parts.push(`x ${Number(d.xScoreBefore || 0).toFixed(1)} -> ${Number(d.xScoreAfter || 0).toFixed(1)}`);
-    if (d.reasonCodes) parts.push(`reasons ${_formatReasonCodes(d.reasonCodes)}`);
-  } else if (d.fraction != null) {
-    parts.push(`fraction ${Math.round(d.fraction * 100)}%`);
-  }
-  return parts.length > 0 ? parts.join(' | ') : '';
-}
-
-function _renderActivityLogHtml(entries) {
-  return entries.map(entry => {
-    const time = new Date(entry.ts).toLocaleTimeString();
-    const levelClass = entry.level === 'error' ? 'log-error' : entry.level === 'warn' ? 'log-progress' : entry.important ? 'log-success' : 'log-info';
-    const badge = `<span class="emb-log-tag">${esc(entry.category)}</span>`;
-    const context = entry.data && (entry.data.title || entry.data.filename || entry.data.nativeFilePath || entry.data.filePath)
-      ? ` &mdash; ${esc(String(entry.data.title || entry.data.filename || entry.data.nativeFilePath || entry.data.filePath))}`
-      : '';
-    const meta = _formatActivityMeta(entry);
-    const metaHtml = meta ? `<div class="emb-log-meta">${esc(meta)}</div>` : '';
-    return `<div class="emb-log-entry ${levelClass}"><span class="emb-log-time">${time}</span>${badge} ${esc(entry.message)}${context}${metaHtml}</div>`;
-  }).join('');
-}
 
 function _activityEntriesToCopyText(entries) {
   return entries.map(e => {
@@ -1449,54 +1503,6 @@ function _activityEntriesToCopyText(entries) {
   }).join('\n');
 }
 
-function _playbackTimelineEntriesToCopyText(entries) {
-  return (entries || []).map((evt, idx) => {
-    const when = evt && evt.timestamp ? new Date(evt.timestamp).toLocaleString() : '-';
-    const sourceLabel = evt && evt.source ? String(evt.source).replace(/_/g, ' ') : '-';
-    const fractionText = evt && evt.fraction != null ? `${Math.round(evt.fraction * 100)}%` : '-';
-    const beforePull = evt && evt.sessionBefore && evt.sessionBefore.weight != null ? `${Math.round(evt.sessionBefore.weight * 100)}%` : '-';
-    const afterPull = evt && evt.sessionAfter && evt.sessionAfter.weight != null ? `${Math.round(evt.sessionAfter.weight * 100)}%` : '-';
-    const beforeSessionEncounters = evt && evt.sessionBefore && evt.sessionBefore.encounters != null ? evt.sessionBefore.encounters : 0;
-    const afterSessionEncounters = evt && evt.sessionAfter && evt.sessionAfter.encounters != null ? evt.sessionAfter.encounters : 0;
-    const beforeSessionSkips = evt && evt.sessionBefore && evt.sessionBefore.skips != null ? evt.sessionBefore.skips : 0;
-    const afterSessionSkips = evt && evt.sessionAfter && evt.sessionAfter.skips != null ? evt.sessionAfter.skips : 0;
-    const beforeSessionPositive = evt && evt.sessionBefore && evt.sessionBefore.plays != null ? evt.sessionBefore.plays : 0;
-    const afterSessionPositive = evt && evt.sessionAfter && evt.sessionAfter.plays != null ? evt.sessionAfter.plays : 0;
-    const beforeAvg = evt && evt.summaryBefore && evt.summaryBefore.avgFrac != null ? `${Math.round(evt.summaryBefore.avgFrac * 100)}%` : '-';
-    const afterAvg = evt && evt.summaryAfter && evt.summaryAfter.avgFrac != null ? `${Math.round(evt.summaryAfter.avgFrac * 100)}%` : '-';
-    const beforePlays = evt && evt.summaryBefore && evt.summaryBefore.plays != null ? evt.summaryBefore.plays : 0;
-    const afterPlays = evt && evt.summaryAfter && evt.summaryAfter.plays != null ? evt.summaryAfter.plays : 0;
-    const beforeSkips = evt && evt.summaryBefore && evt.summaryBefore.skips != null ? evt.summaryBefore.skips : 0;
-    const afterSkips = evt && evt.summaryAfter && evt.summaryAfter.skips != null ? evt.summaryAfter.skips : 0;
-    const beforeCompletions = evt && evt.summaryBefore && evt.summaryBefore.completions != null ? evt.summaryBefore.completions : 0;
-    const afterCompletions = evt && evt.summaryAfter && evt.summaryAfter.completions != null ? evt.summaryAfter.completions : 0;
-    const beforeFracs = evt && evt.summaryBefore && evt.summaryBefore.fracsCount != null ? evt.summaryBefore.fracsCount : 0;
-    const afterFracs = evt && evt.summaryAfter && evt.summaryAfter.fracsCount != null ? evt.summaryAfter.fracsCount : 0;
-    const beforeNeg = evt && evt.negativeBefore != null ? Number(evt.negativeBefore).toFixed(1) : '0.0';
-    const afterNeg = evt && evt.negativeAfter != null ? Number(evt.negativeAfter).toFixed(1) : '0.0';
-    const beforeTaste = _formatTasteScoreSnapshot(evt && evt.tasteBefore);
-    const afterTaste = _formatTasteScoreSnapshot(evt && evt.tasteAfter);
-    const title = evt && (evt.title || evt.filename) ? (evt.title || evt.filename) : 'Unknown';
-    const artist = evt && evt.artist ? evt.artist : '-';
-    const classification = evt && evt.classification === 'skip' ? 'skip' : 'positive listen';
-    const directPlayLine = _formatDirectPlayLine(evt && evt.tasteBefore, evt && evt.tasteAfter);
-    const similarityDeltaLine = _formatSimilarityDeltaLine(evt && evt.tasteAfter);
-    const totalScoreLine = _formatTotalScoreLine(evt && evt.tasteBefore, evt && evt.tasteAfter);
-    return [
-      `${idx + 1}. ${title} | ${artist}`,
-      `Time: ${when}`,
-      `Classification: ${classification} | Listened: ${fractionText} | Source: ${sourceLabel}`,
-      `Direct play effect: ${directPlayLine}`,
-      `Similarity delta effect: ${similarityDeltaLine}`,
-      `Total score: ${totalScoreLine}`,
-      `Session pull: ${beforePull} -> ${afterPull}`,
-      `Session counts: encounters ${beforeSessionEncounters} -> ${afterSessionEncounters} | skips ${beforeSessionSkips} -> ${afterSessionSkips} | positive ${beforeSessionPositive} -> ${afterSessionPositive}`,
-      `Library avg: ${beforeAvg} -> ${afterAvg}`,
-      `Library counts: starts ${beforePlays} -> ${afterPlays} | skips ${beforeSkips} -> ${afterSkips} | completions ${beforeCompletions} -> ${afterCompletions} | fractions ${beforeFracs} -> ${afterFracs}`,
-      `X-score: ${beforeNeg} -> ${afterNeg}`,
-    ].join('\n');
-  }).join('\n\n');
-}
 
 function _copyTextToClipboard(text, successLabel) {
   navigator.clipboard.writeText(text).then(
@@ -1505,1360 +1511,7 @@ function _copyTextToClipboard(text, successLabel) {
   );
 }
 
-function _getTasteActivityEntries(limit = 160) {
-  const playbackTypes = new Set(['listen_fraction_captured', 'song_classified_skip', 'song_classified_complete']);
-  return engine.getRecentActivityEvents({ limit: 300 })
-    .filter(entry => {
-      if (!entry) return false;
-      if (entry.category === 'taste') return true;
-      if (entry.category === 'playback' && playbackTypes.has(entry.type)) return true;
-      if (entry.category === 'engine' && entry.type === 'profile_rebuilt') return true;
-      return false;
-    })
-    .slice(-limit);
-}
 
-function showEmbeddingDetail() {
-  const st = engine.getEmbeddingStatus();
-  const panel = document.getElementById('panel-discover');
-  const wasDetailOpen = !!panel.querySelector('.emb-detail-page');
-  const embScrollTargetId = _embDetailScrollTargetId;
-  _embDetailScrollTargetId = null;
-  // Only save backup on first open, not on live refreshes
-  if (!wasDetailOpen) {
-    discoverContentBackup = panel.innerHTML;
-    discoverContentBackupPanelId = 'panel-discover';
-    const content = document.querySelector('.content');
-    if (content) content.scrollTop = 0;
-    _embLogTab = 'common';
-  }
-  // Preserve scroll positions across live re-renders only. Fresh opens should
-  // start at the top, but embedding-event updates should not yank the user.
-  const _embScrollEl = document.querySelector('.content') || panel;
-  const _embScrollState = wasDetailOpen ? {
-    page: _embScrollEl ? _embScrollEl.scrollTop : 0,
-    unmatched: document.getElementById('unmatchedSongsList')?.scrollTop || 0,
-    embLog: document.getElementById('embLogContainer')?.scrollTop || 0,
-    activityLog: document.getElementById('activityLogContainer')?.scrollTop || 0,
-  } : null;
-
-  const removedSongs = engine.getRemovedEmbeddingSongs();
-  const removedSet = new Set(removedSongs.map(s => s.id));
-  // Unembedded but NOT manually removed = genuinely pending
-  const pendingNewSongs = allSongs.filter(s => s.filePath && !s.hasEmbedding && !removedSet.has(s.id));
-  const unembeddedSongs = allSongs.filter(s => !s.hasEmbedding);
-  const playableSongs = allSongs.filter(s => s.filePath);
-
-  // Build log HTML (newest first)
-  const logHtml = st.log.slice().reverse().map(entry => {
-    const time = new Date(entry.time).toLocaleTimeString();
-    const levelClass = entry.level === 'error' ? 'log-error' : entry.level === 'success' ? 'log-success' : entry.level === 'progress' ? 'log-progress' : 'log-info';
-    return `<div class="emb-log-entry ${levelClass}"><span class="emb-log-time">${time}</span> ${esc(entry.message)}</div>`;
-  }).join('');
-  const activityRows = engine.getRecentActivityEvents({ limit: 300 }).slice().reverse();
-  const activityHtml = _renderActivityLogHtml(activityRows);
-
-  // Stats
-  const elapsed = st.startTime ? Math.round((Date.now() - st.startTime) / 1000) : 0;
-  const successCount = st.log.filter(e => e.level === 'success').length;
-  const errorCount = st.log.filter(e => e.level === 'error').length;
-
-  // Categorize songs
-  const embeddedSongs = playableSongs.filter(s => s.hasEmbedding);
-  const unmatched = st.unmatchedEmbeddings || [];
-  const totalPending = pendingNewSongs.length + (st.failedCount || 0);
-
-  const disp = (flag) => flag ? 'block' : 'none';
-
-  // Status / stop button (retry button moved into pending section below — ISSUE-12)
-  let statusText = '';
-  if (st.inProgress) {
-    const done = st.log.filter(e => e.level === 'success').length;
-    statusText = `<div class="emb-status-active"><div class="emb-spinner"></div> Embedding in progress: ${done} done, ${st.queueSize} remaining</div>
-      <button class="emb-stop-btn" onclick="window._app.stopEmbedding()">Stop Embedding</button>`;
-  } else if (totalPending === 0 && removedSongs.length === 0) {
-    statusText = `<div class="emb-status-done"><span class="emb-done">&#10003;</span> All songs have AI embeddings</div>`;
-  }
-
-  // Embedded + Total Songs lists removed — tiles are now read-only.
-
-  // Unmatched songs list (collapsible) — ISSUE-14
-  const unmatchedListHtml = unmatched.length > 0
-    ? `<div style="display:${disp(_embDetailExpanded.unmatched)};">
-        <div id="unmatchedSongsList" class="emb-song-list">
-          <div class="emb-song-item" style="color:var(--text3);font-size:11px;line-height:1.4;">
-            "Unmatched" means your imported (e.g. Colab) embeddings reference songs that aren't on this device —
-            they may have been renamed, moved, or never copied over. They take up space but can't be used.
-          </div>
-          ${unmatched.map(u =>
-            `<div class="emb-song-item"><span class="orange-dot-inline"></span> ${esc(u.filename)} <span class="emb-song-artist">— ${esc(u.artist)}${u.filepath ? ' (' + esc(u.filepath) + ')' : ''}</span></div>`
-          ).join('')}
-        </div>
-        <div id="unmatchedConfirm" style="display:${disp(_embDetailExpanded.unmatchedConfirm)};">
-          <div class="emb-confirm-msg">Remove ${unmatched.length} unmatched embeddings? This cannot be undone.</div>
-          <div class="emb-confirm-btns">
-            <button class="emb-confirm-yes" onclick="window._app.confirmRemoveUnmatched()">Yes, Remove</button>
-            <button class="emb-confirm-no" onclick="window._app.setEmbConfirm('unmatchedConfirm', false)">Cancel</button>
-          </div>
-        </div>
-        <button class="emb-orphan-btn" onclick="window._app.setEmbConfirm('unmatchedConfirm', true)">Remove ${unmatched.length} Unmatched Embeddings</button>
-      </div>`
-    : '';
-
-  // Pending section — now a collapsible container. Pending stat tile toggles it.
-  // Inside: three collapsible action rows (Embed New / Embed Removed / Re-embed All).
-  const newCount = pendingNewSongs.length + (st.failedCount || 0);
-  const caret = (open) => open ? '&#9660;' : '&#9654;';
-
-  const pendingNewHtml = `
-    <div class="emb-pending-action">
-      <div class="emb-pending-action-header" onclick="window._app.embToggle('pendingNew')">
-        <span>${caret(_embDetailExpanded.pendingNew)} Embed New Songs (${newCount})</span>
-      </div>
-      <div class="emb-pending-action-body" style="display:${disp(_embDetailExpanded.pendingNew)};">
-        ${pendingNewSongs.length === 0
-          ? '<div class="emb-song-item" style="color:var(--text3);">No new songs pending.</div>'
-          : pendingNewSongs.slice(0, 100).map(s =>
-              `<div class="emb-song-item"><span class="red-dot-inline"></span> ${esc(s.title)} <span class="emb-song-artist">— ${esc(s.artist)}</span></div>`
-            ).join('') + (pendingNewSongs.length > 100 ? `<div class="emb-song-item" style="color:var(--text2);">... and ${pendingNewSongs.length - 100} more</div>` : '')
-        }
-        ${!st.inProgress && newCount > 0 ? `<button class="emb-retry-btn" onclick="window._app.embedNewPending()">Embed ${newCount} New Songs</button>` : ''}
-      </div>
-    </div>`;
-
-  const pendingRemovedHtml = `
-    <div class="emb-pending-action">
-      <div class="emb-pending-action-header" onclick="window._app.embToggle('pendingRemoved')">
-        <span>${caret(_embDetailExpanded.pendingRemoved)} Embed Removed Songs (${removedSongs.length})</span>
-      </div>
-      <div class="emb-pending-action-body" style="display:${disp(_embDetailExpanded.pendingRemoved)};">
-        ${removedSongs.length === 0
-          ? '<div class="emb-song-item" style="color:var(--text3);">No manually-removed songs.</div>'
-          : removedSongs.map(s =>
-              `<div class="emb-song-item"><span class="orange-dot-inline"></span> ${esc(s.title)} <span class="emb-song-artist">— ${esc(s.artist)}</span>
-                <button class="emb-readd-btn" onclick="event.stopPropagation();window._app.readdEmbedding(${s.id})">Re-add</button></div>`
-            ).join('')
-        }
-        ${!st.inProgress && removedSongs.length > 0 ? `<button class="emb-retry-btn" onclick="window._app.embedRemovedPending()">Re-add All ${removedSongs.length} Removed Songs</button>` : ''}
-      </div>
-    </div>`;
-
-  const pendingReembedHtml = `
-    <div class="emb-pending-action">
-      <div class="emb-pending-action-header" onclick="window._app.embToggle('pendingReembed')">
-        <span>${caret(_embDetailExpanded.pendingReembed)} Re-embed All Songs (${playableSongs.length})</span>
-      </div>
-      <div class="emb-pending-action-body" style="display:${disp(_embDetailExpanded.pendingReembed)};">
-        <div class="emb-confirm-msg">Replaces existing embeddings for all ${playableSongs.length} songs. Estimated ~${Math.round(playableSongs.length * 25 / 60)} min. Best run while plugged in.</div>
-        ${!st.inProgress ? `<button class="emb-reembed-btn" onclick="window._app.confirmReembedAll()">Start Re-embedding All</button>` : '<div class="emb-song-item" style="color:var(--text3);">Embedding in progress — wait until current run finishes.</div>'}
-      </div>
-    </div>`;
-
-  const pendingSectionHtml = `
-    <div class="emb-pending-section" id="emb-pending-wrap" style="display:${disp(_embDetailExpanded.pending)};">
-      ${pendingNewHtml}
-      ${pendingRemovedHtml}
-      ${pendingReembedHtml}
-    </div>
-    ${!st.inProgress ? `<button class="emb-retry-btn" style="background:var(--bg3);margin-top:10px;" onclick="window._app.rescanLibrary()">Rescan Library</button>` : ''}`;
-
-  panel.innerHTML = `
-    <div class="viewall-header">
-      <button class="viewall-back" onclick="window._app.closeViewAll()">\u2190</button>
-      <span class="viewall-title">AI Embedding</span>
-    </div>
-    <div class="emb-detail-page">
-      <div class="emb-stats-grid">
-        <div class="emb-stat"><div class="emb-stat-num">${st.totalEmbedded}</div><div class="emb-stat-label">Embedded</div></div>
-        <div class="emb-stat clickable" onclick="window._app.embToggle('pending')"><div class="emb-stat-num">${pendingNewSongs.length + removedSongs.length}</div><div class="emb-stat-label">Pending ${_embDetailExpanded.pending ? '&#9660;' : '&#9654;'}</div></div>
-        <div class="emb-stat"><div class="emb-stat-num">${st.totalSongs}</div><div class="emb-stat-label">Total Songs</div></div>
-        <div class="emb-stat clickable" onclick="window._app.embToggle('unmatched')"><div class="emb-stat-num">${unmatched.length}</div><div class="emb-stat-label">Unmatched</div></div>
-      </div>
-      ${unmatchedListHtml}
-
-      ${statusText}
-
-      ${successCount > 0 || errorCount > 0 ? `
-      <div class="emb-run-stats">
-        Session: ${successCount} succeeded, ${errorCount} errors${elapsed > 0 ? ', ' + elapsed + 's elapsed' : ''}
-      </div>` : ''}
-
-      ${pendingSectionHtml}
-
-      ${st.orphanCount > 0 ? `
-      <div class="emb-section-title">Orphaned Embeddings (${st.orphanCount})</div>
-      <div class="emb-orphan-section">
-        <div class="emb-orphan-desc">These songs were deleted from your device (via file manager, another app, or removed storage). They still have embeddings on-device. Removing them keeps your data clean.</div>
-        <div class="emb-song-list">${engine.getOrphanedSongs().map(s =>
-          `<div class="emb-song-item"><span class="orphan-dot-inline"></span> ${esc(s.title)} <span class="emb-song-artist">— ${esc(s.artist)}</span></div>`
-        ).join('')}</div>
-        <div id="orphanConfirm" style="display:${disp(_embDetailExpanded.orphanConfirm)};">
-          <div class="emb-confirm-msg">Remove ${st.orphanCount} orphaned embeddings? This cannot be undone.</div>
-          <div class="emb-confirm-btns">
-            <button class="emb-confirm-yes" onclick="window._app.confirmRemoveOrphans()">Yes, Remove</button>
-            <button class="emb-confirm-no" onclick="window._app.setEmbConfirm('orphanConfirm', false)">Cancel</button>
-          </div>
-        </div>
-        <button class="emb-orphan-btn" onclick="window._app.setEmbConfirm('orphanConfirm', true)">Remove ${st.orphanCount} Orphaned Embeddings</button>
-      </div>` : ''}
-
-      <div class="emb-section-title">Logs</div>
-      <div class="emb-log-tabs">
-        <button class="emb-log-tab ${_embLogTab === 'common' ? 'active' : ''}" onclick="window._app.setEmbLogTab('common')">Common Logs (${activityRows.length})</button>
-        <button class="emb-log-tab ${_embLogTab === 'embeddings' ? 'active' : ''}" onclick="window._app.setEmbLogTab('embeddings')">Embedding Logs (${st.log.length})</button>
-      </div>
-      <div class="emb-log-panel ${_embLogTab === 'common' ? 'active' : ''}">
-        <div class="emb-log-container" id="activityLogContainer" style="display:${_embLogTab === 'common' ? 'block' : 'none'};">
-          ${activityHtml.length > 0 ? activityHtml : '<div class="emb-log-empty">No common activity recorded yet.</div>'}
-        </div>
-      </div>
-      <div class="emb-log-panel ${_embLogTab === 'embeddings' ? 'active' : ''}">
-        <div class="emb-log-container" id="embLogContainer" style="display:${_embLogTab === 'embeddings' ? 'block' : 'none'};">
-          ${logHtml.length > 0 ? logHtml : '<div class="emb-log-empty">No embedding activity recorded this session.<br>Embedding starts automatically after song scan completes.</div>'}
-        </div>
-      </div>
-      <button class="emb-copy-logs-btn" onclick="window._app.copyEmbLogs()">Copy ${_embLogTab === 'embeddings' ? 'Embedding Logs' : 'Common Logs'}</button>
-    </div>
-  `;
-
-  const focusScrollTarget = () => {
-    if (!embScrollTargetId) return;
-    const target = document.getElementById(embScrollTargetId);
-    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  };
-
-  if (_embScrollState) {
-    requestAnimationFrame(() => {
-      const restoreScroll = () => {
-        if (_embScrollEl) _embScrollEl.scrollTop = _embScrollState.page || 0;
-        const unmatchedEl = document.getElementById('unmatchedSongsList');
-        const embLogEl = document.getElementById('embLogContainer');
-        const activityEl = document.getElementById('activityLogContainer');
-        if (unmatchedEl) unmatchedEl.scrollTop = _embScrollState.unmatched || 0;
-        if (embLogEl) embLogEl.scrollTop = _embScrollState.embLog || 0;
-        if (activityEl) activityEl.scrollTop = _embScrollState.activityLog || 0;
-      };
-      restoreScroll();
-      requestAnimationFrame(() => {
-        restoreScroll();
-        focusScrollTarget();
-      });
-    });
-  } else if (embScrollTargetId) {
-    requestAnimationFrame(focusScrollTarget);
-  }
-}
-
-function _embToggleSection(key) {
-  // Independent toggles now (not exclusive accordion) — needed for nested
-  // pending sub-actions. Re-render the detail page so headers update too.
-  if (key === 'unmatched' && _embDetailExpanded.unmatched) {
-    _embDetailExpanded.unmatchedConfirm = false;
-  }
-  _embDetailExpanded[key] = !_embDetailExpanded[key];
-  showEmbeddingDetail();
-}
-
-function _setEmbLogTab(tab) {
-  _embLogTab = tab === 'embeddings' ? 'embeddings' : 'common';
-  showEmbeddingDetail();
-}
-
-function _setEmbConfirm(key, open) {
-  if (key !== 'unmatchedConfirm' && key !== 'orphanConfirm') return;
-  if (key === 'unmatchedConfirm' && open) {
-    _embDetailExpanded.unmatched = true;
-  }
-  _embDetailExpanded[key] = !!open;
-  _embDetailScrollTargetId = open ? key : null;
-  showEmbeddingDetail();
-}
-
-function _embScrollToPending() {
-  const el = document.querySelector('.emb-pending-section');
-  if (el) el.scrollIntoView({ behavior: 'smooth' });
-}
-
-function _copyEmbLogs() {
-  try {
-    const st = engine.getEmbeddingStatus();
-    const activity = engine.getRecentActivityEvents({ limit: 300 });
-    const embText = st.log.map(e => `[${new Date(e.time).toLocaleTimeString()}] EMB ${e.level.toUpperCase()}: ${e.message}`).join('\n');
-    const actText = _activityEntriesToCopyText(activity);
-    const text = _embLogTab === 'embeddings' ? embText : actText;
-    _copyTextToClipboard(text, `${_embLogTab === 'embeddings' ? 'Embedding' : 'Common'} logs copied`);
-  } catch (e) {
-    showStatusToast('Copy failed', 1500);
-  }
-}
-
-function renderSimilar() {
-  const header = document.getElementById('similar-header');
-  const el = document.getElementById('similar-list');
-  if (!header || !el) return;
-
-  // Freeze wins — keep snapshot cards visible regardless of other state.
-  if (_similarFrozen && _cachedSimilar && _cachedSimilar.length > 0) {
-    header.style.display = 'flex';
-    updateSimilarFreezeBtn();
-    return;
-  }
-
-  // Decide state. Reserve the same slot height across every state so nothing
-  // below (For You / Because You Played / Unexplored) ever shifts when Most
-  // Similar transitions between loading → cards or cards → text.
-  const st = engine.getState ? engine.getState() : {};
-  const currentSong = st.current;
-  const hasCurrent = currentSong != null;
-  const currentSongId = hasCurrent && currentSong && currentSong.id != null ? currentSong.id : null;
-  const currentHasEmbedding = hasCurrent && (
-    (currentSong && currentSong.hasEmbedding === true)
-    || (currentSongId != null && engine.hasEmbedding && engine.hasEmbedding(currentSongId))
-  );
-  const embReady = engine.isEmbeddingsReady && engine.isEmbeddingsReady();
-  const status = engine.getEmbeddingStatus ? engine.getEmbeddingStatus() : null;
-
-  // No current song → hide. No anchor to be similar to.
-  if (!hasCurrent) {
-    header.style.display = 'none';
-    el.innerHTML = '';
-    return;
-  }
-
-  header.style.display = 'flex';
-  updateSimilarFreezeBtn();
-
-  const ins = currentHasEmbedding && embReady ? engine.getInsights() : null;
-  const haveCards = ins && Array.isArray(ins.topSimilar) && ins.topSimilar.length > 0;
-
-  // State 1: cards.
-  if (haveCards) {
-    const newIds = ins.topSimilar.map(s => s.id).join(',');
-    const prevIds = _lastSimilarIds || '';
-    _lastSimilarIds = newIds;
-    _cachedSimilar = ins.topSimilar;
-    // If same set of cards already showing, skip DOM rewrite to avoid flash.
-    if (newIds === prevIds && el.querySelector('.hscroll') && !el.querySelector('.similar-placeholder')) {
-      return;
-    }
-    el.innerHTML = '<div class="hscroll fade-in">' +
-      ins.topSimilar.map(s => {
-        const pct = Math.round(s.similarity * 100);
-        return cardHtml(s, pct + '%', 'discover_similar', 'similar');
-      }).join('') +
-      '</div>';
-    return;
-  }
-
-  // All non-card states share placeholder markup. Reserved height matches
-  // card-row height so nothing below moves.
-  _lastSimilarIds = '';
-  let key = 'loading';
-  let mainText = '';
-  let subText = '';
-  let actionHtml = '';
-
-  if (!embReady) {
-    // State 2: embedding system still warming up (cold start).
-    key = 'loading';
-    mainText = 'Loading similar songs';
-    subText = '';
-  } else if (!currentHasEmbedding) {
-    if (status && status.paused) {
-      // State 3: user paused embedding.
-      key = 'paused';
-      mainText = 'Similar songs not available — embedding is paused';
-      subText = 'Tap to resume in AI page.';
-      actionHtml = ' data-action="open-ai"';
-    } else if (status && (status.inProgress || status.unembedded > 0)) {
-      // State 4: embedding running, current song not yet processed.
-      key = 'waiting';
-      mainText = 'Similar songs will appear once this song is embedded';
-      const remaining = status.unembedded || 0;
-      subText = remaining > 0 ? `${remaining} song${remaining === 1 ? '' : 's'} waiting to embed` : '';
-    } else {
-      // State 5: idle but this specific song has no embedding.
-      key = 'unavailable';
-      mainText = 'Similar songs not available for this song';
-      subText = 'Tap to re-embed in AI page.';
-      actionHtml = ' data-action="open-ai"';
-    }
-  } else {
-    // Has embedding, embReady, but no topSimilar results (rare). Treat as loading.
-    key = 'loading';
-    mainText = 'Loading similar songs';
-    subText = '';
-  }
-
-  const dotsHtml = key === 'loading' || key === 'waiting'
-    ? '<span class="similar-loading-dots"><span></span><span></span><span></span></span>'
-    : '';
-  const onclick = actionHtml
-    ? ' onclick="window._app.showEmbeddingDetail && window._app.showEmbeddingDetail()"'
-    : '';
-
-  el.innerHTML = `
-    <div class="similar-placeholder similar-placeholder-${key}"${onclick}>
-      <div class="similar-placeholder-text">${esc(mainText)}${dotsHtml}</div>
-      ${subText ? `<div class="similar-placeholder-sub">${esc(subText)}</div>` : ''}
-    </div>`;
-}
-
-function updateSimilarFreezeBtn() {
-  const btn = document.getElementById('similarFreezeBtn');
-  if (!btn) return;
-  btn.textContent = _similarFrozen ? 'Unfreeze' : 'Freeze';
-  btn.classList.toggle('similar-freeze-btn-active', _similarFrozen);
-}
-
-function toggleSimilarFreezeUI() {
-  if (_similarFrozen) {
-    _similarFrozen = false;
-    renderSimilar();
-    showStatusToast('Similar unfrozen', 1200);
-  } else {
-    if (!_cachedSimilar || _cachedSimilar.length === 0) {
-      showStatusToast('No similar songs to freeze yet', 1400);
-      return;
-    }
-    _similarFrozen = true;
-    updateSimilarFreezeBtn();
-    showStatusToast('Similar frozen \u2014 song changes won\u2019t update this list', 1800);
-  }
-}
-
-function toggleSectionUI(id) {
-  const content = document.getElementById(id + '-list');
-  const arrow = document.getElementById(id + '-arrow');
-  if (!content) return;
-  const collapsed = content.classList.toggle('collapsed');
-  if (arrow) arrow.textContent = collapsed ? '\u25B6' : '\u25BC'; // ▶ vs ▼
-}
-
-let _lastProfile = null;
-
-function _renderForYouList(forYou, opts = {}) {
-  const forYouEl = document.getElementById('for-you-list');
-  const badgeEl = document.getElementById('foryou-badge');
-  if (!forYouEl) return;
-  const fadeCls = opts.fade === false ? '' : ' fade-in';
-  if (forYou && forYou.length > 0) {
-    _cachedForYou = forYou;
-    if (badgeEl) badgeEl.textContent = forYou.length;
-    forYouEl.innerHTML = `<div class="hscroll${fadeCls}">` +
-      forYou.map(s => cardHtml(s, s.similarity, 'manual_foryou', 'forYou')).join('') +
-      '</div>';
-  } else {
-    _cachedForYou = [];
-    if (badgeEl) badgeEl.textContent = '0';
-    forYouEl.innerHTML = '<div class="empty-hint">Play songs to get personalized picks</div>';
-  }
-}
-
-function renderProfile(profile, opts = {}) {
-  _lastProfile = profile;
-  if (profile.stats && profile.stats.totalSongs > 0) {
-    const s = profile.stats;
-    const aiReady = Math.max(0, (s.totalSongs || 0) - (s.unembeddedCount || 0));
-    const embSt = engine.getEmbeddingStatus();
-    const aiLabel = embSt.inProgress ? 'Embedding' : 'AI';
-    const aiSub = `${aiReady}/${s.totalSongs}`;
-    const btnHtml = `
-      <div class="discover-action-row">
-        <button class="discover-action-btn" onclick="window._app.showEmbeddingDetail()">
-          <div class="dab-main">${aiLabel}</div>
-          <div class="dab-sub">${aiSub}</div>
-        </button>
-        <button class="discover-action-btn" onclick="window._app.showTasteWeights()">
-          <div class="dab-main">Taste Signal</div>
-          <div class="dab-sub">&#x2696; View Positive / Negative</div>
-        </button>
-      </div>`;
-    const profEl = document.getElementById('profile-stats');
-    profEl.innerHTML = btnHtml;
-    profEl.style.display = 'block';
-    profEl.classList.toggle('fade-in', opts.fade !== false);
-  }
-
-  _renderForYouList(profile.forYou, opts);
-
-  renderDiscoverTiles(profile);
-}
-
-function renderDiscoverTiles(profile) {
-  const el = document.getElementById('browse-tiles');
-  if (!el) return;
-
-  const recent = _cachedRecentlyPlayed || [];
-  const mostPlayed = (profile && profile.mostPlayed) || [];
-  const lastAdded = engine.getLastAddedSongs(4) || [];
-  const neverPlayed = (profile && profile.neverPlayed) || [];
-  const favorites = _cachedFavorites || engine.getFavoritesList();
-  const dislikedSongs = engine.getDislikedSongsList();
-
-  const neverCount = profile && profile.stats ? profile.stats.neverPlayedCount : neverPlayed.length;
-
-  const tileHtml = (label, count, items, viewAllKey, emptyMsg) => {
-    const thumbs = items.slice(0, 4).map(s => {
-      const art = getArtUrl(s);
-      if (art) {
-        const letter = (s.title || '?')[0].toUpperCase();
-        const onerr = s && s.id != null ? _artOnErrorAttr(s.id, letter, 'dtile-thumb-letter') : '';
-        return `<div class="dtile-thumb"><img src="${art}" decoding="async" alt="" ${onerr}></div>`;
-      }
-      return `<div class="dtile-thumb dtile-thumb-letter"><span>${esc((s.title||'?')[0].toUpperCase())}</span></div>`;
-    }).join('');
-    const body = items.length > 0
-      ? `<div class="dtile-grid">${thumbs}${items.length < 4 ? '<div class="dtile-thumb dtile-thumb-empty"></div>'.repeat(4 - items.length) : ''}</div>`
-      : `<div class="dtile-empty">${emptyMsg}</div>`;
-    const countStr = count != null ? ` <span class="dtile-count">${count}</span>` : '';
-    return `<div class="dtile" onclick="window._app.viewAll('${viewAllKey}')">
-      <div class="dtile-header"><span class="dtile-title">${label}</span>${countStr}</div>
-      ${body}
-    </div>`;
-  };
-
-  el.innerHTML = `
-    ${tileHtml('Most Played', mostPlayed.length || null, mostPlayed, 'mostPlayed', 'No history yet')}
-    ${tileHtml('Recently Played', recent.length || null, recent, 'recentlyPlayed', 'No history yet')}
-    ${tileHtml('Never Played', neverCount || null, neverPlayed, 'neverPlayed', 'Played everything!')}
-    ${tileHtml('Last Added', lastAdded.length || null, lastAdded, 'lastAdded', 'Nothing new')}
-    ${tileHtml('Favorites', favorites.length || null, favorites, 'favorites', 'No favorites yet')}
-    ${tileHtml('Disliked Songs', dislikedSongs.length || null, dislikedSongs, 'dislikedSongs', 'No disliked songs')}
-  `;
-}
-
-let _cachedRecentlyPlayed = [];
-
-// ===== TASTE WEIGHTS OVERLAY =====
-
-let _tasteSignalFilter = 'active';
-let _tasteSignalSort = 'positive';
-let _tasteSignalVisibleCount = 10;
-let _tasteSignalVisibleRows = [];
-const TASTE_SIGNAL_PAGE_SIZE = 10;
-
-async function showTasteWeightsOverlay() {
-  const panel = document.getElementById('panel-discover');
-  if (!panel) return;
-  if (!panel.querySelector('.taste-weights-page')) {
-    discoverContentBackup = panel.innerHTML;
-    discoverContentBackupPanelId = 'panel-discover';
-    const content = document.querySelector('.content');
-    if (content) content.scrollTop = 0;
-  }
-
-  const includeAllEmbedded = _tasteSignalFilter === 'all';
-  const data = await engine.getTasteSignal(includeAllEmbedded);
-  const summary = data.summary || {};
-  let rows = (data.rows || []).slice();
-  if (_tasteSignalFilter === 'active') rows = rows.filter(r => r.isActive);
-  rows.sort((a, b) => {
-    const primary = _tasteSignalSort === 'positive' ? (b.score - a.score) : (a.score - b.score);
-    if (primary !== 0) return primary;
-    return String(a.title || '').localeCompare(String(b.title || ''));
-  });
-  _tasteSignalVisibleRows = rows;
-  const visibleRows = rows.slice(0, _tasteSignalVisibleCount);
-  const remaining = Math.max(0, rows.length - visibleRows.length);
-
-  const rowHtml = (r, idx) => {
-    const full = engine.getSongs()[r.id];
-    const scoreClass = r.score > 0 ? 'tw-score-pos' : (r.score < 0 ? 'tw-score-neg' : 'tw-score-zero');
-    const scoreText = r.score > 0 ? `+${r.score.toFixed(2)}` : r.score.toFixed(2);
-    const barPct = r.isActive ? Math.max(2, Math.round((r.scoreNorm || 0) * 100)) : 0;
-    const barCls = r.score < 0 ? 'tw-bar-fill tw-bar-neg' : 'tw-bar-fill';
-    const chips = [];
-    if (r.isFavorite) chips.push('<span class="tw-chip tw-chip-fav">Favorite</span>');
-    if (r.isDisliked) chips.push('<span class="tw-chip tw-chip-neg">Disliked</span>');
-    if ((r.positiveWeight || 0) > 0 && (r.negativeWeight || 0) > 0) chips.push('<span class="tw-chip">Mixed</span>');
-    if ((r.xScore || 0) > 0) chips.push(`<span class="tw-chip tw-chip-neg">X ${Number(r.xScore).toFixed(1)}</span>`);
-    if (Math.abs(Number(r.similarityBoost) || 0) > 0.001) {
-      const boost = Number(r.similarityBoost) || 0;
-      chips.push(`<span class="tw-chip ${boost > 0 ? 'tw-chip-pos' : 'tw-chip-neg'}">Similarity ${boost > 0 ? '+' : ''}${boost.toFixed(2)}</span>`);
-    }
-    if (r.isHardRecommendationBlock) chips.push('<span class="tw-chip tw-chip-neg">Rec blocked</span>');
-    if (!r.isActive) chips.push('<span class="tw-chip">Neutral</span>');
-    else if (r.score < 0 && r.plays >= 2 && r.avgFrac != null && r.avgFrac < 0.5) chips.push('<span class="tw-chip tw-chip-neg">Short-listened</span>');
-    else if (r.score > 0 && r.inTopPositive30) chips.push('<span class="tw-chip tw-chip-pos">Top +30</span>');
-    else if (r.score < 0 && r.inTopNegative30) chips.push('<span class="tw-chip tw-chip-neg">Top -30</span>');
-    else if (r.inTop30) chips.push('<span class="tw-chip">Top 30</span>');
-
-    const detailParts = [
-      `${r.plays || 0} start${(r.plays || 0) === 1 ? '' : 's'}`,
-      r.avgFrac != null ? `avg ${Math.round(r.avgFrac * 100)}%` : 'avg -',
-    ];
-    if (r.directScore != null) {
-      const direct = Number(r.directScore) || 0;
-      detailParts.push(`direct ${direct > 0 ? '+' : ''}${direct.toFixed(2)}`);
-    }
-    if (Math.abs(Number(r.similarityBoost) || 0) > 0.001) {
-      const boost = Number(r.similarityBoost) || 0;
-      detailParts.push(`similarity ${boost > 0 ? '+' : ''}${boost.toFixed(2)}`);
-    }
-    if ((r.favoritePrior || 0) > 0) detailParts.push(`fav +${Number(r.favoritePrior).toFixed(2)}`);
-    if ((r.dislikePrior || 0) > 0) detailParts.push(`dislike -${Number(r.dislikePrior).toFixed(2)}`);
-    if (r.daysSince != null) detailParts.push(`${r.daysSince}d ago`);
-    if (r.isHardRecommendationBlock) detailParts.push('hidden from taste recs');
-
-    return `
-      <div class="tw-row ${r.score < 0 ? 'tw-row-neg' : ''}" onclick="window._app.playTasteSignal(${idx})">
-        ${full ? songThumb(full) : `<div class="song-thumb song-thumb-letter">${esc((r.title || '?')[0])}</div>`}
-        <div class="tw-row-main">
-          <div class="tw-row-top">
-            <div class="tw-title">${esc(r.title)}</div>
-            <div class="tw-score ${scoreClass}">${scoreText}</div>
-          </div>
-          <div class="tw-artist">${esc(r.artist || '')}</div>
-          ${chips.length > 0 ? `<div class="tw-chip-row">${chips.join('')}</div>` : ''}
-          ${r.isActive ? `<div class="tw-bar-bg"><div class="${barCls}" style="width:${barPct}%;"></div></div>` : ''}
-          <div class="tw-detail">${detailParts.join(' &middot; ')}</div>
-        </div>
-        <button class="tw-reset-btn" onclick="event.stopPropagation(); window._app.resetTasteWeight(${r.id})">Reset</button>
-      </div>`;
-  };
-
-  const listHtml = rows.length === 0
-    ? '<div class="empty-hint">No songs with active Taste Signal yet. Play more music or switch to All Embedded.</div>'
-    : visibleRows.map((r, idx) => rowHtml(r, idx)).join('') +
-      (remaining > 0 ? `<button class="tw-more-btn" onclick="window._app.tasteSignalMore()">Show ${Math.min(TASTE_SIGNAL_PAGE_SIZE, remaining)} more (${remaining} remaining)</button>` : '');
-
-  const tuning = engine.getTuning();
-  const ins = engine.getInsights();
-  const playbackTimelineFull = await engine.getRecentPlaybackSignalTimeline(TASTE_PLAYBACK_MAX);
-  const playbackVisibleCount = Math.min(_tastePlaybackVisibleCount, playbackTimelineFull.length);
-  const playbackTimeline = playbackTimelineFull.slice(0, playbackVisibleCount);
-  const playbackRemaining = Math.max(0, playbackTimelineFull.length - playbackVisibleCount);
-  const tasteActivityRows = _getTasteActivityEntries(160).slice().reverse();
-  const tPct = (v) => Math.round(v * 100);
-  const playbackTimelineHtml = (!playbackTimelineFull || playbackTimelineFull.length === 0)
-    ? '<div class="empty-hint">No recent playback signal updates yet. After songs are skipped or completed, each change will appear here one by one.</div>'
-    : playbackTimeline.map(evt => {
-      const when = evt.timestamp ? new Date(evt.timestamp).toLocaleString() : '';
-      const sourceLabel = evt.source ? String(evt.source).replace(/_/g, ' ') : '-';
-      const beforePull = evt.sessionBefore && evt.sessionBefore.weight != null ? `${Math.round(evt.sessionBefore.weight * 100)}%` : '-';
-      const afterPull = evt.sessionAfter && evt.sessionAfter.weight != null ? `${Math.round(evt.sessionAfter.weight * 100)}%` : '-';
-      const beforeSessionEncounters = evt.sessionBefore && evt.sessionBefore.encounters != null ? evt.sessionBefore.encounters : 0;
-      const afterSessionEncounters = evt.sessionAfter && evt.sessionAfter.encounters != null ? evt.sessionAfter.encounters : 0;
-      const beforeSessionSkips = evt.sessionBefore && evt.sessionBefore.skips != null ? evt.sessionBefore.skips : 0;
-      const afterSessionSkips = evt.sessionAfter && evt.sessionAfter.skips != null ? evt.sessionAfter.skips : 0;
-      const beforeSessionPositive = evt.sessionBefore && evt.sessionBefore.plays != null ? evt.sessionBefore.plays : 0;
-      const afterSessionPositive = evt.sessionAfter && evt.sessionAfter.plays != null ? evt.sessionAfter.plays : 0;
-      const beforeAvg = evt.summaryBefore && evt.summaryBefore.avgFrac != null ? `${Math.round(evt.summaryBefore.avgFrac * 100)}%` : '-';
-      const afterAvg = evt.summaryAfter && evt.summaryAfter.avgFrac != null ? `${Math.round(evt.summaryAfter.avgFrac * 100)}%` : '-';
-      const beforePlays = evt.summaryBefore && evt.summaryBefore.plays != null ? evt.summaryBefore.plays : 0;
-      const afterPlays = evt.summaryAfter && evt.summaryAfter.plays != null ? evt.summaryAfter.plays : 0;
-      const beforeSkips = evt.summaryBefore && evt.summaryBefore.skips != null ? evt.summaryBefore.skips : 0;
-      const afterSkips = evt.summaryAfter && evt.summaryAfter.skips != null ? evt.summaryAfter.skips : 0;
-      const beforeCompletions = evt.summaryBefore && evt.summaryBefore.completions != null ? evt.summaryBefore.completions : 0;
-      const afterCompletions = evt.summaryAfter && evt.summaryAfter.completions != null ? evt.summaryAfter.completions : 0;
-      const beforeFracs = evt.summaryBefore && evt.summaryBefore.fracsCount != null ? evt.summaryBefore.fracsCount : 0;
-      const afterFracs = evt.summaryAfter && evt.summaryAfter.fracsCount != null ? evt.summaryAfter.fracsCount : 0;
-      const beforeNeg = evt.negativeBefore != null ? Number(evt.negativeBefore).toFixed(1) : '0.0';
-      const afterNeg = evt.negativeAfter != null ? Number(evt.negativeAfter).toFixed(1) : '0.0';
-      const directPlayLine = _formatDirectPlayLine(evt.tasteBefore, evt.tasteAfter);
-      const similarityDeltaLine = _formatSimilarityDeltaLine(evt.tasteAfter);
-      const totalScoreLine = _formatTotalScoreLine(evt.tasteBefore, evt.tasteAfter);
-      return `
-        <div class="tw-session-row tw-playback-row">
-          <div class="tw-session-main">
-            <div class="tw-session-title">${esc(evt.title || evt.filename || 'Unknown')}</div>
-            <div class="tw-session-meta">${esc(when)} &middot; ${evt.classification === 'skip' ? 'Skip' : 'Positive listen'} &middot; listened ${evt.fraction != null ? Math.round(evt.fraction * 100) + '%' : '-'}</div>
-            <div class="tw-playback-line">Source: ${esc(sourceLabel)}</div>
-            <div class="tw-playback-line">Direct play effect: ${directPlayLine}</div>
-            <div class="tw-playback-line">Similarity delta effect: ${similarityDeltaLine}</div>
-            <div class="tw-playback-line">Total score: ${totalScoreLine}</div>
-            <div class="tw-playback-line">Session pull: ${beforePull} &rarr; ${afterPull}</div>
-            <div class="tw-playback-line">Session counts: encounters ${beforeSessionEncounters} &rarr; ${afterSessionEncounters} &middot; skips ${beforeSessionSkips} &rarr; ${afterSessionSkips} &middot; positive ${beforeSessionPositive} &rarr; ${afterSessionPositive}</div>
-            <div class="tw-playback-line">Library avg: ${beforeAvg} &rarr; ${afterAvg}</div>
-            <div class="tw-playback-line">Library counts: starts ${beforePlays} &rarr; ${afterPlays} &middot; skips ${beforeSkips} &rarr; ${afterSkips} &middot; completions ${beforeCompletions} &rarr; ${afterCompletions} &middot; fractions ${beforeFracs} &rarr; ${afterFracs}</div>
-            <div class="tw-playback-line">X-score: ${beforeNeg} &rarr; ${afterNeg}</div>
-          </div>
-          <div class="tw-session-badge ${evt.classification === 'skip' ? 'tw-session-badge-neg' : ''}">${evt.classification === 'skip' ? 'SKIP' : 'LISTEN'}</div>
-        </div>
-      `;
-    }).join('');
-  const tasteActivityHtml = _renderActivityLogHtml(tasteActivityRows);
-  window._tuningHints = {
-    adventurous: "Higher = more diverse Up Next picks (MMR lambda). Lower = stick closer to what you just played.",
-    sessionBias: "Higher = recs follow the mood of what you're playing right now. Lower = lean on long-term taste profile.",
-    negativeStrength: "Higher = songs in your Negative list (X'd, disliked, repeat-skipped) pull recommendations farther away from their sound."
-  };
-  const tuneRow = (key, label, val, defaultPct) => `
-      <div class="tuning-row tuning-row-compact">
-        <div class="tuning-label-compact">
-          <span class="tuning-label-text">${label}</span>
-          <button class="tuning-info-btn" title="Info"
-            ontouchstart="event.stopPropagation()"
-            onmousedown="event.stopPropagation()"
-            onclick="event.stopPropagation(); window._app.tuningInfo('${key}')">info</button>
-          <span class="tuning-val" id="tune${key}Val">${tPct(val)}%</span>
-          <button class="tuning-reset" title="Reset to default (${defaultPct}%)" onclick="window._app.resetTuning('${key}')">\u21BA</button>
-        </div>
-        <div class="tuning-inline-hint" id="tuningHint-${key}" style="display:none;">${esc(window._tuningHints[key])}</div>
-        <input class="tuning-slider" type="range" min="0" max="100" value="${tPct(val)}"
-          oninput="document.getElementById('tune${key}Val').textContent=this.value+'%'"
-          onchange="window._app.setTuning('${key}', this.value/100)">
-      </div>`;
-  const tuningHtml = `
-    <div class="tuning-block tuning-block-compact">
-      <div class="tuning-title">Recommendation Tuning</div>
-      ${tuneRow('adventurous', 'Adventurous', tuning.adventurous, 80)}
-      ${tuneRow('sessionBias', 'Session weight', tuning.sessionBias, 50)}
-      ${tuneRow('negativeStrength', 'Skip strength', tuning.negativeStrength, 50)}
-    </div>`;
-  const playbackLoadMoreHtml = playbackRemaining > 0
-    ? `<button class="tw-more-btn" onclick="window._app.tastePlaybackMore()">Show ${Math.min(TASTE_PLAYBACK_PAGE_SIZE, playbackRemaining)} more (${playbackRemaining} remaining)</button>`
-    : '';
-  const playbackInsightsHtml = `
-    <div class="tw-session-block">
-      <button class="tw-session-header" onclick="window._app.toggleTastePlayback()">
-        <span>Last 30 Playback Signal Updates (${playbackTimelineFull.length})</span>
-        <span>${_tastePlaybackExpanded ? '\u25BC' : '\u25B6'}</span>
-      </button>
-      <div class="tw-session-body" style="display:${_tastePlaybackExpanded ? 'block' : 'none'};">
-        <div class="tw-intro-sub">Each row is one playback result. Repeat listens appear one by one so you can see how session pull, library evidence, and Taste score changed over time. Very early skips under 10% listened are not added here.</div>
-        ${playbackTimelineHtml}
-        ${playbackLoadMoreHtml}
-        <button class="emb-copy-logs-btn tw-copy-logs-btn" onclick="window._app.copyTastePlaybackSignals()">Copy Last 30 Signals</button>
-      </div>
-    </div>`;
-  const tasteLogsHtml = `
-    <div class="tw-session-block">
-      <button class="tw-session-header" onclick="window._app.toggleTasteLogs()">
-        <span>Taste Logs (${tasteActivityRows.length})</span>
-        <span>${_tasteLogsExpanded ? '\u25BC' : '\u25B6'}</span>
-      </button>
-      <div class="tw-session-body" style="display:${_tasteLogsExpanded ? 'block' : 'none'};">
-        <div class="tw-intro-sub">Filtered Taste Signal, playback evidence, reset, and tuning logs. Use AI page Common Logs for the full app audit trail.</div>
-        <div class="emb-log-container tw-log-container" id="tasteLogContainer">
-          ${tasteActivityHtml.length > 0 ? tasteActivityHtml : '<div class="emb-log-empty">No Taste activity recorded yet.</div>'}
-        </div>
-        <button class="emb-copy-logs-btn tw-copy-logs-btn" onclick="window._app.copyTasteLogs()">Copy Taste Logs</button>
-      </div>
-    </div>`;
-  const engineInsightsHtml = `
-    <div class="tw-session-block">
-      <button class="tw-session-header" onclick="window._app.toggleTasteEngine()">
-        <span>Engine Snapshot</span>
-        <span>${_tasteEngineExpanded ? '\u25BC' : '\u25B6'}</span>
-      </button>
-      <div class="tw-session-body" style="display:${_tasteEngineExpanded ? 'block' : 'none'};">
-        <div class="tw-engine-grid">
-          <div class="tw-engine-card">
-            <div class="tw-engine-key">Current Blend</div>
-            <div class="tw-engine-val">${esc(ins.blend.currentSong)} / ${esc(ins.blend.session)} / ${esc(ins.blend.profile)}</div>
-            <div class="tw-engine-meta">${esc(ins.blend.mode)}</div>
-          </div>
-          <div class="tw-engine-card">
-            <div class="tw-engine-key">Up Next</div>
-            <div class="tw-engine-val">${ins.queue.size} songs</div>
-            <div class="tw-engine-meta">${esc(ins.queue.mode)}${ins.queue.label ? ' \u00b7 ' + esc(ins.queue.label) : ''}</div>
-          </div>
-          <div class="tw-engine-card">
-            <div class="tw-engine-key">Library AI</div>
-            <div class="tw-engine-val">${esc(ins.embeddingCoverage.percentage)}</div>
-            <div class="tw-engine-meta">${ins.embeddingCoverage.embedded}/${ins.embeddingCoverage.total} embedded</div>
-          </div>
-          <div class="tw-engine-card">
-            <div class="tw-engine-key">Now Playing</div>
-            <div class="tw-engine-val">${esc(ins.currentSong ? ins.currentSong.title : 'Nothing active')}</div>
-            <div class="tw-engine-meta">${esc(ins.currentSong ? ins.currentSong.artist : 'Start a song to see live blend state')}</div>
-          </div>
-        </div>
-      </div>
-    </div>`;
-
-  const headline = `${summary.activeCount || 0} active signals across ${summary.totalEmbedded || 0} embedded songs. ${summary.hardBlockedCount || 0} strong negative songs are blocked from taste-based recommendations. Tap any row to start playback from that exact order.`;
-  const filterAllEmbeddedChecked = _tasteSignalFilter === 'all';
-  const sortNegativeChecked = _tasteSignalSort === 'negative';
-  const filterToggleLabel = filterAllEmbeddedChecked ? `All Embedded (${summary.totalEmbedded || 0})` : `Active Only (${summary.activeCount || 0})`;
-  const sortToggleLabel = sortNegativeChecked ? 'Top Negative' : 'Top Positive';
-
-  panel.innerHTML = `
-    <div class="viewall-header">
-      <button class="viewall-back" onclick="window._app.closeTasteWeights()">\u2190</button>
-      <span class="viewall-title">Taste Signal</span>
-    </div>
-    <div class="taste-weights-page">
-      ${tuningHtml}
-      ${engineInsightsHtml}
-      ${playbackInsightsHtml}
-      <div class="tw-intro">${headline}</div>
-      <div class="tw-intro-sub">Library Signals Reset clears recommendation history plus X-score so a song can re-earn signal from fresh listening. Manual dislikes stay separate. Similarity chips show neighbor influence from related songs.</div>
-      <div class="tw-page-actions">
-        <button class="tw-page-reset-btn" onclick="window._app.reset()">Reset Engine</button>
-        <button class="tuning-info-btn" onclick="window._app.toggleTasteResetInfo()">info</button>
-      </div>
-      <div class="tw-reset-help" id="tasteResetHelp" style="display:${_tasteResetInfoVisible ? 'block' : 'none'};">
-        <div><strong>Clears:</strong> Up Next, playback history, Taste profile summary, favorites, dislikes, X-score, session logs, and saved playback state.</div>
-        <div><strong>Keeps:</strong> song files, embeddings, playlists, and Common Logs / activity logs.</div>
-        <div>Playback stops and the app reloads after reset.</div>
-      </div>
-      <div class="tw-toggle-row">
-        <label class="tw-toggle">
-          <span class="tw-toggle-text">${filterToggleLabel}</span>
-          <input type="checkbox" ${filterAllEmbeddedChecked ? 'checked' : ''} onchange="window._app.setTasteSignalFilter(this.checked ? 'all' : 'active')">
-          <span class="tw-toggle-slider"></span>
-        </label>
-        <label class="tw-toggle">
-          <span class="tw-toggle-text">${sortToggleLabel}</span>
-          <input type="checkbox" ${sortNegativeChecked ? 'checked' : ''} onchange="window._app.setTasteSignalSort(this.checked ? 'negative' : 'positive')">
-          <span class="tw-toggle-slider"></span>
-        </label>
-      </div>
-      <div class="tw-section-title">Library Signals (${rows.length})</div>
-      <div class="tw-list">${listHtml}</div>
-      ${tasteLogsHtml}
-    </div>
-  `;
-}
-
-function closeTasteWeightsOverlay() {
-  _tasteSignalFilter = 'active';
-  _tasteSignalSort = 'positive';
-  _tasteSignalVisibleCount = TASTE_SIGNAL_PAGE_SIZE;
-  _tasteSignalVisibleRows = [];
-  _tastePlaybackExpanded = false;
-  _tastePlaybackVisibleCount = TASTE_PLAYBACK_PAGE_SIZE;
-  _tasteLogsExpanded = false;
-  _tasteEngineExpanded = false;
-  _tasteResetInfoVisible = false;
-  _hideTuningInfoPopup();
-  const panel = discoverContentBackupPanelId ? document.getElementById(discoverContentBackupPanelId) : document.getElementById('panel-discover');
-  if (panel && discoverContentBackup) {
-    panel.innerHTML = discoverContentBackup;
-    discoverContentBackup = null;
-    discoverContentBackupPanelId = null;
-    if (!_flushQueuedDiscoverRefresh()) refreshDiscoverPrimaryState();
-  } else if (panel) {
-    if (!_flushQueuedDiscoverRefresh()) renderDiscoverSnapshotFromCache({ fade: false });
-  }
-}
-
-async function resetTasteWeightUI(songId) {
-  const result = await engine.resetSongProfileWeight(songId);
-  showStatusToast(result && result.ok ? 'Taste weight reset' : 'Could not reset weight', 1500);
-  if (result && result.ok) showTasteWeightsOverlay();
-}
-
-function copyTasteLogsUI() {
-  try {
-    const entries = _getTasteActivityEntries(160);
-    _copyTextToClipboard(_activityEntriesToCopyText(entries), 'Taste logs copied');
-  } catch (e) {
-    showStatusToast('Copy failed', 1500);
-  }
-}
-
-async function copyTastePlaybackSignalsUI() {
-  try {
-    const entries = await engine.getRecentPlaybackSignalTimeline(TASTE_PLAYBACK_MAX);
-    if (!entries || entries.length === 0) {
-      showStatusToast('No playback signals to copy', 1500);
-      return;
-    }
-    _copyTextToClipboard(_playbackTimelineEntriesToCopyText(entries), 'Playback signals copied');
-  } catch (e) {
-    showStatusToast('Copy failed', 1500);
-  }
-}
-
-async function playTasteSignalRowUI(visibleIndex) {
-  const row = _tasteSignalVisibleRows[visibleIndex];
-  if (!row) return;
-  if (row.id === currentSong && nativeAudioPlaying) {
-    if (!fullPlayerOpen) openFullPlayer();
-    return;
-  }
-  const frac = getListenFraction();
-  const label = `Taste Signal · ${_tasteSignalSort === 'positive' ? 'Top Positive' : 'Top Negative'}${_tasteSignalFilter === 'all' ? ' · All Embedded' : ' · Active Only'}`;
-  logActivity({
-    category: 'ui',
-    type: 'taste_signal_song_tapped',
-    message: `Tapped "${row.title}" from Taste Signal`,
-    data: { songId: row.id, rank: visibleIndex + 1, sort: _tasteSignalSort, filter: _tasteSignalFilter, prevFraction: frac },
-    tags: ['taste', 'queue', 'playback'],
-    important: true,
-  });
-  const info = engine.playFromOrderedList(_tasteSignalVisibleRows.map(item => item.id), visibleIndex, label, 'taste_signal', frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-function setTasteSignalFilterUI(mode) {
-  _tasteSignalFilter = mode === 'all' ? 'all' : 'active';
-  _tasteSignalVisibleCount = TASTE_SIGNAL_PAGE_SIZE;
-  showTasteWeightsOverlay();
-}
-
-function setTasteSignalSortUI(mode) {
-  _tasteSignalSort = mode === 'negative' ? 'negative' : 'positive';
-  _tasteSignalVisibleCount = TASTE_SIGNAL_PAGE_SIZE;
-  showTasteWeightsOverlay();
-}
-
-function showMoreTasteSignalUI() {
-  _tasteSignalVisibleCount += TASTE_SIGNAL_PAGE_SIZE;
-  showTasteWeightsOverlay();
-}
-
-
-function _renderBecauseYouPlayedSections(sections, opts = {}) {
-  const el = document.getElementById('because-you-played');
-  if (!el) return;
-  const fadeCls = opts.fade === false ? '' : ' fade-in';
-  if (!sections || sections.length === 0) {
-    _cachedBecauseYouPlayed = [];
-    el.innerHTML = '<div class="empty-hint">Play music to get personal recommendations</div>';
-    return;
-  }
-  _cachedBecauseYouPlayed = sections;
-  el.innerHTML = sections.map((sec, i) => `
-    <div class="section-header${fadeCls}">Because you played ${esc(sec.sourceTitle)}</div>
-    <div class="hscroll-wrap${fadeCls}">
-      <div class="hscroll">
-        ${sec.recommendations.map(s => cardHtml(s, s.similarity, 'manual_because', 'byp:' + i)).join('')}
-      </div>
-    </div>
-  `).join('');
-}
-
-function renderCachedBecauseYouPlayed(opts = {}) {
-  _renderBecauseYouPlayedSections(_cachedBecauseYouPlayed || [], opts);
-}
-
-function renderBecauseYouPlayed(opts = {}) {
-  const sections = engine.getBecauseYouPlayed(3, 6, {
-    avoidSourceIds: opts.refresh ? (_cachedBecauseYouPlayed || []).map(s => s.sourceId) : [],
-    avoidRecIds: opts.refresh ? (_cachedBecauseYouPlayed || []).flatMap(s => (s.recommendations || []).map(r => r.id)) : [],
-  });
-  _renderBecauseYouPlayedSections(sections, opts);
-}
-
-function _renderUnexploredPlaceholder() {
-  const header = document.getElementById('unexplored-header');
-  const el = document.getElementById('unexplored-clusters');
-  if (!el || !header) return;
-  header.style.display = '';
-  el.innerHTML = `
-    <div class="similar-placeholder similar-placeholder-loading">
-      <div class="similar-placeholder-text">Loading unexplored sounds<span class="similar-loading-dots"><span></span><span></span><span></span></span></div>
-    </div>`;
-}
-
-function _renderUnexploredSections(sections, opts = {}) {
-  const header = document.getElementById('unexplored-header');
-  const el = document.getElementById('unexplored-clusters');
-  if (!el || !header) return;
-  if (!engine.isEmbeddingsReady()) {
-    _renderUnexploredPlaceholder();
-    return;
-  }
-  if (!sections || sections.length === 0) {
-    _cachedUnexplored = [];
-    header.style.display = 'none';
-    el.innerHTML = '';
-    return;
-  }
-  const fadeCls = opts.fade === false ? '' : ' fade-in';
-  header.style.display = '';
-  _cachedUnexplored = sections;
-  const labels = ['Sound you rarely visit', 'Another pocket of your library', 'Off the beaten path'];
-  el.innerHTML = sections.map((sec, i) => `
-    <div class="section-header${fadeCls}">${labels[i] || 'Unexplored'}</div>
-    <div class="hscroll-wrap${fadeCls}">
-      <div class="hscroll">
-        ${sec.songs.map(s => cardHtml(s, null, 'unexplored', 'unexp:' + i)).join('')}
-      </div>
-    </div>
-  `).join('');
-}
-
-function renderCachedUnexplored(opts = {}) {
-  const header = document.getElementById('unexplored-header');
-  const el = document.getElementById('unexplored-clusters');
-  if (!el || !header) return;
-  const sections = _cachedUnexplored || [];
-  // Render cached sections directly — do NOT gate on isEmbeddingsReady(). The
-  // section is a snapshot of the last manual refresh; it must appear on cold
-  // start even before embeddings finish merging.
-  if (sections.length > 0) {
-    const fadeCls = opts.fade === false ? '' : ' fade-in';
-    header.style.display = '';
-    const labels = ['Sound you rarely visit', 'Another pocket of your library', 'Off the beaten path'];
-    el.innerHTML = sections.map((sec, i) => `
-      <div class="section-header${fadeCls}">${labels[i] || 'Unexplored'}</div>
-      <div class="hscroll-wrap${fadeCls}">
-        <div class="hscroll">
-          ${sec.songs.map(s => cardHtml(s, null, 'unexplored', 'unexp:' + i)).join('')}
-        </div>
-      </div>
-    `).join('');
-    return;
-  }
-  // No cached sections yet — fall back to the embedding-aware placeholder path.
-  _renderUnexploredSections(sections, opts);
-}
-
-function renderDiscoverSnapshotFromCache(opts = {}) {
-  if (opts.includeSimilar !== false) {
-    if (engine.isEmbeddingsReady()) {
-      renderSimilar();
-    } else {
-      const similarHeader = document.getElementById('similar-header');
-      const similarList = document.getElementById('similar-list');
-      if (similarHeader) similarHeader.style.display = 'none';
-      if (similarList) similarList.innerHTML = '';
-    }
-  }
-  renderCachedBecauseYouPlayed({ fade: opts.fade });
-  renderCachedUnexplored({ fade: opts.fade });
-  if (_lastProfile) {
-    renderProfile(_lastProfile, { fade: opts.fade });
-  } else {
-    renderDiscoverTiles(_lastProfile);
-  }
-}
-
-function refreshDiscoverPrimaryState() {
-  renderSimilar();
-  refreshVisibleDiscoverCardState();
-}
-
-function refreshVisibleDiscoverCardState() {
-  if (activeTab !== 'discover' || _isOnSubPage()) return;
-  const panel = document.getElementById('panel-discover');
-  if (!panel) return;
-  panel.querySelectorAll('.hcard[data-song-id]').forEach(card => {
-    const songId = parseInt(card.getAttribute('data-song-id') || '', 10);
-    const isPlaying = Number.isFinite(songId) && nativeAudioPlaying && songId === currentSong;
-    card.classList.toggle('playing', isPlaying);
-    const art = card.querySelector('.hcard-art');
-    if (!art) return;
-    const eq = art.querySelector('.playing-eq');
-    if (isPlaying && !eq) {
-      const eqEl = document.createElement('div');
-      eqEl.className = 'playing-eq';
-      eqEl.innerHTML = '<span></span><span></span><span></span>';
-      art.appendChild(eqEl);
-    } else if (!isPlaying && eq) {
-      eq.remove();
-    }
-  });
-}
-
-async function renderUnexploredClusters(opts = {}) {
-  const header = document.getElementById('unexplored-header');
-  const el = document.getElementById('unexplored-clusters');
-  if (!el || !header) return;
-  if (!engine.isEmbeddingsReady()) {
-    _renderUnexploredPlaceholder();
-    return;
-  }
-  const sections = await engine.getUnexploredClusters(3, 8, {
-    refresh: opts.refresh === true,
-    avoidSongIds: opts.refresh ? document.querySelectorAll('#unexplored-clusters .hcard').length > 0
-      ? Array.from(new Set((_cachedUnexplored || []).flatMap(sec => (sec.songs || []).map(s => s.id))))
-      : []
-      : [],
-  });
-  _renderUnexploredSections(sections, opts);
-}
-
-let _cachedBecauseYouPlayed = [];
-let _cachedForYou = [];
-let _cachedSimilar = [];
-let _lastSimilarIds = '';
-let _similarFrozen = false;
-let _cachedFavorites = [];
-let _cachedPlaylists = [];
-let _cachedUnexplored = [];
-let _viewAllItems = []; // current ViewAll list — sectionKey 'viewAll' resolves to this
-let _currentViewAllType = null;
-let _currentPlaylistViewId = null;
-
-function _buildDiscoverCacheSnapshot() {
-  return {
-    profile: _lastProfile || null,
-    becauseYouPlayed: _cachedBecauseYouPlayed || [],
-    unexplored: _cachedUnexplored || [],
-    recentlyPlayed: _cachedRecentlyPlayed || [],
-    favorites: _cachedFavorites || [],
-  };
-}
-
-function _saveVisibleDiscoverCache() {
-  engine.saveDiscoverCache(_buildDiscoverCacheSnapshot()).catch(() => {});
-}
-
-function _saveVisibleDiscoverCacheDebounced() {
-  engine.saveDiscoverCacheDebounced(_buildDiscoverCacheSnapshot());
-}
-
-function _filterSongItems(items, songId) {
-  return (Array.isArray(items) ? items : []).filter(item => item && item.id !== songId);
-}
-
-function _filterBecauseYouPlayedSections(sections, songId) {
-  return (Array.isArray(sections) ? sections : [])
-    .map(sec => ({
-      ...sec,
-      recommendations: _filterSongItems(sec && sec.recommendations, songId),
-    }))
-    .filter(sec => sec && sec.sourceId !== songId && (sec.recommendations || []).length > 0);
-}
-
-function _filterSectionSongGroups(sections, songId) {
-  return (Array.isArray(sections) ? sections : [])
-    .map(sec => ({
-      ...sec,
-      songs: _filterSongItems(sec && sec.songs, songId),
-    }))
-    .filter(sec => sec && (sec.songs || []).length > 0);
-}
-
-function _pruneSongFromDiscoverCaches(songId) {
-  _cachedForYou = _filterSongItems(_cachedForYou, songId);
-  _cachedSimilar = _filterSongItems(_cachedSimilar, songId);
-  _lastSimilarIds = (_cachedSimilar || []).map(s => s.id).join(',');
-  _cachedBecauseYouPlayed = _filterBecauseYouPlayedSections(_cachedBecauseYouPlayed, songId);
-  _cachedUnexplored = _filterSectionSongGroups(_cachedUnexplored, songId);
-  _cachedRecentlyPlayed = _filterSongItems(_cachedRecentlyPlayed, songId);
-  _cachedFavorites = _filterSongItems(_cachedFavorites, songId);
-  _viewAllItems = _filterSongItems(_viewAllItems, songId);
-
-  if (_lastProfile) {
-    _lastProfile = {
-      ..._lastProfile,
-      forYou: _filterSongItems(_lastProfile.forYou, songId),
-      mostPlayed: _filterSongItems(_lastProfile.mostPlayed, songId),
-      neverPlayed: _filterSongItems(_lastProfile.neverPlayed, songId),
-      stats: _lastProfile.stats
-        ? {
-            ..._lastProfile.stats,
-            neverPlayedCount: _filterSongItems(_lastProfile.neverPlayed, songId).length,
-          }
-        : _lastProfile.stats,
-    };
-  }
-}
-
-function _rerenderCachedDiscoverViews() {
-  if (_currentViewAllType && !_currentPlaylistViewId) {
-    viewAllUI(_currentViewAllType, { items: _viewAllItems }).catch(() => {});
-  }
-  if (activeTab === 'discover' && !_isOnSubPage() && !_hasDiscoverBackup()) {
-    renderDiscoverSnapshotFromCache({ fade: false });
-    refreshVisibleDiscoverCardState();
-    return;
-  }
-  if (activeTab === 'browse' && !document.querySelector('#panel-browse .viewall-header')) {
-    renderDiscoverTiles(_lastProfile);
-  }
-}
-
-// sectionKey: when provided, tap plays the song and replaces Up Next with the
-// rest of that section starting after the tapped song. When absent, falls back
-// to plain engine.play (standalone song tap).
-function cardHtml(s, badge, source, sectionKey) {
-  const initial = (s.title || '?')[0].toUpperCase();
-  const badgeHtml = badge ? `<div class="card-badge">${badge}</div>` : '';
-  const redDot = (s.hasEmbedding === false) ? '<span class="red-dot" title="No embedding"></span>' : '';
-  const fullSong = (s.id != null) ? engine.getSongs()[s.id] : null;
-  const isDis = s.disliked || (fullSong && fullSong.disliked);
-  const disBadge = isDis ? '<span class="dislike-badge" title="Disliked">\uD83D\uDC4E</span>' : '';
-  const onclick = sectionKey
-    ? `window._app.playFromSection(${s.id}, '${sectionKey}')`
-    : `window._app.playSong(${s.id}, '${source}')`;
-  const isPlaying = (s.id != null && s.id === currentSong && nativeAudioPlaying);
-  const playingCls = isPlaying ? ' playing' : '';
-  const eqHtml = isPlaying ? '<div class="playing-eq"><span></span><span></span><span></span></div>' : '';
-  const artUrl = getArtUrl(s);
-  const onerr = s && s.id != null ? _artOnErrorAttr(s.id, initial, '') : '';
-  const artContent = artUrl
-    ? `<img src="${artUrl}" class="hcard-art-img" decoding="async" alt="" ${onerr}>${redDot}`
-    : `${esc(initial)}${redDot}`;
-  return `<div class="hcard${playingCls}" data-song-id="${s.id != null ? s.id : ''}" onclick="${onclick}">
-    <div class="hcard-art">${disBadge}${artContent}${eqHtml}</div>
-    <div class="hcard-title">${esc(s.title)}</div>
-    <div class="hcard-artist">${esc(s.artist)}</div>
-    <div class="hcard-menu" onclick="event.stopPropagation(); window._app.showSongMenu(${s.id}, this)">&#8942;</div>
-    ${badgeHtml}
-  </div>`;
-}
-
-// ===== VIEW ALL OVERLAY =====
-
-let discoverContentBackup = null;
-let discoverContentBackupPanelId = null;
-
-async function viewAllUI(type, opts = {}) {
-  const useProvidedItems = Array.isArray(opts.items);
-  let items = useProvidedItems ? opts.items.slice() : [];
-  const meta = getViewAllMeta(type);
-  const title = meta.title;
-
-  if (!useProvidedItems && type === 'mostPlayed') {
-    const profile = await engine.analyzeProfile(500);
-    items = profile.mostPlayed || [];
-  } else if (!useProvidedItems && type === 'recentlyPlayed') {
-    items = await engine.loadRecentlyPlayed(200);
-  } else if (!useProvidedItems && type === 'lastAdded') {
-    items = engine.getLastAddedSongs(200);
-  } else if (!useProvidedItems && type === 'neverPlayed') {
-    const profile = await engine.analyzeProfile(500);
-    items = profile.neverPlayed || [];
-  } else if (!useProvidedItems && type === 'noEmbedding') {
-    items = allSongs.filter(s => !s.hasEmbedding).map(s => ({
-      id: s.id, title: s.title, artist: s.artist, album: s.album, hasEmbedding: false,
-    }));
-  } else if (!useProvidedItems && type === 'favorites') {
-    items = engine.getFavoritesList();
-  } else if (!useProvidedItems && type === 'dislikedSongs') {
-    items = engine.getDislikedSongsList();
-  } else if (!useProvidedItems && type === 'forYou') {
-    const profile = await engine.analyzeProfile(500);
-    items = profile.forYou || [];
-  } else if (!useProvidedItems && type === 'similar') {
-    const ins = engine.getInsights();
-    items = (ins.topSimilar || []).map(s => {
-      const song = engine.getSongs()[s.id];
-      return { id: s.id, title: s.title, artist: s.artist, album: song ? song.album : '', hasEmbedding: true, artPath: s.artPath };
-    });
-  }
-
-  _viewAllItems = items;
-  _currentViewAllType = type;
-  _currentPlaylistViewId = null;
-
-  const panelId = activeTab === 'browse' ? 'panel-browse' : 'panel-discover';
-  const panel = document.getElementById(panelId);
-  if (!panel) return;
-  if (!panel.querySelector('.viewall-header')) {
-    discoverContentBackup = panel.innerHTML;
-    discoverContentBackupPanelId = panelId;
-  }
-
-  const listHtml = items.length > 0
-    ? items.map((s) => {
-        const badge = type === 'mostPlayed' && s.play_count ? `<div class="similarity">${s.play_count}\u00d7</div>` : '';
-        const redDot = (s.hasEmbedding === false) ? '<span class="red-dot-inline"></span>' : '';
-        const full = engine.getSongs()[s.id];
-        const onclick = `window._app.playFromSection(${s.id}, 'viewAll')`;
-        return `<div class="song-item" onclick="${onclick}">
-          ${full ? songThumb(full) : `<div class="song-thumb song-thumb-letter">${esc((s.title||'?')[0])}</div>`}
-          <div class="song-info">
-            <div class="song-title">${redDot}${esc(s.title)}</div>
-            <div class="song-artist">${esc(s.artist)} \u00b7 ${esc(s.album || '')}</div>
-          </div>
-          ${badge}
-          <div class="song-menu-btn" onclick="event.stopPropagation(); window._app.showSongMenu(${s.id}, this)">&#8942;</div>
-        </div>`;
-      }).join('')
-    : `<div class="playlist-empty-large">${esc(meta.empty)}</div>`;
-
-  panel.innerHTML = `
-    <div class="viewall-header">
-      <button class="viewall-back" onclick="window._app.closeViewAll()">\u2190</button>
-      <span class="viewall-title">${esc(title)}</span>
-      <span class="viewall-count">${items.length} songs</span>
-    </div>
-    <div class="viewall-list">
-      ${listHtml}
-    </div>
-  `;
-  const content = document.querySelector('.content');
-  if (content) content.scrollTop = 0;
-}
-
-async function refreshCurrentViewAllUI() {
-  if (!_currentViewAllType || _currentPlaylistViewId) return;
-  const content = document.querySelector('.content');
-  const prevScrollTop = content ? content.scrollTop : 0;
-  await viewAllUI(_currentViewAllType);
-  const nextContent = document.querySelector('.content');
-  if (!nextContent) return;
-  const maxScroll = Math.max(0, nextContent.scrollHeight - nextContent.clientHeight);
-  nextContent.scrollTop = Math.min(prevScrollTop, maxScroll);
-}
-
-function refreshBrowseCollectionsUI() {
-  loadFavorites();
-  if (_currentViewAllType === 'favorites' || _currentViewAllType === 'dislikedSongs') {
-    refreshCurrentViewAllUI().catch(() => {});
-  }
-}
-
-function openPlaylistUI(playlistId) {
-  const meta = engine.getPlaylistMeta(playlistId);
-  if (!meta) {
-    showStatusToast('Playlist not found', 1500);
-    return;
-  }
-  const items = engine.getPlaylistSongs(playlistId);
-  _viewAllItems = items;
-  _currentViewAllType = 'playlist';
-  _currentPlaylistViewId = playlistId;
-
-  const panel = document.getElementById('panel-browse');
-  if (!panel) return;
-  if (!panel.querySelector('.viewall-header')) {
-    discoverContentBackup = panel.innerHTML;
-    discoverContentBackupPanelId = 'panel-browse';
-  }
-
-  panel.innerHTML = `
-    <div class="viewall-header">
-      <button class="viewall-back" onclick="window._app.closeViewAll()">\u2190</button>
-      <span class="viewall-title">${esc(meta.name)}</span>
-      <span class="viewall-count">${items.length} songs</span>
-    </div>
-    <div class="playlist-page-actions">
-      <button class="action-btn" onclick="window._app.renamePlaylist('${playlistId}')">Rename</button>
-      <button class="action-btn reset-btn" onclick="window._app.deletePlaylist('${playlistId}')">Delete</button>
-      <button class="action-btn" onclick="window._app.showPlaylistPicker()">+ New</button>
-    </div>
-    <div class="viewall-list">
-      ${items.length > 0 ? items.map((s) => {
-        const redDot = (s.hasEmbedding === false) ? '<span class="red-dot-inline"></span>' : '';
-        return `<div class="song-item" onclick="window._app.playFromPlaylist(${s.id}, '${playlistId}')">
-          ${songThumb(engine.getSongs()[s.id] || s)}
-          <div class="song-info">
-            <div class="song-title">${redDot}${esc(s.title)}</div>
-            <div class="song-artist">${esc(s.artist)} \u00b7 ${esc(s.album || '')}</div>
-          </div>
-          <div class="song-menu-btn" onclick="event.stopPropagation(); window._app.showSongMenu(${s.id}, this)">&#8942;</div>
-        </div>`;
-      }).join('') : '<div class="playlist-empty-large">No songs in this playlist yet. Use any song menu to add songs here.</div>'}
-    </div>
-  `;
-
-  const content = document.querySelector('.content');
-  if (content) content.scrollTop = 0;
-}
-
-function closeViewAll() {
-  if (discoverContentBackup && discoverContentBackupPanelId) {
-    const panelId = discoverContentBackupPanelId;
-    const panel = document.getElementById(discoverContentBackupPanelId);
-    panel.innerHTML = discoverContentBackup;
-    discoverContentBackup = null;
-    discoverContentBackupPanelId = null;
-    _viewAllItems = [];
-    _currentViewAllType = null;
-    _currentPlaylistViewId = null;
-    if (panelId === 'panel-browse') {
-      loadPlaylistsUI();
-      loadFavorites();
-      if (_lastProfile) renderDiscoverTiles(_lastProfile);
-    } else if (panelId === 'panel-discover') {
-      if (!_flushQueuedDiscoverRefresh()) refreshDiscoverPrimaryState();
-    }
-  }
-}
 
 // ===== NATIVE AUDIO EVENTS =====
 
@@ -3016,22 +1669,6 @@ function setupNativeAudioEvents() {
   }
 }
 
-function updateProgressUI(pos, dur) {
-  const pct = dur > 0 ? (pos / dur * 100) : 0;
-  document.getElementById('progressFill').style.width = pct + '%';
-  const thumb = document.getElementById('seekThumb');
-  if (thumb) thumb.style.left = pct + '%';
-  document.getElementById('npTime').textContent = formatTime(pos);
-  document.getElementById('npDuration').textContent = formatTime(dur);
-  updateFullPlayerProgress(pos, dur);
-}
-
-function updatePlayIcon(paused) {
-  document.getElementById('playIcon').innerHTML = paused
-    ? '<path d="M8 5v14l11-7z"/>'
-    : '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
-  updateFullPlayerPlayIcon(paused);
-}
 
 // ===== NATIVE MEDIA LISTENER (notification/lock screen controls) =====
 
@@ -3174,12 +1811,21 @@ function setupEmbeddingUI() {
       scheduleEmbeddingUiRefresh();
     });
 
-    // Auto-refresh detail page every 2s while it's open (catches missed events)
+    // Auto-refresh detail page every 2s during active embedding to keep the
+    // elapsed-time display, current-file label, and queue counts moving even
+    // if a native event slips through. Outside of an active batch the
+    // event-driven listeners above (embeddingProgress / embeddingSongComplete /
+    // embeddingComplete / embeddingError / _songLibraryChangedCbs) cover every
+    // state transition that needs a re-render — so we skip the heavy DOM
+    // rebuild when the engine reports inProgress=false.
     setInterval(() => {
       const panel = document.getElementById('panel-discover');
-      if (panel && panel.querySelector('.emb-detail-page')) {
-        showEmbeddingDetail();
-      }
+      if (!panel || !panel.querySelector('.emb-detail-page')) return;
+      try {
+        if (engine.getEmbeddingStatus().inProgress) {
+          showEmbeddingDetail();
+        }
+      } catch (e) { /* engine not ready yet */ }
     }, 2000);
   } catch (e) {
     console.log('Embedding UI listeners not available:', e);
@@ -3234,61 +1880,6 @@ function updateModeIndicator() {
   }
 }
 
-// ===== SHUFFLE & LOOP =====
-
-function toggleShuffleUI() {
-  shuffleOn = !shuffleOn;
-  const btn = document.getElementById('shuffleBtn');
-  if (btn) { btn.classList.toggle('active-mode', shuffleOn); btn.title = shuffleOn ? 'Shuffle: keep remaining Up Next songs randomized' : 'Shuffle off'; }
-  const fpShuffle = document.getElementById('fpShuffleBtn');
-  if (fpShuffle) fpShuffle.classList.toggle('active-mode', shuffleOn);
-  engine.setQueueShuffleEnabled(shuffleOn);
-  showStatusToast(shuffleOn ? 'Shuffle: remaining Up Next songs randomized' : 'Shuffle off', 1800);
-  if (shuffleOn) {
-    refreshStateUI();
-    syncUpcomingNativeQueue();
-    _scheduleRecsFocusCurrent();
-  }
-}
-
-// Loop cycles: off → one → all → off
-// - off: play queue to end, then stop
-// - one: native MediaPlayer repeats the current song forever
-// - all: queue auto-refreshes on exhaustion (AI/shuffle keeps flowing)
-function toggleLoopUI() {
-  loopMode = loopMode === 'off' ? 'one' : (loopMode === 'one' ? 'all' : 'off');
-  const loopModeMap = { off: 0, one: 1, all: 2 };
-  try { MusicBridge.setLoopMode({ mode: loopModeMap[loopMode] || 0 }); } catch (e) { /* ignore */ }
-  const apply = (el) => {
-    if (!el) return;
-    el.classList.toggle('active-mode', loopMode !== 'off');
-    el.classList.toggle('loop-one', loopMode === 'one');
-    el.classList.toggle('loop-all', loopMode === 'all');
-    el.title = loopMode === 'one' ? 'Repeat current song' : (loopMode === 'all' ? 'Repeat all (auto-refresh queue)' : 'Loop off');
-  };
-  apply(document.getElementById('loopBtn'));
-  apply(document.getElementById('fpLoopBtn'));
-  const msg = loopMode === 'one' ? 'Loop: repeat this song' : (loopMode === 'all' ? 'Loop: repeat all' : 'Loop off');
-  showStatusToast(msg, 1800);
-}
-
-// ===== REC TOGGLE =====
-
-function goToQueueUI() {
-  if (fullPlayerOpen) closeFullPlayer();
-  _activateTab('recs', { resetScroll: false });
-  _scheduleRecsFocusCurrent();
-}
-
-function toggleRecUI(on) {
-  engine.setRecToggle(on);
-  const toggle = document.getElementById('recToggle');
-  if (toggle) toggle.checked = on;
-  updateModeIndicator();
-  refreshStateUI();
-  syncUpcomingNativeQueue();
-  showStatusToast(on ? 'AI recommendations on' : 'Shuffle mode', 1500);
-}
 
 // ===== PULL TO REFRESH =====
 
@@ -3301,6 +1892,10 @@ function setupPullToRefresh() {
   // Resolve lazily on every gesture so state still applies after return.
   const getIndicator = () => document.getElementById('pullIndicator');
   const getPullBody = () => document.getElementById('discover-pull-body');
+  // After the scroll-snap rewrite (follow-up #10), `.content` no longer scrolls;
+  // each `.panel` is its own vertical scroll container. Read scroll position
+  // from the Discover panel so the "am I at the top?" gate is meaningful.
+  const getDiscoverScroller = () => document.getElementById('panel-discover');
 
   let startY = 0;
   let pulling = false;
@@ -3368,7 +1963,9 @@ function setupPullToRefresh() {
 
   content.addEventListener('touchstart', (e) => {
     if (activeTab !== 'discover' || refreshing) return;
-    if (content.scrollTop <= 0 && !_isOnSubPage()) {
+    const scroller = getDiscoverScroller();
+    const scrollTop = scroller ? scroller.scrollTop : 0;
+    if (scrollTop <= 0 && !_isOnSubPage()) {
       startY = e.touches[0].clientY;
       pulling = true;
       currentPull = 0;
@@ -3378,7 +1975,9 @@ function setupPullToRefresh() {
   content.addEventListener('touchmove', (e) => {
     if (!pulling || activeTab !== 'discover' || refreshing) return;
     const dy = e.touches[0].clientY - startY;
-    if (dy > 12 && content.scrollTop <= 0) {
+    const scroller = getDiscoverScroller();
+    const scrollTop = scroller ? scroller.scrollTop : 0;
+    if (dy > 12 && scrollTop <= 0) {
       e.preventDefault();
       const eased = Math.min(MAX_PULL, (dy - 12) * 0.80);
       applyPullState(eased);
@@ -3478,7 +2077,6 @@ function queueDiscoverRefresh(reason, opts = {}) {
 function _activateTab(target, opts = {}) {
   const pushHistory = opts.pushHistory === true;
   const resetScroll = opts.resetScroll !== false;
-  const content = document.querySelector('.content');
   const recsListWrap = document.getElementById('recs-list-wrap');
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -3488,21 +2086,35 @@ function _activateTab(target, opts = {}) {
   tabEl.classList.add('active');
   panelEl.classList.add('active');
   activeTab = target;
-  if (content) {
-    content.classList.toggle('content-recs-active', target === 'recs');
-    if (resetScroll && target !== 'recs') content.scrollTop = 0;
+
+  // Scroll the panel-strip horizontally to bring the target panel into view —
+  // BUT only when this _activateTab call originated from a tab-bar click.
+  // When it originated from the IntersectionObserver (after a manual swipe),
+  // `opts.instant === true` is set; the browser is mid-snap to that panel
+  // already and issuing our own `scrollTo` on top would race the snap and
+  // produce the "flick" the user sees.
+  if (target !== 'history' && opts.instant !== true) {
+    _scrollToPanel(target, 'smooth');
+  }
+
+  if (resetScroll && panelEl && target !== 'recs') {
+    panelEl.scrollTop = 0;
   }
   if (recsListWrap && resetScroll && target === 'recs') recsListWrap.scrollTop = 0;
-  document.getElementById('searchBar').style.display =
-    (target === 'songs' || target === 'albums') ? 'block' : 'none';
+  // 2026-05-10 follow-up #12: the standalone .search-bar element no longer
+  // exists; the search input now lives in the top-bar permanently and is
+  // universal across all tabs. Switching tabs clears any active search so
+  // the user sees the destination tab's full content rather than stale
+  // search results.
+  if (typeof _clearSearchInput === 'function') _clearSearchInput();
 
   if (target === 'songs' && _songsDirty) {
     _songsDirty = false;
-    renderSongs(allSongs);
+    renderSongs(_filteredSongs());
   }
   if (target === 'albums' && _albumsDirty) {
     _albumsDirty = false;
-    renderAlbums(allAlbums);
+    renderAlbums(_filteredAlbums());
   }
 
   if (target === 'discover' && _discoverDirty && !_hasDiscoverBackup()) {
@@ -3538,207 +2150,176 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// ===== SEARCH =====
-
-document.getElementById('searchInput').addEventListener('input', (e) => {
-  const q = e.target.value.toLowerCase();
-  const clearBtn = document.getElementById('searchClear');
-  if (clearBtn) clearBtn.style.display = q.length > 0 ? 'flex' : 'none';
-  if (activeTab === 'songs') {
-    renderSongs(allSongs.filter(s =>
-      s.title.toLowerCase().includes(q) ||
-      s.artist.toLowerCase().includes(q) ||
-      s.album.toLowerCase().includes(q)
-    ));
-  } else if (activeTab === 'albums') {
-    renderAlbums(allAlbums.filter(a =>
-      a.name.toLowerCase().includes(q) ||
-      a.artist.toLowerCase().includes(q)
-    ));
+// ===== SWIPE BETWEEN TABS =====
+// Touch-target based: a swipe that starts on a horizontal scroller (Discover
+// section rows, the tab bar itself, anything with overflow-x: auto) lets that
+// element scroll its own content. Anywhere else, a clearly horizontal swipe
+// past the threshold switches tabs left/right.
+//
+// Detection rules:
+//   - Skip if start target is inside .hscroll, .hscroll-wrap, .tabs, an input,
+//     a slider, or any element marked data-no-tab-swipe.
+//   - Commit only when |deltaX| > 60px AND |deltaX| > 2 * |deltaY| AND the
+//     gesture finished within 600ms (avoids slow accidental drags).
+//   - Edges don't wrap: at the first tab a right-swipe is a no-op; at the
+//     last tab a left-swipe is a no-op.
+// 2026-05-10 follow-up #10: scroll-snap takes over from the JS swipe handler.
+// The browser handles the swipe gesture natively at 60fps via
+// `scroll-snap-type: x mandatory` on `#panelStrip`. We only need to:
+//   1. Programmatically scroll the strip when a bottom-tab is tapped
+//      (`_scrollToPanel` below + the call inside `_activateTab`).
+//   2. Detect when the user manually swipes to a new tab so we can update
+//      `activeTab`, the bottom-tab `.active` class, and run the per-tab
+//      arrival logic that used to live inside `_activateTab` (search-bar
+//      visibility, dirty-render flushes, history.pushState).
+// IntersectionObserver does the detection: it fires when a panel becomes
+// >=75% visible inside the strip, which corresponds to the user finishing a
+// swipe and the snap completing.
+const _SCROLL_TAB_ORDER = ['discover', 'songs', 'albums', 'recs', 'browse'];
+function _scrollToPanel(target, behavior) {
+  const strip = document.getElementById('panelStrip');
+  const panelEl = document.getElementById('panel-' + target);
+  if (!strip || !panelEl) return;
+  // No-op if the strip is already at the target position (avoids ripple
+  // when called from the observer right after a manual swipe).
+  if (Math.abs(strip.scrollLeft - panelEl.offsetLeft) < 1) return;
+  // Suppress the IntersectionObserver while the smooth-scroll animation is
+  // in flight — otherwise the intermediate panels passing through the
+  // viewport would each trigger _activateTab → snowball.
+  if (typeof window._suppressPanelObserverFor === 'function') {
+    window._suppressPanelObserverFor(behavior === 'instant' ? 50 : 500);
   }
-});
+  strip.scrollTo({ left: panelEl.offsetLeft, behavior: behavior || 'smooth' });
+}
+(function setupPanelStripObserver() {
+  const strip = document.getElementById('panelStrip');
+  if (!strip) return;
+  if (typeof IntersectionObserver !== 'function') return;
 
-function clearSearch() {
+  // Debounce flag: tab clicks call `_scrollToPanel` which animates the strip.
+  // During that animation the observer would fire mid-flight; we don't want
+  // intermediate panels triggering `activeTab` updates.
+  let suppressUntil = 0;
+  function _suppressObserverFor(ms) { suppressUntil = Date.now() + ms; }
+  // Make this hookable so `_activateTab` can suppress before each programmatic scroll.
+  window._suppressPanelObserverFor = _suppressObserverFor;
+
+  const observer = new IntersectionObserver((entries) => {
+    if (Date.now() < suppressUntil) return;
+    let bestEntry = null;
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      if (!bestEntry || entry.intersectionRatio > bestEntry.intersectionRatio) {
+        bestEntry = entry;
+      }
+    }
+    if (!bestEntry || bestEntry.intersectionRatio < 0.6) return;
+    const tab = bestEntry.target.dataset && bestEntry.target.dataset.tab;
+    if (!tab || tab === activeTab) return;
+    // The user manually swiped to a new tab. Run the same per-arrival logic
+    // _activateTab does (search-bar toggle, dirty renders, etc.) but DON'T
+    // call _scrollToPanel — they're already there.
+    const shouldPush = tab !== 'discover' && activeTab !== tab;
+    _activateTab(tab, { pushHistory: shouldPush, resetScroll: false, instant: true });
+  }, { root: strip, threshold: [0.6, 0.75, 0.9] });
+
+  strip.querySelectorAll('.panel').forEach(p => observer.observe(p));
+})();
+
+// ===== UNIVERSAL SEARCH =====
+// 2026-05-10 follow-up #12: search now lives in the top bar and is universal
+// across the whole library — not per-tab. Typing shows a results overlay
+// (#searchOverlay) layered over the panel-strip with two sections: matching
+// songs and matching albums. Empty input or X button hides the overlay,
+// revealing whatever tab the user was on. Tab change clears the search too.
+const _SEARCH_RESULT_LIMIT_SONGS = 80;
+const _SEARCH_RESULT_LIMIT_ALBUMS = 40;
+
+function _filterSearch(q) {
+  const songs = allSongs.filter(s =>
+    s.title.toLowerCase().includes(q) ||
+    (s.artist || '').toLowerCase().includes(q) ||
+    (s.album || '').toLowerCase().includes(q)
+  );
+  const albums = allAlbums.filter(a =>
+    a.name.toLowerCase().includes(q) ||
+    (a.artist || '').toLowerCase().includes(q)
+  );
+  return { songs, albums };
+}
+
+function _showSearchOverlay(q) {
+  const overlay = document.getElementById('searchOverlay');
+  const songsTarget = document.getElementById('search-results-songs');
+  const albumsTarget = document.getElementById('search-results-albums');
+  const songsCount = document.getElementById('searchCountSongs');
+  const albumsCount = document.getElementById('searchCountAlbums');
+  const empty = document.getElementById('searchEmpty');
+  if (!overlay || !songsTarget || !albumsTarget) return;
+
+  const { songs, albums } = _filterSearch(q);
+  const songsTrunc = songs.slice(0, _SEARCH_RESULT_LIMIT_SONGS);
+  const albumsTrunc = albums.slice(0, _SEARCH_RESULT_LIMIT_ALBUMS);
+
+  // Reuse the same row/card templates the Songs/Albums tabs use.
+  renderSongs(songsTrunc, { target: songsTarget, sort: true });
+  renderAlbums(albumsTrunc, { target: albumsTarget });
+
+  if (songsCount) songsCount.textContent = songs.length > songsTrunc.length
+    ? `${songsTrunc.length} of ${songs.length}` : `${songs.length}`;
+  if (albumsCount) albumsCount.textContent = albums.length > albumsTrunc.length
+    ? `${albumsTrunc.length} of ${albums.length}` : `${albums.length}`;
+
+  if (empty) empty.style.display = (songs.length === 0 && albums.length === 0) ? 'block' : 'none';
+
+  // Hide whichever section has zero results so we don't show "Songs" with an empty list.
+  songsTarget.parentElement.style.display = songs.length > 0 ? '' : 'none';
+  albumsTarget.parentElement.style.display = albums.length > 0 ? '' : 'none';
+
+  overlay.style.display = 'block';
+}
+
+function _hideSearchOverlay() {
+  const overlay = document.getElementById('searchOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function _clearSearchInput() {
   const input = document.getElementById('searchInput');
-  input.value = '';
-  input.dispatchEvent(new Event('input'));
+  if (input) input.value = '';
   const clearBtn = document.getElementById('searchClear');
   if (clearBtn) clearBtn.style.display = 'none';
-  input.focus(); // keep keyboard open
+  _hideSearchOverlay();
 }
 
-// ===== RENDER SONGS / ALBUMS =====
-
-function songThumb(s) {
-  const artUrl = getArtUrl(s);
-  const fullSong = _resolveSongForArt(s) || s;
-  const songId = fullSong && fullSong.id != null ? fullSong.id : null;
-  const initial = (fullSong && fullSong.title ? fullSong.title : '?')[0].toUpperCase();
-  const disBadge = s && s.disliked ? '<span class="dislike-badge" title="Disliked">\uD83D\uDC4E</span>' : '';
-  if (artUrl) {
-    const onerr = songId != null ? _artOnErrorAttr(songId, initial, 'song-thumb-letter') : '';
-    return `<div class="song-thumb">${disBadge}<img src="${artUrl}" decoding="async" alt="" ${onerr}></div>`;
+document.getElementById('searchInput').addEventListener('input', (e) => {
+  const raw = e.target.value || '';
+  const q = raw.toLowerCase().trim();
+  const clearBtn = document.getElementById('searchClear');
+  if (clearBtn) clearBtn.style.display = raw.length > 0 ? 'flex' : 'none';
+  if (q.length === 0) {
+    _hideSearchOverlay();
+    return;
   }
-  return `<div class="song-thumb song-thumb-letter">${disBadge}${esc(initial)}</div>`;
-}
+  _showSearchOverlay(q);
+});
 
-function renderSongs(list) {
-  const sorted = [...list].sort((a, b) => a.title.localeCompare(b.title));
-  document.getElementById('panel-songs').innerHTML = sorted.map((s, i) => {
-    const redDot = !s.hasEmbedding ? '<span class="red-dot-inline"></span>' : '';
-    const isPlay = (currentSong === s.id && nativeAudioPlaying);
-    const eq = isPlay ? '<div class="playing-eq song-eq"><span></span><span></span><span></span></div>' : '';
-    return `<div class="song-item ${isPlay ? 'playing' : ''}" onclick="window._app.playSong(${s.id})">
-      ${songThumb(s)}${eq}
-      <div class="song-info">
-        <div class="song-title">${redDot}${esc(s.title)}</div>
-        <div class="song-artist">${esc(s.artist)} \u00b7 ${esc(s.album)}</div>
-      </div>
-      <div class="song-menu-btn" onclick="event.stopPropagation(); window._app.showSongMenu(${s.id}, this)">&#8942;</div>
-    </div>`;
-  }).join('');
-}
-
-function renderAlbums(list) {
-  document.getElementById('panel-albums').innerHTML = list.map(a => {
-    const trackIds = JSON.stringify(a.tracks.map(t => t.id));
-    const artTrack = a.tracks.find(t => {
-      const full = engine.getSongs()[t.id];
-      return full && full.filePath;
+// `clearSearch` is the API the X-button onclick + the existing app-browse-render
+// `clearSearch()` helper both call. Override the imported one's effect by
+// also closing the overlay (the overlay didn't exist when that helper was written).
+window.addEventListener('DOMContentLoaded', () => {
+  const clearBtn = document.getElementById('searchClear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      _clearSearchInput();
+      const input = document.getElementById('searchInput');
+      if (input) input.blur();
     });
-    const albumArtUrl = artTrack ? getArtUrl(engine.getSongs()[artTrack.id]) : null;
-    const albumArtContent = albumArtUrl
-      ? `<img src="${albumArtUrl}" class="album-art-img" decoding="async" alt="" ${artTrack ? _artOnErrorAttr(artTrack.id, a.name.charAt(0), '') : ''}>`
-      : esc(a.name.charAt(0));
-    return `<div class="album-item">
-      <div class="album-header" onclick="window._app.toggleAlbum(this)">
-        <div class="album-art">${albumArtContent}</div>
-        <div class="album-info">
-          <div class="album-name">${esc(a.name)}</div>
-          <div class="album-meta">${esc(a.artist)} \u00b7 ${a.count} songs</div>
-        </div>
-        <div class="album-chevron">&#9654;</div>
-      </div>
-      <div class="album-tracks" data-track-ids='${trackIds}'>
-        ${a.tracks.map((t, j) => {
-          const trackSong = engine.getSongs()[t.id];
-          return `
-          <div class="song-item ${(currentSong === t.id && nativeAudioPlaying) ? 'playing' : ''}" onclick="window._app.playFromAlbum(${t.id}, ${esc(trackIds)})">
-            ${trackSong ? songThumb(trackSong) : `<div class="song-thumb song-thumb-letter">${esc(t.title[0])}</div>`}
-            <div class="song-info">
-              <div class="song-title">${esc(t.title)}</div>
-              <div class="song-artist">${esc(t.artist)}</div>
-            </div>
-            <div class="song-menu-btn" onclick="event.stopPropagation(); window._app.showSongMenu(${t.id}, this)">&#8942;</div>
-          </div>`;
-        }).join('')}
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function toggleAlbumUI(header) {
-  header.nextElementSibling.classList.toggle('expanded');
-  header.querySelector('.album-chevron').classList.toggle('expanded');
-}
-
-// ===== RENDER RECS / HISTORY =====
-
-function renderRecs(data) {
-  const list = document.getElementById('recs-list');
-  const label = document.getElementById('recs-session-label');
-  if (data.sessionLabel) {
-    label.textContent = data.sessionLabel;
-    label.style.display = 'block';
-  } else {
-    label.style.display = 'none';
   }
+}, { once: true });
 
-  // Sync rec toggle checkbox
-  const toggle = document.getElementById('recToggle');
-  if (toggle) toggle.checked = data.recToggle;
 
-  const timeline = data.timeline && Array.isArray(data.timeline.items) ? data.timeline : { items: [], explicit: false };
-  if ((!timeline.items || timeline.items.length === 0) && (!data.queue || data.queue.length === 0)) {
-    list.innerHTML = '<div class="empty-state">Play a song to get recommendations</div>';
-    return;
-  }
-
-  const allSongsData = engine.getSongs();
-  const rowHtml = (s) => {
-    const full = allSongsData[s.id];
-    const manualBadge = s.manual ? '<span class="queue-manual-badge" title="Added via Play Next">\u25B6</span>' : '';
-    const roleBadge = s.role === 'current'
-      ? '<span class="timeline-badge timeline-badge-current">Now</span>'
-      : (s.role === 'previous'
-          ? `<span class="timeline-badge">${timeline.explicit ? 'Earlier' : 'Played'}</span>`
-          : '');
-    const similarity = s.role === 'upcoming' && parseFloat(s.similarity) > 0
-      ? `<div class="similarity">${Math.round(parseFloat(s.similarity) * 100)}%</div>`
-      : '';
-    const removeBtn = s.role === 'upcoming' && s.queueIndex != null
-      ? `<div class="queue-remove-btn" onclick="event.stopPropagation(); window._app.removeFromQueue(${s.queueIndex})" title="Remove from Up Next">&times;</div>`
-      : '';
-    const rowClass = s.role === 'current' ? 'playing' : '';
-    return `
-    <div class="song-item ${rowClass}" onclick="window._app.playTimelineIndex(${s.timelineIndex})">
-      ${full ? songThumb(full) : `<div class="song-thumb song-thumb-letter">${esc((s.title||'?')[0])}</div>`}
-      <div class="song-info">
-        <div class="song-title">${manualBadge}${esc(s.title)}</div>
-        <div class="song-artist">${esc(s.artist)}</div>
-      </div>
-      ${roleBadge}
-      ${similarity}
-      ${removeBtn}
-      <div class="song-menu-btn" onclick="event.stopPropagation(); window._app.showSongMenu(${s.id}, this)">&#8942;</div>
-    </div>`;
-  };
-
-  const previous = timeline.items.filter(item => item.role === 'previous');
-  const current = timeline.items.find(item => item.role === 'current');
-  const upcoming = timeline.items.filter(item => item.role === 'upcoming');
-  const visiblePrevious = timeline.explicit ? previous : previous.slice(-10);
-  const hiddenPreviousCount = Math.max(0, previous.length - visiblePrevious.length);
-  const prevTitle = timeline.explicit
-    ? 'Earlier In This Order'
-    : (hiddenPreviousCount > 0
-        ? `Previously Played (last ${visiblePrevious.length} of ${previous.length})`
-        : 'Previously Played');
-  const currentHtml = current
-    ? `<div class="timeline-section-title">Now Playing</div>${rowHtml(current)}`
-    : '';
-  const prevHtml = visiblePrevious.length > 0
-    ? `<div class="timeline-section-title">${prevTitle}</div>${visiblePrevious.map(rowHtml).join('')}`
-    : '';
-  const nextHtml = upcoming.length > 0
-    ? `<div class="timeline-section-title">Coming Up</div>${upcoming.map(rowHtml).join('')}`
-    : '';
-
-  list.innerHTML = prevHtml + currentHtml + nextHtml;
-  if (_recsShouldFocusCurrent && activeTab === 'recs') _scheduleRecsFocusCurrent();
-}
-
-function renderHistory(history, historyPos) {
-  const list = document.getElementById('history-list');
-  if (!list) return;
-  if (!history || history.length === 0) {
-    list.innerHTML = '<div class="empty-state">No songs played yet</div>';
-    return;
-  }
-  // Reverse: most recently played at top
-  const reversed = [...history].reverse();
-  const reversedPos = history.length - 1 - historyPos;
-  const allSongsData = engine.getSongs();
-  list.innerHTML = reversed.map((s, i) => {
-    const full = allSongsData[s.id];
-    return `
-    <div class="history-item ${i === reversedPos ? 'current-pos' : ''}" onclick="window._app.playSong(${s.id}, 'manual_history_tab')">
-      ${full ? songThumb(full) : `<div class="song-thumb song-thumb-letter">${esc((s.title||'?')[0])}</div>`}
-      <div class="h-info"><div class="h-title">${esc(s.title)}</div><div class="h-artist">${esc(s.artist)}</div></div>
-      <div class="song-menu-btn" onclick="event.stopPropagation(); window._app.showSongMenu(${s.id}, this)">&#8942;</div>
-    </div>`;
-  }).join('');
-}
 
 // ===== LOAD AND PLAY =====
 
@@ -3783,8 +2364,16 @@ async function loadAndPlay(songInfo, seekToSec) {
         });
         _dbg('loadAndPlay: playAudio OK (no queue)');
       }
-      await MusicBridge.setLoopMode({ mode: loopModeMap[loopMode] || 2 });
-      await _refreshNativePlaybackInstanceId();
+      // Fix I: setLoopMode and _refreshNativePlaybackInstanceId don't gate
+      // audio playback on native side — setQueue/playAudio already triggered
+      // ExoPlayer prepare. Awaiting them sequentially adds ~50-100ms of bridge
+      // round-trip latency between the user's tap and the audio actually
+      // starting. Run them in parallel without blocking; instance id will be
+      // reconciled by the next audioPlayStateChanged event anyway.
+      Promise.all([
+        MusicBridge.setLoopMode({ mode: loopModeMap[loopMode] || 2 }),
+        _refreshNativePlaybackInstanceId(),
+      ]).catch(e => _dbg('loadAndPlay aux err: ' + (e && e.message || e)));
       nativeAudioPlaying = true;
       nativeFileLoaded = true;
       updatePlayIcon(false);
@@ -3802,8 +2391,11 @@ async function loadAndPlay(songInfo, seekToSec) {
             seekTo: requestedSeek,
           });
         }
-        await MusicBridge.setLoopMode({ mode: loopModeMap[loopMode] || 2 });
-        await _refreshNativePlaybackInstanceId();
+        // Fix I: same parallel pattern as the success path above.
+        Promise.all([
+          MusicBridge.setLoopMode({ mode: loopModeMap[loopMode] || 2 }),
+          _refreshNativePlaybackInstanceId(),
+        ]).catch(e => _dbg('loadAndPlay retry aux err: ' + (e && e.message || e)));
         nativeAudioPlaying = true;
         nativeFileLoaded = true;
         updatePlayIcon(false);
@@ -3853,530 +2445,6 @@ async function syncUpcomingNativeQueue() {
   }
 }
 
-// ===== PLAYER CONTROLS =====
-
-async function playSongUI(id, source) {
-  if (!source) source = 'manual_' + activeTab + '_tab';
-  _notePlaybackIntent();
-  // If the tapped song is already the currently playing song, don't restart it.
-  // Open the full player instead so the tap feels intentional.
-  if (id === currentSong && nativeAudioPlaying) {
-    if (!fullPlayerOpen) openFullPlayer();
-    return;
-  }
-  const song = engine.getSongs()[id];
-  logActivity({ category: 'ui', type: 'song_tapped', message: `Tapped "${song ? song.title : id}" from ${source}`, data: { songId: id, source, title: song ? song.title : '' , filename: song ? song.filename : '' }, tags: ['playback', 'ui'], important: true });
-  _dbg('SONG-TAP: id=' + id + ' src=' + source);
-  const frac = getListenFraction();
-  const info = engine.play(id, frac, source);
-  _dbg('SONG-TAP: engine.play → ' + (info ? info.title + ' path=' + !!info.filePath : 'NULL'));
-  if (info) {
-    await loadAndPlay(info);
-    _dbg('SONG-TAP: loadAndPlay done');
-    refreshStateUI();
-  }
-}
-
-async function playFromQueueUI(id) {
-  const frac = getListenFraction();
-  const song = engine.getSongs()[id];
-  logActivity({ category: 'ui', type: 'queue_song_tapped', message: `Tapped queued song "${song ? song.title : id}"`, data: { songId: id, prevFraction: frac, title: song ? song.title : '', filename: song ? song.filename : '' }, tags: ['queue'], important: true });
-  const info = engine.playFromQueue(id, frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-async function playTimelineIndexUI(index) {
-  const st = engine.getState();
-  const item = st.timeline && Array.isArray(st.timeline.items) ? st.timeline.items[index] : null;
-  if (!item) return;
-  if (item.id === currentSong && item.role === 'current' && nativeAudioPlaying) {
-    if (!fullPlayerOpen) openFullPlayer();
-    return;
-  }
-  const frac = getListenFraction();
-  logActivity({
-    category: 'ui',
-    type: 'timeline_song_tapped',
-    message: `Tapped "${item.title}" from Up Next timeline`,
-    data: { songId: item.id, timelineIndex: index, role: item.role, prevFraction: frac },
-    tags: ['queue', 'playback'],
-    important: true,
-  });
-  const info = engine.playFromTimelineIndex(index, frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-async function playFromAlbumUI(id, trackIds) {
-  if (id === currentSong && nativeAudioPlaying) {
-    if (!fullPlayerOpen) openFullPlayer();
-    return;
-  }
-  const frac = getListenFraction();
-  const song = engine.getSongs()[id];
-  logActivity({ category: 'ui', type: 'album_song_tapped', message: `Tapped album song "${song ? song.title : id}"`, data: { songId: id, prevFraction: frac, trackCount: Array.isArray(trackIds) ? trackIds.length : 0, title: song ? song.title : '', filename: song ? song.filename : '' }, tags: ['album', 'playback'], important: true });
-  const info = engine.playFromAlbum(id, trackIds, frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-// Tap-from-section handler. Plays `songId` and replaces Up Next with the rest
-// of the resolved section. If songId is omitted, starts from the section head.
-async function playFromSectionUI(songId, sectionKey) {
-  if (songId === currentSong && nativeAudioPlaying) {
-    if (!fullPlayerOpen) openFullPlayer();
-    return;
-  }
-  let ids = [];
-  let label = '';
-  if (sectionKey === 'forYou') {
-    ids = (_cachedForYou || []).map(s => s.id);
-    label = 'For You';
-  } else if (sectionKey === 'similar') {
-    ids = (_cachedSimilar || []).map(s => s.id);
-    label = 'Most Similar';
-  } else if (sectionKey === 'favorites') {
-    ids = (_cachedFavorites || []).map(s => s.id);
-    label = 'Favorites';
-  } else if (sectionKey === 'viewAll') {
-    ids = (_viewAllItems || []).map(s => s.id);
-    label = getViewAllMeta(_currentViewAllType).title;
-  } else if (typeof sectionKey === 'string' && sectionKey.startsWith('byp:')) {
-    const i = parseInt(sectionKey.slice(4), 10);
-    const sec = (_cachedBecauseYouPlayed || [])[i];
-    if (sec) {
-      ids = (sec.recommendations || []).map(s => s.id);
-      label = `Because you played ${sec.sourceTitle}`;
-    }
-  } else if (typeof sectionKey === 'string' && sectionKey.startsWith('unexp:')) {
-    const secs = _cachedUnexplored || [];
-    const i = parseInt(sectionKey.slice(6), 10);
-    const sec = secs[i];
-    if (sec) {
-      ids = (sec.songs || []).map(s => s.id);
-      label = 'Unexplored Sounds';
-    }
-  }
-  if (!ids || ids.length === 0) {
-    showStatusToast('Nothing to play', 1500);
-    return;
-  }
-  const startId = (songId != null && ids.includes(songId)) ? songId : ids[0];
-  const frac = getListenFraction();
-  const song = engine.getSongs()[startId];
-  logActivity({ category: 'ui', type: 'section_song_tapped', message: `Tapped "${song ? song.title : startId}" from ${sectionKey}`, data: { songId: startId, sectionKey, prevFraction: frac, sectionSize: ids.length, title: song ? song.title : '', filename: song ? song.filename : '' }, tags: ['section', 'playback'], important: true });
-  const info = engine.playFromSection(startId, ids, label, frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-// "Play only" — plays the song without touching Up Next. Wired from the ⋮ menu.
-async function playOnlyUI(songId) {
-  const frac = getListenFraction();
-  const song = engine.getSongs()[songId];
-  logActivity({ category: 'ui', type: 'play_only_pressed', message: `Play only for "${song ? song.title : songId}"`, data: { songId, prevFraction: frac, title: song ? song.title : '', filename: song ? song.filename : '' }, tags: ['playback'], important: true });
-  const info = engine.playOnly(songId, frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-    showStatusToast('Playing only this song (queue kept)', 1800);
-  }
-}
-
-async function togglePauseUI() {
-  try {
-    _notePlaybackIntent();
-    _dbg('PLAY-TAP: playing=' + nativeAudioPlaying + ' loaded=' + nativeFileLoaded + ' cur=' + currentSong + ' quick=' + !!_quickRestoreInfo + ' init=' + _initRestoreComplete);
-
-    if (nativeAudioPlaying) {
-      _dbg('PLAY: pausing');
-      MusicBridge.pauseAudio();
-    } else if (!nativeFileLoaded && currentSong != null) {
-      const songs = engine.getSongs();
-      const song = songs[currentSong];
-      _dbg('PLAY: cold restore song=' + (song ? song.title : 'NULL') + ' path=' + (song ? song.filePath : 'NULL'));
-      if (song && song.filePath) {
-        const seekTo = nativeAudioPos || 0;
-        await loadAndPlay({
-          id: currentSong,
-          title: song.title,
-          artist: song.artist,
-          album: song.album,
-          filename: song.filename,
-          filePath: song.filePath,
-          isFavorite: engine.isFavorite(currentSong),
-        }, seekTo);
-        _dbg('PLAY: cold restore done');
-      } else if (!_initRestoreComplete) {
-        _dbg('PLAY: init not complete yet, waiting');
-        showStatusToast('Loading...', 1000);
-      } else {
-        _dbg('PLAY: song has no filePath!');
-      }
-    } else if (!_initRestoreComplete && _quickRestoreInfo) {
-      _pendingStartupResume = true;
-      _dbg('PLAY: waiting for authoritative restore');
-      showStatusToast('Restoring playback...', 1200);
-    } else if (!nativeFileLoaded && currentSong == null) {
-      _dbg('PLAY: no song and no quickRestore');
-    } else {
-      _dbg('PLAY: resuming');
-      MusicBridge.resumeAudio();
-    }
-  } catch (e) {
-    _dbg('PLAY ERROR: ' + e.message);
-  }
-}
-
-async function nextUI(source) {
-  if (!source) source = 'next_button';
-  if (_shouldBlockRapidNav('next')) {
-    _dbg('NEXT blocked duplicate tap');
-    return;
-  }
-  const frac = getListenFraction();
-  logActivity({ category: 'ui', type: 'next_pressed', message: `Next pressed (${source})`, data: { source, prevFraction: frac }, tags: ['playback'], important: true });
-  if (source === 'next_button') showStatusToast('Dislike skip', 1200);
-  if (nativeFileLoaded) {
-    try {
-      await MusicBridge.nextTrack({ action: 'user_next', prevFraction: frac == null ? -1 : frac });
-      return;
-    } catch (e) {
-      _dbg('NEXT native fallback: ' + e.message);
-    }
-  }
-  const info = engine.nextSong(frac, source);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-async function prevUI(source) {
-  if (_shouldBlockRapidNav('prev')) {
-    _dbg('PREV blocked duplicate tap');
-    return;
-  }
-  const frac = getListenFraction();
-  logActivity({ category: 'ui', type: 'prev_pressed', message: `Previous pressed (${source || 'prev_button'})`, data: { source: source || 'prev_button', prevFraction: frac }, tags: ['playback'], important: true });
-  if (nativeFileLoaded) {
-    try {
-      await MusicBridge.prevTrack({ prevFraction: frac == null ? -1 : frac });
-      return;
-    } catch (e) {
-      _dbg('PREV native fallback: ' + e.message);
-    }
-  }
-  if (nativeAudioPos > 3) {
-    try { MusicBridge.seekAudio({ position: 0 }); } catch (e) { /* ignore */ }
-    return;
-  }
-  const info = engine.prevSong(frac);
-  if (info) {
-    await loadAndPlay(info);
-    refreshStateUI();
-  }
-}
-
-function seekUI(e) {
-  if (e.target.id === 'seekThumb') return;
-  const bar = document.getElementById('progressBar');
-  const rect = bar.getBoundingClientRect();
-  const dur = nativeAudioDur || 0;
-  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-  if (dur > 0) {
-    const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) * dur;
-    try { MusicBridge.seekAudio({ position: pos }); } catch (e) { /* ignore */ }
-    nativeAudioPos = pos;
-    updateProgressUI(nativeAudioPos, nativeAudioDur);
-    persistPlaybackState(true);
-  }
-}
-
-function setupSeekDrag() {
-  const bar = document.getElementById('progressBar');
-  if (!bar) return;
-  let dragging = false;
-
-  function getSeekFraction(e) {
-    const rect = bar.getBoundingClientRect();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  }
-
-  function startDrag(e) {
-    dragging = true;
-    bar.classList.add('seeking');
-    updateDragPosition(e);
-  }
-
-  function updateDragPosition(e) {
-    if (!dragging) return;
-    e.preventDefault();
-    const frac = getSeekFraction(e);
-    document.getElementById('progressFill').style.width = (frac * 100) + '%';
-    document.getElementById('seekThumb').style.left = (frac * 100) + '%';
-  }
-
-  function endDrag(e) {
-    if (!dragging) return;
-    dragging = false;
-    bar.classList.remove('seeking');
-    const frac = getSeekFraction(e.changedTouches ? e.changedTouches[0] : e);
-    const dur = nativeAudioDur || 0;
-    if (dur > 0) {
-      nativeAudioPos = frac * dur;
-      try { MusicBridge.seekAudio({ position: nativeAudioPos }); } catch (ex) { /* ignore */ }
-      updateProgressUI(nativeAudioPos, nativeAudioDur);
-      persistPlaybackState(true);
-    }
-  }
-
-  // Touch events
-  bar.addEventListener('touchstart', (e) => { startDrag(e); }, { passive: false });
-  bar.addEventListener('touchmove', (e) => { updateDragPosition(e); }, { passive: false });
-  bar.addEventListener('touchend', (e) => { endDrag(e); });
-  bar.addEventListener('touchcancel', () => { dragging = false; bar.classList.remove('seeking'); });
-
-  // Mouse events (fallback)
-  bar.addEventListener('mousedown', (e) => { startDrag(e); });
-  document.addEventListener('mousemove', (e) => { updateDragPosition(e); });
-  document.addEventListener('mouseup', (e) => { if (dragging) endDrag(e); });
-
-  // Click on track (not thumb) to seek directly
-  bar.addEventListener('click', (e) => { seekUI(e); });
-}
-
-// ===== FULL-SCREEN PLAYER =====
-
-let fullPlayerOpen = false;
-
-function getArtUrl(song, opts = {}) {
-  const resolved = _resolveSongForArt(song);
-  if (!resolved) return null;
-  if (!resolved.artPath) {
-    if (opts.prime !== false) _enqueueSongArt(resolved, { priority: !!opts.priority });
-    return null;
-  }
-  try { return window.Capacitor.convertFileSrc('file://' + resolved.artPath); } catch (e) { return null; }
-}
-
-function openFullPlayer() {
-  const fp = document.getElementById('fullPlayer');
-  if (!fp) return;
-  syncFullPlayer();
-  fp.classList.add('open');
-  fullPlayerOpen = true;
-}
-
-function closeFullPlayer() {
-  const fp = document.getElementById('fullPlayer');
-  if (!fp) return;
-  fp.classList.remove('open');
-  fullPlayerOpen = false;
-}
-
-function syncFullPlayer() {
-  if (currentSong == null) return;
-  const songs = engine.getSongs();
-  const song = songs[currentSong];
-  if (!song) return;
-  const syncedSongId = song.id;
-
-  document.getElementById('fpTitle').textContent = song.title;
-  document.getElementById('fpArtist').textContent = song.artist + ' \u00b7 ' + (song.album || '');
-
-  // Art
-  const artUrl = getArtUrl(song, { prime: false });
-  const imgEl = document.getElementById('fpArtImg');
-  const placeholderEl = document.getElementById('fpArtPlaceholder');
-  if (artUrl) {
-    imgEl.src = artUrl;
-    imgEl.style.display = 'block';
-    placeholderEl.style.display = 'none';
-  } else {
-    imgEl.style.display = 'none';
-    placeholderEl.style.display = 'block';
-    placeholderEl.textContent = (song.title || '?')[0].toUpperCase();
-    if (song.filePath) {
-      MusicBridge.getAlbumArtUri({ path: song.filePath }).then((res) => {
-        if (!res || !res.exists || !res.uri || currentSong !== syncedSongId) return;
-        song.artPath = res.uri;
-        syncFullPlayer();
-      }).catch(() => {});
-    }
-  }
-
-  // Mini player art thumbnail
-  const npIcon = document.getElementById('npIcon');
-  if (npIcon) {
-    let thumb = npIcon.querySelector('img');
-    if (artUrl) {
-      if (!thumb) {
-        thumb = document.createElement('img');
-        npIcon.appendChild(thumb);
-      }
-      thumb.src = artUrl;
-      thumb.style.display = 'block';
-    } else if (thumb) {
-      thumb.style.display = 'none';
-    }
-  }
-
-  // Fav state
-  const fpFav = document.getElementById('fpFavBtn');
-  if (fpFav) {
-    fpFav.classList.toggle('is-fav', currentIsFav);
-    fpFav.textContent = currentIsFav ? '\u2665' : '\u2661';
-  }
-
-  // Sync loop/shuffle button states
-  const fpLoop = document.getElementById('fpLoopBtn');
-  if (fpLoop) {
-    fpLoop.classList.toggle('active-mode', loopMode !== 'off');
-    fpLoop.classList.toggle('loop-one', loopMode === 'one');
-    fpLoop.classList.toggle('loop-all', loopMode === 'all');
-  }
-  const fpShuffle = document.getElementById('fpShuffleBtn');
-  if (fpShuffle) fpShuffle.classList.toggle('active-mode', shuffleOn);
-}
-
-function updateFullPlayerProgress(pos, dur) {
-  if (!fullPlayerOpen) return;
-  const pct = dur > 0 ? (pos / dur * 100) : 0;
-  const fill = document.getElementById('fpProgressFill');
-  const thumb = document.getElementById('fpSeekThumb');
-  if (fill) fill.style.width = pct + '%';
-  if (thumb) thumb.style.left = pct + '%';
-  const timeEl = document.getElementById('fpTime');
-  const durEl = document.getElementById('fpDuration');
-  if (timeEl) timeEl.textContent = formatTime(pos);
-  if (durEl) durEl.textContent = formatTime(dur);
-}
-
-function updateFullPlayerPlayIcon(paused) {
-  const icon = document.getElementById('fpPlayIcon');
-  if (icon) {
-    icon.innerHTML = paused
-      ? '<path d="M8 5v14l11-7z"/>'
-      : '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
-  }
-}
-
-// Swipe gesture for full player
-function setupFullPlayerGestures() {
-  const fp = document.getElementById('fullPlayer');
-  const handle = document.getElementById('fpHandle');
-  const npCard = document.getElementById('nowPlaying');
-  if (!fp || !handle) return;
-
-  // Swipe down on handle OR album art to close
-  let startY = 0, currentY = 0, isDragging = false;
-  const swipeTargets = [handle, document.getElementById('fpArt')].filter(Boolean);
-
-  for (const target of swipeTargets) {
-    target.addEventListener('touchstart', (e) => {
-      startY = e.touches[0].clientY;
-      isDragging = true;
-      fp.classList.add('dragging');
-    }, { passive: true });
-
-    target.addEventListener('touchmove', (e) => {
-      if (!isDragging) return;
-      currentY = e.touches[0].clientY;
-      const dy = Math.max(0, currentY - startY);
-      fp.style.transform = `translateY(${dy}px)`;
-    }, { passive: true });
-
-    target.addEventListener('touchend', () => {
-      if (!isDragging) return;
-      isDragging = false;
-      fp.classList.remove('dragging');
-      fp.style.transform = '';
-      const dy = currentY - startY;
-      if (dy > 80) {
-        closeFullPlayer();
-      }
-    });
-  }
-
-  // Swipe up OR tap on mini player to open
-  if (npCard) {
-    let npStartY = 0, npStartX = 0, npDragging = false;
-    npCard.addEventListener('touchstart', (e) => {
-      npStartY = e.touches[0].clientY;
-      npStartX = e.touches[0].clientX;
-      npDragging = true;
-    }, { passive: true });
-
-    npCard.addEventListener('touchend', (e) => {
-      if (!npDragging) return;
-      npDragging = false;
-      const dy = e.changedTouches[0].clientY - npStartY;
-      const dx = e.changedTouches[0].clientX - npStartX;
-      if (dy < -40) {
-        openFullPlayer();
-        return;
-      }
-      // Tap (small movement) on song info area opens full player.
-      // Excludes: any button, the progress bar, control icons.
-      if (Math.abs(dy) < 10 && Math.abs(dx) < 10) {
-        const t = e.target;
-        if (t && t.closest && !t.closest('button') && !t.closest('#progressBar') && !t.closest('svg') && !t.closest('.np-btn')) {
-          openFullPlayer();
-        }
-      }
-    });
-  }
-
-  // Full player seek drag
-  const fpBar = document.getElementById('fpProgressBar');
-  if (fpBar) {
-    let seeking = false;
-    function getFpFrac(e) {
-      const rect = fpBar.getBoundingClientRect();
-      const x = e.touches ? e.touches[0].clientX : e.clientX;
-      return Math.max(0, Math.min(1, (x - rect.left) / rect.width));
-    }
-    fpBar.addEventListener('touchstart', (e) => { seeking = true; e.preventDefault(); }, { passive: false });
-    fpBar.addEventListener('touchmove', (e) => {
-      if (!seeking) return;
-      e.preventDefault();
-      const frac = getFpFrac(e);
-      document.getElementById('fpProgressFill').style.width = (frac * 100) + '%';
-      document.getElementById('fpSeekThumb').style.left = (frac * 100) + '%';
-    }, { passive: false });
-    fpBar.addEventListener('touchend', (e) => {
-      if (!seeking) return;
-      seeking = false;
-      const frac = getFpFrac(e.changedTouches[0]);
-      if (nativeAudioDur > 0) {
-        nativeAudioPos = frac * nativeAudioDur;
-        try { MusicBridge.seekAudio({ position: nativeAudioPos }); } catch (ex) { /* ignore */ }
-        updateProgressUI(nativeAudioPos, nativeAudioDur);
-        persistPlaybackState(true);
-      }
-    });
-    fpBar.addEventListener('click', (e) => {
-      const frac = getFpFrac(e);
-      if (nativeAudioDur > 0) {
-        nativeAudioPos = frac * nativeAudioDur;
-        try { MusicBridge.seekAudio({ position: nativeAudioPos }); } catch (ex) { /* ignore */ }
-        updateProgressUI(nativeAudioPos, nativeAudioDur);
-        persistPlaybackState(true);
-      }
-    });
-  }
-}
 
 async function neutralSkipUI() {
   const frac = getListenFraction();
@@ -4637,12 +2705,6 @@ function refreshStateUI() {
   _saveVisibleDiscoverCacheDebounced();
 }
 
-function formatTime(s) {
-  if (!s || isNaN(s)) return '0:00';
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return m + ':' + (sec < 10 ? '0' : '') + sec;
-}
 
 function esc(str) {
   const d = document.createElement('div');
@@ -4650,415 +2712,6 @@ function esc(str) {
   return d.innerHTML;
 }
 
-function closePlaylistPicker() {
-  const overlay = document.getElementById('playlistPickerOverlay');
-  if (overlay) overlay.remove();
-}
-
-function showPlaylistPicker(songId = null) {
-  closePlaylistPicker();
-
-  const playlists = engine.getPlaylists();
-  const song = songId != null ? engine.getSongs()[songId] : null;
-  const title = song ? 'Add to Playlist' : 'Create Playlist';
-  const subtitle = song ? `<div class="playlist-modal-sub">${esc(song.title)} \u2022 ${esc(song.artist || '')}</div>` : '';
-
-  const existingSection = song
-    ? (playlists.length > 0
-      ? `<div class="playlist-target-list">
-          ${playlists.map(pl => {
-            const already = engine.isSongInPlaylist(pl.id, songId);
-            return `<button class="playlist-target-btn${already ? ' is-added' : ''}" ${already ? 'disabled' : ''} onclick="window._app.addSongToPlaylist('${pl.id}', ${songId})">
-              <span class="playlist-target-name">${esc(pl.name)}</span>
-              <span class="playlist-target-meta">${already ? 'Added' : `${pl.count} songs`}</span>
-            </button>`;
-          }).join('')}
-        </div>`
-      : '<div class="playlist-empty-inline">No playlists yet. Create one below.</div>')
-    : (playlists.length > 0
-      ? `<div class="playlist-existing-list">
-          ${playlists.map(pl => `<button class="playlist-existing-chip" onclick="window._app.openPlaylist('${pl.id}'); window._app.closePlaylistPicker()">${esc(pl.name)}</button>`).join('')}
-        </div>`
-      : '<div class="playlist-empty-inline">No playlists yet. Create your first one below.</div>');
-
-  const overlay = document.createElement('div');
-  overlay.id = 'playlistPickerOverlay';
-  overlay.className = 'sd-overlay';
-  overlay.innerHTML = `
-    <div class="sd-modal playlist-modal" onclick="event.stopPropagation()">
-      <div class="sd-title">${title}</div>
-      ${subtitle}
-      ${song ? '<div class="playlist-modal-section-title">Available playlists</div>' : '<div class="playlist-modal-section-title">Existing playlists</div>'}
-      ${existingSection}
-      <div class="playlist-modal-section-title">${song ? 'Create new playlist' : 'New playlist'}</div>
-      <div class="playlist-create-row">
-        <input id="playlistNameInput" class="playlist-name-input" type="text" maxlength="60" placeholder="Playlist name">
-        <button class="playlist-create-btn" onclick="window._app.createPlaylistFromModal(${songId != null ? songId : 'null'})">Create</button>
-      </div>
-      <button class="sd-close" onclick="window._app.closePlaylistPicker()">Close</button>
-    </div>`;
-  overlay.addEventListener('click', closePlaylistPicker);
-  document.body.appendChild(overlay);
-
-  const input = document.getElementById('playlistNameInput');
-  if (input) {
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        createPlaylistFromModal(songId);
-      }
-    });
-    setTimeout(() => input.focus(), 40);
-  }
-}
-
-function createPlaylistFromModal(initialSongId = null) {
-  const input = document.getElementById('playlistNameInput');
-  const name = input ? input.value.trim() : '';
-  const res = engine.createPlaylist(name, initialSongId != null ? Number(initialSongId) : null);
-  if (!res || !res.ok) {
-    showStatusToast(res && res.error ? res.error : 'Could not create playlist', 2000);
-    return;
-  }
-  closePlaylistPicker();
-  refreshPlaylistViews();
-  if (initialSongId != null) {
-    showStatusToast(`Added to new playlist "${res.playlist.name}"`, 2000);
-  } else {
-    showStatusToast(`Created playlist "${res.playlist.name}"`, 2000);
-    openPlaylistUI(res.playlist.id);
-  }
-}
-
-function addSongToPlaylistUI(playlistId, songId) {
-  const res = engine.addSongToPlaylist(playlistId, songId);
-  if (!res || !res.ok) {
-    showStatusToast(res && res.error ? res.error : 'Could not add to playlist', 2000);
-    return;
-  }
-  closePlaylistPicker();
-  refreshPlaylistViews();
-  showStatusToast(res.alreadyExists ? 'Song already in playlist' : 'Added to playlist', 1800);
-}
-
-function removeSongFromPlaylistUI(songId, playlistId = _currentPlaylistViewId) {
-  if (!playlistId) return;
-  const res = engine.removeSongFromPlaylist(playlistId, songId);
-  if (!res || !res.ok) {
-    showStatusToast(res && res.error ? res.error : 'Could not remove from playlist', 2000);
-    return;
-  }
-  refreshPlaylistViews();
-  showStatusToast(res.removed ? 'Removed from playlist' : 'Song not in playlist', 1800);
-}
-
-function renamePlaylistUI(playlistId) {
-  const meta = engine.getPlaylistMeta(playlistId);
-  if (!meta) return;
-  const nextName = prompt('Rename playlist', meta.name);
-  if (nextName == null) return;
-  const res = engine.renamePlaylist(playlistId, nextName);
-  if (!res || !res.ok) {
-    showStatusToast(res && res.error ? res.error : 'Could not rename playlist', 2000);
-    return;
-  }
-  refreshPlaylistViews();
-  showStatusToast('Playlist renamed', 1800);
-}
-
-function deletePlaylistUI(playlistId) {
-  const meta = engine.getPlaylistMeta(playlistId);
-  if (!meta) return;
-  const ok = confirm(`Delete playlist "${meta.name}"?\n\nSongs will remain in your library.`);
-  if (!ok) return;
-  const res = engine.deletePlaylist(playlistId);
-  if (!res || !res.ok) {
-    showStatusToast(res && res.error ? res.error : 'Could not delete playlist', 2000);
-    return;
-  }
-  if (_currentPlaylistViewId === playlistId) {
-    closeViewAll();
-  } else {
-    refreshPlaylistViews();
-  }
-  showStatusToast('Playlist deleted', 1800);
-}
-
-// ===== 3-DOT SONG MENU =====
-
-let _activeMenu = null;
-let _activeMenuSongId = null;
-let _activeMenuScrollTarget = null;
-let _activeMenuScrollHandler = null;
-
-function _closeSongMenu() {
-  if (_activeMenu) {
-    _activeMenu.remove();
-    _activeMenu = null;
-  }
-  _activeMenuSongId = null;
-  document.removeEventListener('click', _closeSongMenu);
-  if (_activeMenuScrollTarget && _activeMenuScrollHandler) {
-    _activeMenuScrollTarget.removeEventListener('scroll', _activeMenuScrollHandler, true);
-  }
-  _activeMenuScrollTarget = null;
-  _activeMenuScrollHandler = null;
-}
-
-function showSongMenu(songId, btnEl) {
-  // Toggle: if menu already open for this exact song, just close it
-  if (_activeMenu && _activeMenuSongId === songId) {
-    _closeSongMenu();
-    return;
-  }
-  _closeSongMenu();
-  if (fullPlayerOpen) closeFullPlayer();
-  const songs = engine.getSongs();
-  const song = songs[songId];
-  if (!song) return;
-
-  const isFav = engine.getFavoritesList().some(f => f.id === songId);
-  const favLabel = isFav ? 'Remove from Favorites' : 'Add to Favorites';
-  const isDis = !!song.disliked;
-  const dislikeLabel = isDis ? 'Remove Dislike' : 'Dislike';
-  const hasEmb = !!song.hasEmbedding;
-  const embLabel = hasEmb ? 'Remove Embedding' : 'Re-add Embedding';
-  const currentPlaylistMeta = _currentPlaylistViewId ? engine.getPlaylistMeta(_currentPlaylistViewId) : null;
-  const canRemoveFromCurrentPlaylist = !!(currentPlaylistMeta && engine.isSongInPlaylist(_currentPlaylistViewId, songId));
-
-  const menu = document.createElement('div');
-  menu.className = 'song-popup-menu';
-  menu.innerHTML = `
-    <div class="song-popup-item" data-action="playonly">Play only (keep queue)</div>
-    <div class="song-popup-item" data-action="playnext">Play Next</div>
-    <div class="song-popup-item" data-action="addtoplaylist">Add to Playlist</div>
-    ${canRemoveFromCurrentPlaylist ? `<div class="song-popup-item" data-action="removefromplaylist">Remove from ${esc(currentPlaylistMeta.name)}</div>` : ''}
-    <div class="song-popup-item" data-action="togglefav">${favLabel}</div>
-    <div class="song-popup-item" data-action="toggledislike">${dislikeLabel}</div>
-    <div class="song-popup-item" data-action="viewdetails">View Details</div>
-    <div class="song-popup-item" data-action="viewalbum">View Album</div>
-    <div class="song-popup-item" data-action="toggleemb">${embLabel}</div>
-    <div class="song-popup-item song-popup-item-danger" data-action="deletesong">Delete Song</div>
-  `;
-
-  menu.addEventListener('click', (e) => {
-    const action = e.target.dataset.action;
-    if (!action) return;
-    e.stopPropagation();
-    _closeSongMenu();
-    if (action === 'playonly') {
-      playOnlyUI(songId);
-    } else if (action === 'playnext') {
-      logActivity({ category: 'ui', type: 'play_next_pressed', message: `Play Next pressed for "${song.title}"`, data: { songId }, tags: ['queue'], important: true });
-      engine.playNext(songId);
-      showStatusToast(`"${song.title}" plays next`, 2000);
-      refreshStateUI();
-      syncUpcomingNativeQueue();
-    } else if (action === 'addtoplaylist') {
-      showPlaylistPicker(songId);
-    } else if (action === 'removefromplaylist') {
-      removeSongFromPlaylistUI(songId, _currentPlaylistViewId);
-    } else if (action === 'togglefav') {
-      const r = engine.toggleFavorite(songId);
-      logActivity({ category: 'ui', type: 'favorite_menu_toggled', message: `${isFav ? 'Removed from' : 'Added to'} favorites via menu`, data: { songId, isFavorite: !!(r && r.isFavorite) }, tags: ['favorite'], important: true });
-      const msg = isFav ? 'Removed from favorites'
-        : (r && r.unDisliked ? 'Added to favorites (removed dislike)' : 'Added to favorites');
-      showStatusToast(msg, 1500);
-      refreshStateUI();
-      refreshBrowseCollectionsUI();
-      if (_lastProfile) renderDiscoverTiles(_lastProfile);
-    } else if (action === 'toggledislike') {
-      const r = engine.toggleDislike(songId);
-      logActivity({ category: 'ui', type: 'dislike_menu_toggled', message: `${isDis ? 'Removed dislike from' : 'Disliked'} "${song.title}" via menu`, data: { songId, isDisliked: !!(r && r.isDisliked) }, tags: ['dislike'], important: true });
-      const msg = isDis ? 'Dislike removed'
-        : (r && r.unFavorited ? 'Disliked (removed favorite)' : 'Disliked');
-      showStatusToast(msg, 1500);
-      refreshStateUI();
-      refreshBrowseCollectionsUI();
-      if (_lastProfile) renderDiscoverTiles(_lastProfile);
-    } else if (action === 'viewdetails') {
-      showSongDetailsModal(songId);
-    } else if (action === 'viewalbum') {
-      if (fullPlayerOpen) closeFullPlayer();
-      viewAlbumForSong(songId);
-    } else if (action === 'toggleemb') {
-      logActivity({ category: 'ui', type: hasEmb ? 'embedding_remove_pressed' : 'embedding_readd_pressed', message: `${hasEmb ? 'Remove' : 'Re-add'} embedding for "${song.title}"`, data: { songId }, tags: ['embedding'], important: true });
-      if (hasEmb) {
-        engine.removeSongEmbedding(songId);
-        showStatusToast('Embedding removed', 1500);
-      } else {
-        engine.readdSongEmbedding(songId);
-        showStatusToast('Re-added to embedding queue', 1500);
-      }
-      if (document.querySelector('.emb-detail-page')) showEmbeddingDetail();
-    } else if (action === 'deletesong') {
-      confirmDeleteSong(songId);
-    }
-  });
-
-  // Render offscreen so we can measure before positioning
-  menu.style.visibility = 'hidden';
-  menu.style.left = '0px';
-  menu.style.top = '0px';
-  menu.style.right = 'auto';
-  document.body.appendChild(menu);
-  _activeMenu = menu;
-  _activeMenuSongId = songId;
-
-  // Viewport-aware positioning: right-align menu to button, but clamp to screen.
-  const rect = btnEl.getBoundingClientRect();
-  const mW = menu.offsetWidth || 200;
-  const mH = menu.offsetHeight || 240;
-  const vW = window.innerWidth;
-  const vH = window.innerHeight;
-  const pad = 8;
-  let left = rect.right - mW;
-  if (left < pad) left = pad;
-  if (left + mW > vW - pad) left = vW - mW - pad;
-  let top = rect.bottom + 4;
-  if (top + mH > vH - pad) {
-    const flipped = rect.top - mH - 4;
-    top = flipped >= pad ? flipped : Math.max(pad, vH - mH - pad);
-  }
-  menu.style.left = left + 'px';
-  menu.style.top = top + 'px';
-  menu.style.visibility = 'visible';
-
-  // Close on next click anywhere
-  setTimeout(() => document.addEventListener('click', _closeSongMenu), 0);
-
-  // Close on scroll of any ancestor panel
-  _activeMenuScrollTarget = document;
-  _activeMenuScrollHandler = () => _closeSongMenu();
-  document.addEventListener('scroll', _activeMenuScrollHandler, true);
-}
-
-async function confirmDeleteSong(songId) {
-  const song = engine.getSongs()[songId];
-  if (!song) return;
-  const ok = confirm(`Delete "${song.title}" by ${song.artist}?\n\nThis permanently removes the file from your device. This cannot be undone.`);
-  if (!ok) return;
-  logActivity({ category: 'ui', type: 'delete_song_confirmed', message: `Confirmed delete for "${song.title}"`, data: { songId, wasCurrent: currentSong === songId }, tags: ['library'], important: true });
-
-  // If the song being deleted is currently playing, skip forward first so
-  // the player doesn't try to read a file that's about to disappear.
-  if (currentSong === songId) {
-    try {
-      const nextInfo = engine.nextSong(getListenFraction(), 'delete_song');
-      if (nextInfo) {
-        await loadAndPlay(nextInfo);
-        refreshStateUI();
-      } else {
-        try { MusicBridge.stopPlaybackService(); } catch (e) { /* ignore */ }
-        nativeAudioPlaying = false;
-        nativeFileLoaded = false;
-        updatePlayIcon(true);
-      }
-    } catch (e) { /* ignore */ }
-  }
-
-  try {
-    const result = await engine.deleteSong(songId);
-    if (result && result.ok) {
-      showStatusToast(`Deleted "${song.title}"`, 2000);
-      refreshPlaylistViews();
-      refreshStateUI();
-      _pruneSongFromDiscoverCaches(songId);
-      _rerenderCachedDiscoverViews();
-      _saveVisibleDiscoverCache();
-      // Refresh Songs / Albums panels if they're the visible tab.
-      if (typeof renderSongs === 'function') try { renderSongs(); } catch (e) {}
-      if (typeof renderAlbums === 'function') try { renderAlbums(); } catch (e) {}
-    } else {
-      showStatusToast(`Delete failed: ${result && result.error ? result.error : 'unknown error'}`, 3500);
-    }
-  } catch (e) {
-    showStatusToast(`Delete failed: ${e && e.message ? e.message : e}`, 3500);
-  }
-}
-
-async function showSongDetailsModal(songId) {
-  const song = engine.getSongs()[songId];
-  if (!song) return;
-  const existing = document.getElementById('songDetailsOverlay');
-  if (existing) existing.remove();
-
-  let playCount = 0;
-  let avgListen = null;
-  let lastPlayed = null;
-  try {
-    const stats = await engine.getSongPlayStats(songId);
-    if (stats) {
-      playCount = stats.plays || 0;
-      avgListen = stats.avgFrac;
-      lastPlayed = stats.lastPlayedAt;
-    }
-  } catch (e) {}
-
-  const avgStr = avgListen != null ? Math.round(avgListen * 100) + '%' : '—';
-  const lastStr = lastPlayed ? new Date(lastPlayed).toLocaleDateString() : '—';
-
-  const rows = [
-    ['Title', song.title],
-    ['Artist', song.artist],
-    ['Album', song.album || '—'],
-    ['Format', (song.filePath || '').split('.').pop().toUpperCase() || '—'],
-    ['File path', song.filePath || '—'],
-    ['Content hash', song.contentHash || '—'],
-    ['Embedding', song.hasEmbedding ? 'Yes' : 'No'],
-    ['Start count', playCount > 0 ? String(playCount) : '0'],
-    ['Avg listen', avgStr],
-    ['Last played', lastStr],
-    ['Favorite', engine.getFavoritesList().some(f => f.id === songId) ? 'Yes' : 'No'],
-  ];
-  const rowHtml = rows.map(([k, v]) => `<div class="sd-row"><span class="sd-k">${esc(k)}</span><span class="sd-v">${esc(String(v))}</span></div>`).join('');
-
-  const overlay = document.createElement('div');
-  overlay.id = 'songDetailsOverlay';
-  overlay.className = 'sd-overlay';
-  overlay.innerHTML = `<div class="sd-modal" onclick="event.stopPropagation()">
-    <div class="sd-title">Song Details</div>
-    ${rowHtml}
-    <button class="sd-close" onclick="document.getElementById('songDetailsOverlay').remove()">Close</button>
-  </div>`;
-  overlay.addEventListener('click', () => overlay.remove());
-  document.body.appendChild(overlay);
-}
-
-function viewAlbumForSong(songId) {
-  const songs = engine.getSongs();
-  const song = songs[songId];
-  if (!song) return;
-
-  // Switch to albums tab
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelector('.tab[data-tab="albums"]').classList.add('active');
-  document.getElementById('panel-albums').classList.add('active');
-  activeTab = 'albums';
-  document.getElementById('searchBar').style.display = 'none';
-  // Ensure albums are rendered
-  if (_albumsDirty) { _albumsDirty = false; renderAlbums(allAlbums); }
-  history.pushState({ depth: 1 }, '');
-
-  // Find and expand the album
-  setTimeout(() => {
-    const albumPanel = document.getElementById('panel-albums');
-    const headers = albumPanel.querySelectorAll('.album-header');
-    for (const header of headers) {
-      const nameEl = header.querySelector('.album-name');
-      if (nameEl && nameEl.textContent === song.album) {
-        const tracks = header.nextElementSibling;
-        if (!tracks.classList.contains('expanded')) {
-          tracks.classList.add('expanded');
-          header.querySelector('.album-chevron').classList.add('expanded');
-        }
-        header.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        break;
-      }
-    }
-  }, 100);
-}
 
 // Expose functions for onclick handlers in HTML
 window._app = {
@@ -5107,6 +2760,11 @@ window._app = {
   showEmbeddingDetail,
   setEmbConfirm: _setEmbConfirm,
   retryEmbedding: () => { engine.retryEmbedding(); showEmbeddingDetail(); },
+  // embedPending: kicks off retryEmbedding() which queues every playable song
+  // without an embedding (truly new + previously failed) excluding manually
+  // removed ones. Kept exported under both names for back-compat with any
+  // older references.
+  embedPending: () => { engine.retryEmbedding(); showEmbeddingDetail(); },
   embedNewPending: () => { engine.retryEmbedding(); showEmbeddingDetail(); },
   embedRemovedPending: () => {
     const n = engine.embedRemovedSongsBatch();
@@ -5141,23 +2799,11 @@ window._app = {
   setTasteSignalFilter: setTasteSignalFilterUI,
   setTasteSignalSort: setTasteSignalSortUI,
   tasteSignalMore: showMoreTasteSignalUI,
-  toggleTastePlayback: () => {
-    _tastePlaybackExpanded = !_tastePlaybackExpanded;
-    showTasteWeightsOverlay();
-  },
-  toggleTasteLogs: () => {
-    _tasteLogsExpanded = !_tasteLogsExpanded;
-    showTasteWeightsOverlay();
-  },
-  toggleTasteEngine: () => {
-    _tasteEngineExpanded = !_tasteEngineExpanded;
-    showTasteWeightsOverlay();
-  },
-  tastePlaybackMore: () => {
-    _tastePlaybackVisibleCount = Math.min(TASTE_PLAYBACK_MAX, _tastePlaybackVisibleCount + TASTE_PLAYBACK_PAGE_SIZE);
-    showTasteWeightsOverlay();
-  },
-  tuningInfo: (key) => { _toggleTuningInfoPopup(key); },
+  toggleTastePlayback: () => _tasteUi.toggleTastePlayback(),
+  toggleTasteLogs: () => _tasteUi.toggleTasteLogs(),
+  toggleTasteEngine: () => _tasteUi.toggleTasteEngine(),
+  tastePlaybackMore: () => _tasteUi.tastePlaybackMore(),
+  tuningInfo: (key) => _tasteUi.tuningInfo(key),
   toggleTasteResetInfo: toggleTasteResetInfoUI,
   setTuning: async (key, val) => {
     await engine.setTuning({ [key]: Number(val) });
@@ -5186,41 +2832,6 @@ window._app = {
 // ===== BACK NAVIGATION =====
 // Uses @capacitor/app backButton event for Android back gesture/button
 
-function _switchToDiscover() {
-  _activateTab('discover');
-}
-
-function _isOnSubPage() {
-  if (activeTab === 'discover') {
-    return !!document.querySelector('#panel-discover .emb-detail-page, #panel-discover .taste-weights-page, #panel-discover .viewall-header');
-  }
-  if (activeTab === 'browse') {
-    return !!document.querySelector('#panel-browse .viewall-header');
-  }
-  return false;
-}
-
-function _closeActiveSubPage() {
-  if (document.querySelector('#panel-discover .taste-weights-page')) {
-    closeTasteWeightsOverlay();
-    return true;
-  }
-  if (document.querySelector('#panel-discover .emb-detail-page')) {
-    if (discoverContentBackup && discoverContentBackupPanelId) {
-      closeViewAll();
-    } else {
-      const panel = document.getElementById('panel-discover');
-      if (panel && !_flushQueuedDiscoverRefresh()) renderDiscoverSnapshotFromCache({ fade: false });
-    }
-    return true;
-  }
-  if (document.querySelector('#panel-discover .viewall-header, #panel-browse .viewall-header')) {
-    closeViewAll();
-    return true;
-  }
-  return false;
-}
-
 App.addListener('appStateChange', ({ isActive }) => {
   logActivity({
     category: 'app',
@@ -5236,47 +2847,7 @@ App.addListener('appStateChange', ({ isActive }) => {
 });
 
 App.addListener('backButton', () => {
-  // Close song popup menu first (top-most transient)
-  if (_activeMenu) {
-    _closeSongMenu();
-    return;
-  }
-
-  // Close Song Details modal if open (sd-overlay is a z-index 10001 modal)
-  const sdOverlay = document.getElementById('songDetailsOverlay');
-  if (sdOverlay) {
-    sdOverlay.remove();
-    return;
-  }
-
-  // Close any other ad-hoc modal overlays that use `.modal-overlay` / `.sd-overlay`
-  const genericOverlay = document.querySelector('.sd-overlay, .modal-overlay');
-  if (genericOverlay) {
-    genericOverlay.remove();
-    return;
-  }
-
-  // Close full-screen player if open
-  if (fullPlayerOpen) {
-    closeFullPlayer();
-    return;
-  }
-
-  // Priority 1: close sub-page within discover
-  if (_isOnSubPage() && (activeTab === 'discover' || activeTab === 'browse')) {
-    if (_closeActiveSubPage()) return;
-    return;
-  }
-
-  // Priority 2: return to discover from another tab
-  if (activeTab !== 'discover') {
-    _switchToDiscover();
-    return;
-  }
-
-  // On discover main with no sub-page — minimize instead of killing
-  // This keeps the WebView alive so reopening is instant
-  App.minimizeApp();
+  _handleBackButton();
 });
 
 init();

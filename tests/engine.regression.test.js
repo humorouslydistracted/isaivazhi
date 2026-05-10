@@ -226,6 +226,27 @@ describe('engine regression coverage', () => {
     expect(insights.session.listenedSongs.map((song) => song.title)).toEqual(['Alpha']);
   });
 
+  it('_runPostBatchMerge dedupes a repeated complete signal so the merge runs once', async () => {
+    const engine = await loadFreshEngine();
+
+    const first = await engine._runPostBatchMerge({ processed: 2, failed: 0 }, 'native_event');
+    const second = await engine._runPostBatchMerge({ processed: 2, failed: 0 }, 'status_fallback');
+
+    expect(first).toMatchObject({ deduped: false });
+    expect(second).toMatchObject({ deduped: true });
+
+    const status = engine.getEmbeddingStatus();
+    expect(status.inProgress).toBe(false);
+    const completeEntries = (status.log || []).filter((entry) => /Embedding complete/.test(entry.message));
+    expect(completeEntries).toHaveLength(1);
+
+    const distinct = await engine._runPostBatchMerge({ processed: 3, failed: 1 }, 'native_event');
+    expect(distinct).toMatchObject({ deduped: false });
+    const status2 = engine.getEmbeddingStatus();
+    const completeEntries2 = (status2.log || []).filter((entry) => /Embedding complete/.test(entry.message));
+    expect(completeEntries2).toHaveLength(2);
+  });
+
   it('restores favorites and dislikes from persisted filename-based storage', async () => {
     const engine = await loadFreshEngine({
       prefSeed: {

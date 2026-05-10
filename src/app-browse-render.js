@@ -29,9 +29,10 @@ export function createBrowseRenderSupport({
     return `<div class="song-thumb song-thumb-letter">${disBadge}${esc(initial)}</div>`;
   }
 
-  function renderSongs(list) {
-    const sorted = [...list].sort((a, b) => a.title.localeCompare(b.title));
-    document.getElementById('panel-songs').innerHTML = sorted.map((s) => {
+  function _songsHtml(list, opts = {}) {
+    const sort = opts.sort !== false;
+    const arr = sort ? [...list].sort((a, b) => a.title.localeCompare(b.title)) : list;
+    return arr.map((s) => {
       const redDot = !s.hasEmbedding ? '<span class="red-dot-inline"></span>' : '';
       const isPlay = (getCurrentSongId() === s.id && isNativeAudioPlaying());
       const eq = isPlay ? '<div class="playing-eq song-eq"><span></span><span></span><span></span></div>' : '';
@@ -46,8 +47,14 @@ export function createBrowseRenderSupport({
     }).join('');
   }
 
-  function renderAlbums(list) {
-    document.getElementById('panel-albums').innerHTML = list.map(a => {
+  function renderSongs(list, opts = {}) {
+    const target = opts.target || document.getElementById('panel-songs');
+    if (!target) return;
+    target.innerHTML = _songsHtml(list, opts);
+  }
+
+  function _albumsHtml(list) {
+    return list.map(a => {
       const trackIds = JSON.stringify(a.tracks.map(t => t.id));
       const songs = getSongsMap();
       const artTrack = a.tracks.find(t => {
@@ -83,6 +90,12 @@ export function createBrowseRenderSupport({
         </div>
       </div>`;
     }).join('');
+  }
+
+  function renderAlbums(list, opts = {}) {
+    const target = opts.target || document.getElementById('panel-albums');
+    if (!target) return;
+    target.innerHTML = _albumsHtml(list);
   }
 
   function toggleAlbumUI(header) {

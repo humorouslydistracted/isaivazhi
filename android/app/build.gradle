@@ -16,6 +16,18 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
              noCompress 'onnx', 'data'  // Prevent AAPT from compressing ONNX model files
         }
+        // NEON SIMD acceleration for similarity search. The library is built per ABI;
+        // we ship arm64-v8a (modern devices), armeabi-v7a (older 32-bit ARM), and
+        // x86/x86_64 (emulators) — matching what onnxruntime-android already pulls in,
+        // so the APK ABI surface doesn't change.
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++14"
+            }
+        }
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86", "x86_64"
+        }
     }
     testOptions {
         unitTests.includeAndroidResources = true
@@ -24,6 +36,12 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
         }
     }
 }

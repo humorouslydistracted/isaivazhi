@@ -110,6 +110,23 @@ class Recommender {
     this.sessionWindow = opts.sessionWindow ?? 12;
     this.currentWeight = opts.currentWeight ?? 0.6;
     this.dim = embeddings.length > 0 ? embeddings[0].length : 0;
+    // Optional WebGPU accelerator. Set via attachGpu(); null means CPU-only.
+    // Async methods (computeClustersAsync) check this and use GPU when available.
+    this._gpu = null;
+  }
+
+  /**
+   * Attach a GpuRecommender for hardware-accelerated similarity. Pass null to
+   * detach. The accelerator must already have setEmbeddings() applied to a
+   * vector set with the same indices as this.embeddings — typically the caller
+   * uploads embeddings to the GPU just before attaching.
+   */
+  attachGpu(gpu) {
+    this._gpu = gpu || null;
+  }
+
+  hasGpu() {
+    return this._gpu != null && typeof this._gpu.isReady === 'function' && this._gpu.isReady();
   }
 
   /**
@@ -321,6 +338,52 @@ class Recommender {
   }
 
   /**
+   * Convert a precomputed similarity array (length = embeddings.length) into
+   * a top-n result identical to _findNearest's output. Used by the GPU path.
+   */
+  _topKFromSims(sims, n) {
+    n = Math.min(n, sims.length);
+    const heap = [];
+    for (let i = 0; i < sims.length; i++) {
+      if (heap.length < n) {
+        heap.push({ idx: i, sim: sims[i] });
+        let c = heap.length - 1;
+        while (c > 0) {
+          const p = (c - 1) >> 1;
+          if (heap[c].sim < heap[p].sim) { [heap[c], heap[p]] = [heap[p], heap[c]]; c = p; }
+          else break;
+        }
+      } else if (sims[i] > heap[0].sim) {
+        heap[0] = { idx: i, sim: sims[i] };
+        let p = 0;
+        while (true) {
+          let smallest = p;
+          const l = 2 * p + 1, r = 2 * p + 2;
+          if (l < n && heap[l].sim < heap[smallest].sim) smallest = l;
+          if (r < n && heap[r].sim < heap[smallest].sim) smallest = r;
+          if (smallest !== p) { [heap[p], heap[smallest]] = [heap[smallest], heap[p]]; p = smallest; }
+          else break;
+        }
+      }
+    }
+    const topIndices = heap.sort((a, b) => b.sim - a.sim).map(h => h.idx);
+    return { sims, topIndices };
+  }
+
+  /**
+   * Async nearest-neighbor search. Uses WebGPU dot-product kernel when
+   * available, otherwise calls the synchronous CPU path. Always succeeds —
+   * GPU failures fall back transparently.
+   */
+  async _findNearestAsync(queryVec, n) {
+    if (this.hasGpu()) {
+      const sims = await this._gpu.computeAllSimilarities(queryVec);
+      if (sims) return this._topKFromSims(sims, n);
+    }
+    return this._findNearest(queryVec, n);
+  }
+
+  /**
    * K-means clustering on normalized embeddings using cosine similarity.
    * @param {number} nClusters
    * @param {number} maxIter
@@ -368,6 +431,73 @@ class Recommender {
         for (let i = 0; i < n; i++) {
           if (labels[i] === j) {
             for (let d = 0; d < this.dim; d++) centroid[d] += this.embeddings[i][d];
+            count++;
+          }
+        }
+        if (count > 0) {
+          for (let d = 0; d < this.dim; d++) centroid[d] /= count;
+          const norm = vecNorm(centroid);
+          if (norm > 0) {
+            for (let d = 0; d < this.dim; d++) centroid[d] /= norm;
+          }
+          centroids[j] = centroid;
+        }
+      }
+    }
+
+    return labels;
+  }
+
+  /**
+   * Async k-means clustering. Uses GPU for the assignment step (the inner
+   * O(n × k × d) loop) when WebGPU is available — typically 5-20× faster on
+   * large libraries. Centroid update remains on CPU since it requires
+   * scattered reads keyed by label and is much cheaper than assignment.
+   *
+   * Falls back to the synchronous CPU computeClusters() if no GPU or if any
+   * GPU dispatch returns null (device lost, dispatch error).
+   */
+  async computeClustersAsync(nClusters = 15, maxIter = 50) {
+    if (!this.hasGpu()) {
+      return this.computeClusters(nClusters, maxIter);
+    }
+
+    const n = this.embeddings.length;
+    if (n < nClusters) return new Int32Array(n);
+
+    const rng = new SeededRNG(42);
+    const initIndices = rng.sample(n, nClusters);
+    const centroids = initIndices.map(i => new Float32Array(this.embeddings[i]));
+
+    let labels = new Int32Array(n);
+
+    for (let iter = 0; iter < maxIter; iter++) {
+      // GPU-accelerated assignment step
+      const newLabels = await this._gpu.kmeansAssign(centroids, nClusters);
+      if (!newLabels) {
+        // GPU dispatch failed — fall back to full CPU computeClusters from
+        // scratch to keep semantics identical.
+        console.warn('[GPU] k-means assignment failed mid-run, falling back to CPU');
+        return this.computeClusters(nClusters, maxIter);
+      }
+
+      // Convergence check
+      let converged = true;
+      for (let i = 0; i < n; i++) {
+        if (labels[i] !== newLabels[i]) { converged = false; break; }
+      }
+      labels = newLabels;
+      if (converged) break;
+
+      // Centroid update — CPU. Cheap relative to assignment (O(n×d) vs O(n×k×d)).
+      for (let j = 0; j < nClusters; j++) {
+        const centroid = new Float32Array(this.dim);
+        let count = 0;
+        for (let i = 0; i < n; i++) {
+          if (labels[i] === j) {
+            const v = this.embeddings[i];
+            if (!v) continue;
+            for (let d = 0; d < this.dim; d++) centroid[d] += v[d];
             count++;
           }
         }

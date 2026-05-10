@@ -15,8 +15,8 @@
     "test:ui:headed": "playwright test --config playwright.config.mjs --headed"
   },
   "keywords": [],
-  "author": "Yuvaraj M P",
-  "license": "MIT",
+  "author": "",
+  "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "@capacitor/android": "^8.3.0",

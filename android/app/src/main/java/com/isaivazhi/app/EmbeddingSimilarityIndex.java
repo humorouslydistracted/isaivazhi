@@ -74,6 +74,24 @@ final class EmbeddingSimilarityIndex {
                 }
             }
 
+            // Compute all similarities in one pass. NativeAccelerator uses ARM NEON
+            // SIMD intrinsics (~3-4× faster than the Java loop on arm64-v8a) and
+            // returns false if the .so isn't loaded or pinning failed — in which case
+            // we fall back to the per-entry Java dot product without any fanfare.
+            float[] sims = new float[entries.length];
+            boolean usedNative = false;
+            if (entries.length > 0 && dim > 0
+                    && NativeAccelerator.isAvailable()
+                    && (long) entries.length * dim == vectors.length) {
+                usedNative = NativeAccelerator.dotProductBatch(
+                        query, vectors, entries.length, dim, sims);
+            }
+            if (!usedNative) {
+                for (int i = 0; i < entries.length; i++) {
+                    sims[i] = dot(query, i);
+                }
+            }
+
             ArrayList<Result> best = new ArrayList<>();
             for (int i = 0; i < entries.length; i++) {
                 Entry entry = entries[i];
@@ -81,8 +99,7 @@ final class EmbeddingSimilarityIndex {
                 if (excludePaths.contains(entry.filepath) || excludeHashes.contains(entry.contentHash)) {
                     continue;
                 }
-                float sim = dot(query, i);
-                insertBest(best, new Result(i, sim), topK);
+                insertBest(best, new Result(i, sims[i]), topK);
             }
 
             ArrayList<Bundle> resultBundles = new ArrayList<>();
