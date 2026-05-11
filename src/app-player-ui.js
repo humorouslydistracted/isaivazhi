@@ -405,12 +405,33 @@ export function createPlayerUiSupport({
 
   async function togglePauseUI() {
     try {
+      const tTap = performance.now();
       notePlaybackIntent();
       dbg('PLAY-TAP: playing=' + getNativeAudioPlaying() + ' loaded=' + getNativeFileLoaded() + ' cur=' + getCurrentSong() + ' quick=' + !!getQuickRestoreInfo() + ' init=' + getInitRestoreComplete());
 
       if (getNativeAudioPlaying()) {
         dbg('PLAY: pausing');
-        MusicBridge.pauseAudio();
+        const tBridge = performance.now();
+        // 2026-05-11 #8: time the bridge call itself separately from the
+        // native ack so we can tell whether the slow first-pause-after-boot
+        // is JS-side queueing or native Media3 prepare-to-pause latency.
+        // MusicBridge.pauseAudio returns a Promise that resolves when the
+        // native call dispatches (NOT when isPlaying flips). The actual
+        // audioPlayStateChanged event fires later and has its own DBG line.
+        try {
+          const ret = MusicBridge.pauseAudio();
+          if (ret && typeof ret.then === 'function') {
+            ret.then(() => {
+              console.log(`[PERF] pauseAudio bridge resolved: ${Math.round(performance.now() - tBridge)} ms (tap+${Math.round(performance.now() - tTap)} ms)`);
+            }).catch(e => {
+              console.log(`[PERF] pauseAudio bridge rejected: ${Math.round(performance.now() - tBridge)} ms — ${e && e.message || e}`);
+            });
+          } else {
+            console.log(`[PERF] pauseAudio bridge returned sync: ${Math.round(performance.now() - tBridge)} ms`);
+          }
+        } catch (e) {
+          console.log(`[PERF] pauseAudio bridge threw: ${Math.round(performance.now() - tBridge)} ms — ${e && e.message || e}`);
+        }
       } else if (!getNativeFileLoaded() && getCurrentSong() != null) {
         const songs = engine.getSongs();
         const song = songs[getCurrentSong()];
@@ -441,7 +462,21 @@ export function createPlayerUiSupport({
         dbg('PLAY: no song and no quickRestore');
       } else {
         dbg('PLAY: resuming');
-        MusicBridge.resumeAudio();
+        const tBridge = performance.now();
+        try {
+          const ret = MusicBridge.resumeAudio();
+          if (ret && typeof ret.then === 'function') {
+            ret.then(() => {
+              console.log(`[PERF] resumeAudio bridge resolved: ${Math.round(performance.now() - tBridge)} ms (tap+${Math.round(performance.now() - tTap)} ms)`);
+            }).catch(e => {
+              console.log(`[PERF] resumeAudio bridge rejected: ${Math.round(performance.now() - tBridge)} ms — ${e && e.message || e}`);
+            });
+          } else {
+            console.log(`[PERF] resumeAudio bridge returned sync: ${Math.round(performance.now() - tBridge)} ms`);
+          }
+        } catch (e) {
+          console.log(`[PERF] resumeAudio bridge threw: ${Math.round(performance.now() - tBridge)} ms — ${e && e.message || e}`);
+        }
       }
     } catch (e) {
       dbg('PLAY ERROR: ' + e.message);
