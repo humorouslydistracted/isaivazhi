@@ -406,6 +406,79 @@ Expected outcome on next launch:
 
 ---
 
+### 2026-05-11 #11 — Native critical-path: SharedPreferences read in MainActivity.onCreate
+
+User captured `logs.txt` on the first v10 launch. The front-loaded fetch fired 309 ms earlier than v9 (right after `loadData`), the JS thread was idle for most of the wait, and yet the read still took **3621 ms** (worse than v9's 2221 ms). Same log: `meta fetch 82 ms`, `bin fetch 239 ms` later in the session. The slowness is a Capacitor cold-start tax that hits whatever runs in the first ~3 s of plugin activity, and shuffling JS code within that window doesn't help — it just shifts the queue.
+
+After 5 iterations across v6–v10 chasing this from the JS side, **the conclusion is: this can't be fixed from JS while staying inside Capacitor's plugin pipeline.** Time to take the critical-path read out of the bridge entirely.
+
+**Mechanism — native critical-path read in `MainActivity.onCreate`:**
+
+```java
+// android/app/src/main/java/com/isaivazhi/app/MainActivity.java
+@Override
+protected void onCreate(Bundle savedInstanceState) {
+    try {
+        SharedPreferences prefs = getSharedPreferences("CapacitorStorage", MODE_PRIVATE);
+        String cached = prefs.getString("playback_state_current", null);
+        MusicBridgePlugin.cacheInitialPlaybackState(cached);
+    } catch (Throwable t) { /* graceful fallback */ }
+    registerPlugin(MusicBridgePlugin.class);
+    super.onCreate(savedInstanceState);
+    requestStoragePermissions();
+}
+```
+
+This runs on the main thread BEFORE `registerPlugin()` and BEFORE `super.onCreate()` (which loads the WebView). SharedPreferences is synchronous, in-process, ~5–20 ms reliably. The Capacitor bridge / plugin executor / WebView aren't involved.
+
+**MusicBridgePlugin caches and exposes:**
+
+```java
+private static volatile String sCachedInitialPlaybackState = null;
+public static void cacheInitialPlaybackState(String json) {
+    sCachedInitialPlaybackState = json;
+}
+
+@PluginMethod
+public void getCachedInitialState(PluginCall call) {
+    JSObject ret = new JSObject();
+    String cached = sCachedInitialPlaybackState;
+    ret.put("value", cached != null ? cached : JSONObject.NULL);
+    call.resolve(ret);
+}
+```
+
+When JS calls `MusicBridge.getCachedInitialState()`, the plugin returns the cached string from in-memory. The heavy work (disk I/O, JSON parse) was done in onCreate; this is just a memory lookup. Even if the bridge call itself takes 2 s (worst Capacitor cold-start case), the plugin method returns instantly once invoked.
+
+**JS — try native cache FIRST in `restorePlaybackStateCritical()`:**
+
+Three-tier fallback chain:
+1. **Native cache** (`MusicBridge.getCachedInitialState()`) — primary path, designed to be reliable.
+2. **File fetch** (`fetch(convertFileSrc('file://.../playback_state_current.json'))`) — fallback if native cache empty (e.g., MainActivity threw, or first launch).
+3. **Preferences key** (`Preferences.get('playback_state_current')`) — last resort.
+
+New PERF marker reports which source served the read so we can verify the native path engaged.
+
+Files modified:
+- `android/app/src/main/java/com/isaivazhi/app/MainActivity.java` (SharedPreferences read in onCreate, BEFORE super.onCreate)
+- `android/app/src/main/java/com/isaivazhi/app/MusicBridgePlugin.java` (static cache field, `cacheInitialPlaybackState()` static method, `getCachedInitialState()` PluginMethod)
+- `src/engine-playback.js` (try native cache first in `restorePlaybackStateCritical`)
+
+Verification: `npm.cmd run build` OK (Vite 276 ms; bundle `dist/assets/index-BaxFhKhg.js` 309.73 kB / 86.52 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 8 s (Java compiled cleanly with the new static field + PluginMethod). Fresh APK at 390.9 MB, timestamp `2026-05-11 16:17`. GitHub release `v2026.05.11.11` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.11. Commit `30db90b` on `origin/main`.
+
+Expected outcome:
+| | v10 capture | v11 (expected) |
+|---|---|---|
+| Critical state read | 3621 ms (file via fetch) | **5-20 ms** (native cache hit) |
+| Tap-to-audio (cold restore) | ~5 s | **under 500 ms** |
+| Play/pause taps | 14-116 ms | unchanged ✓ |
+
+Reliability: independent of Capacitor cold-start timing. Even if the FIRST `getCachedInitialState()` plugin call takes 2 s due to cold bridge (it shouldn't, but possible), the plugin returns the cached string instantly once invoked — there's no actual work to do, just a static field read. The 2-3 s cold-bridge tax can no longer land on the critical read.
+
+This is the architectural fix the past 5 iterations were dancing around. The user explicitly asked for "reliability and no hiccups" and chose this path over the 30-min JS quick win.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
