@@ -479,6 +479,69 @@ This is the architectural fix the past 5 iterations were dancing around. The use
 
 ---
 
+### 2026-05-11 #12 — addJavascriptInterface: truly bridge-free critical state
+
+User captured `logs.txt` on the first v11 launch. The native cache was populated correctly (`MainActivity.onCreate` did its job — payload 488 chars proves it), but the PERF marker showed:
+
+```
+16:30:13.815 [PERF] restorePlaybackStateCritical: native read 4090 ms, payload 488 chars
+```
+
+**4090 ms for a static-field read.** The plugin method body literally does `return sCachedInitialPlaybackState;` — microseconds of work. The 4 seconds is purely the **Capacitor bridge round-trip cost** for the call itself. Same log shows `pauseAudio: 32 ms` later in the session, so the bridge eventually warms up — but during the first ~3 s of init every plugin call pays the tax, regardless of what work it actually does.
+
+After 11 build iterations (#1 through #11), this is the conclusion: **the cold-start tax cannot be fixed by anything that stays inside Capacitor's plugin pipeline**. Not by changing the plugin (#11), not by changing the read order (#10), not by serializing (#9), not by pre-warming (#9), not by file fetching (#7), not by splitting keys (#6). Every variant rode the same bridge cold-start cost.
+
+**The fix — Android's WebView `addJavascriptInterface`**, which is a separate JS bridge that doesn't share Capacitor's plugin executor.
+
+New class `NativeBridgeInterface` with `@JavascriptInterface` annotation:
+```java
+public class NativeBridgeInterface {
+    @JavascriptInterface
+    public String getCachedInitialState() {
+        String cached = MusicBridgePlugin.getCachedInitialPlaybackStateStatic();
+        return cached != null ? cached : "";
+    }
+}
+```
+
+Bound in `MainActivity.onCreate` after `super.onCreate` (which creates the WebView):
+```java
+this.bridge.getWebView().addJavascriptInterface(new NativeBridgeInterface(), "_native");
+```
+
+JS reads it **synchronously** — no Promise, no Capacitor:
+```js
+const s = window._native.getCachedInitialState();
+if (s && typeof s === 'string' && s.length > 0) value = s;
+```
+
+`restorePlaybackStateCritical()` now has a four-tier fallback chain:
+1. `window._native.getCachedInitialState()` — synchronous, bridge-free, ~1 ms expected
+2. `MusicBridge.getCachedInitialState()` — fallback if `_native` missing (e.g., `addJavascriptInterface` failed)
+3. `fetch(convertFileSrc('file://.../playback_state_current.json'))` — file fallback
+4. `Preferences.get('playback_state_current')` — last resort
+
+Files modified / created:
+- `android/app/src/main/java/com/isaivazhi/app/NativeBridgeInterface.java` (NEW)
+- `android/app/src/main/java/com/isaivazhi/app/MainActivity.java` (`addJavascriptInterface` call after super.onCreate)
+- `android/app/src/main/java/com/isaivazhi/app/MusicBridgePlugin.java` (new `getCachedInitialPlaybackStateStatic()` static getter)
+- `src/engine-playback.js` (try `window._native.*` first in `restorePlaybackStateCritical`)
+
+Verification: `npm.cmd run build` OK (Vite 296 ms; bundle `dist/assets/index-vVfwoRMJ.js` 309.95 kB / 86.57 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 5 s (`NativeBridgeInterface` compiled cleanly with the @JavascriptInterface annotation). Fresh APK at 391.1 MB, timestamp `2026-05-11 16:36`. GitHub release `v2026.05.11.12` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.12. Commit `fdcb7bc` on `origin/main`.
+
+Expected outcome:
+| | v11 capture | v12 (expected) |
+|---|---|---|
+| Critical state read | 4090 ms (Capacitor plugin) | **<5 ms** (WebView @JavascriptInterface) |
+| Tap-to-audio (cold restore) | ~6 s | **under 400 ms** |
+| Reliability | Bridge-dependent | Bridge-independent |
+
+New PERF marker `native-sync read Xms` confirms the synchronous path engaged.
+
+If this finally works, the cold-start play-tap latency is structurally fixed. If it doesn't, the bridge isn't the bottleneck and the problem lives elsewhere we haven't measured yet.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
