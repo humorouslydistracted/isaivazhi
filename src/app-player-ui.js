@@ -437,6 +437,18 @@ export function createPlayerUiSupport({
         const song = songs[getCurrentSong()];
         dbg('PLAY: cold restore song=' + (song ? song.title : 'NULL') + ' path=' + (song ? song.filePath : 'NULL'));
         if (song && song.filePath) {
+          // 2026-05-11 #18: ensure state.queue has multiple items before
+          // loadAndPlay builds the Media3 setQueue call. Tier 1 = nextUpFilenames
+          // seed from critical payload; Tier 2 = shuffle from songs[] if seed is
+          // empty / short; Tier 3 = recommender once embeddings are ready.
+          // Without this, items=1 + Media3 loop=ALL triggers the 'first song
+          // plays twice' bug almost immediately on cold restore.
+          try {
+            if (typeof engine.ensureColdStartQueue === 'function') {
+              const r = engine.ensureColdStartQueue(10);
+              dbg('cold restore: ensureColdStartQueue source=' + r.source + ' size=' + r.size);
+            }
+          } catch (e) { dbg('ensureColdStartQueue err: ' + (e && e.message || e)); }
           const seekTo = getNativeAudioPos() || 0;
           await loadAndPlay({
             id: getCurrentSong(),

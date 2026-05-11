@@ -103,6 +103,32 @@ export async function savePlaybackState(currentTimeSec, durationSec) {
     // taking 2233ms for a 10KB payload with bin fetch NOT in flight. Splitting
     // the critical fields off a separate small key bypasses that latency for
     // the play-tap path without changing the rest of the restore semantics.
+    // 2026-05-11 #17: also stash the next 10 upcoming songs in the tiny
+    // critical payload. The cold-restore loadAndPlay branch in togglePauseUI
+    // builds Media3's queue from engine.getNativeQueueSnapshot() — which
+    // iterates state.queue. If state.queue is empty (it is, until the full
+    // restorePlaybackState lands), only the current song is sent. Media3
+    // with items=1 + loop=ALL transitions back to the same song almost
+    // immediately for reasons that aren't reachable from JS, before our
+    // delayed replaceUpcoming can extend the queue. Visible as 'first song
+    // plays twice'. Seeding state.queue from the critical payload lets the
+    // very first setQueue carry 11 items so the auto-advance lands somewhere
+    // useful. This is a bridge for the gap until embeddings come up and
+    // _doRefresh takes over recommendations.
+    const nextUpFilenames = [];
+    for (let i = 0; i < Math.min(10, state.queue.length); i++) {
+      const q = state.queue[i];
+      const s = songs[q.id];
+      if (s && s.filePath) {
+        nextUpFilenames.push({
+          filename: s.filename,
+          filePath: s.filePath,
+          title: s.title || 'Unknown',
+          artist: s.artist || '',
+          album: s.album || '',
+        });
+      }
+    }
     const tinyData = {
       currentFilename: data.currentFilename,
       currentFilePath: data.currentFilePath,
@@ -112,6 +138,7 @@ export async function savePlaybackState(currentTimeSec, durationSec) {
       currentTime: data.currentTime,
       duration: data.duration,
       currentSource: data.currentSource,
+      nextUpFilenames,
     };
     const tinyJson = JSON.stringify(tinyData);
     // 2026-05-11 #7: ALSO write the tiny critical state to a plain JSON file
@@ -302,6 +329,32 @@ export async function restorePlaybackStateCritical() {
     state.currentSource = data.currentSource || 'restored';
     const s = songs[currentId];
     if (!s) return null;
+    // 2026-05-11 #17: seed state.queue from the critical payload's
+    // nextUpFilenames. This makes engine.getNativeQueueSnapshot() (used by
+    // the cold-restore loadAndPlay path) return more than just the current
+    // song. Without this, Media3 receives items=1 and the early auto-loop
+    // bug visible in the captured logs (transitions from current to current
+    // before our delayed replaceUpcoming runs) cannot be prevented because
+    // it happens too fast.
+    let seededCount = 0;
+    if (Array.isArray(data.nextUpFilenames) && data.nextUpFilenames.length > 0) {
+      const seeded = [];
+      for (const entry of data.nextUpFilenames) {
+        const fn = entry && entry.filename;
+        if (!fn) continue;
+        const id = _filenameToId(fn);
+        if (id == null || !songs[id] || !songs[id].filePath) continue;
+        if (id === currentId) continue; // already current
+        seeded.push({ id, similarity: 1.0 });
+      }
+      if (seeded.length > 0) {
+        state.queue = seeded;
+        seededCount = seeded.length;
+      }
+    }
+    if (seededCount > 0) {
+      console.log(`[DBG] restorePlaybackStateCritical: seeded state.queue with ${seededCount} upcoming songs from critical payload`);
+    }
     return {
       id: s.id,
       title: s.title,

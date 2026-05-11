@@ -774,6 +774,35 @@ function _buildShuffleQueue() {
   _syncDynamicTimelineFromState();
 }
 
+/**
+ * 2026-05-11 #17/18: ensure the queue has at least `minSize` items for the
+ * cold-restore loadAndPlay. Captured logs proved Media3 with items=1 +
+ * loop=ALL transitions back to the same song almost immediately, causing
+ * the user-visible "first song plays twice" bug. Pre-populating the queue
+ * prevents the loop because Media3 always has a different "next" to advance
+ * to.
+ *
+ * Tier 1: state.queue was seeded from critical payload's `nextUpFilenames`
+ *         (engine-playback.js restorePlaybackStateCritical). Use as-is.
+ * Tier 2: if too short / empty, build a shuffle from songs[] — works before
+ *         embeddings are ready, since we don't need any vector math.
+ * Tier 3: if embeddings ARE ready, refresh via the proper recommender path.
+ *         Better picks but only available post-embeddings-ready.
+ *
+ * Returns the resulting state.queue length so the caller can log it.
+ */
+export function ensureColdStartQueue(minSize = 10) {
+  if (state.queue && state.queue.length >= minSize) {
+    return { size: state.queue.length, source: 'preseeded' };
+  }
+  if (isEmbeddingsReady() && rec) {
+    _doRefresh('cold_start_ensure');
+    return { size: state.queue.length, source: 'recommender' };
+  }
+  _buildShuffleQueue();
+  return { size: state.queue.length, source: 'shuffle' };
+}
+
 function _doRefresh(reason = 'auto') {
   if (state.timelineMode === 'explicit') {
     _clearTimelineContext();
