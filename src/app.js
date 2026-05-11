@@ -1100,12 +1100,27 @@ async function init() {
     const restored = await engine.restorePlaybackState();
     const pendingListenSnapshot = await engine.loadPendingListenSnapshot();
     _dbg('init: restore done ' + Math.round(performance.now() - _t0) + 'ms, currentSong=' + (restored ? restored.id : 'null') + ', filePath=' + (restored ? !!restored.filePath : 'n/a'));
-    // 2026-05-11 #5: kick off the embedding bin preload NOW — restorePlaybackState
-    // has finished its critical Preferences.get, so the Capacitor native plugin
-    // pool is uncontended for the multi-MB fetch. startBackgroundScan() will
-    // reuse this in-flight promise (or discard if the resolved data dir
-    // doesn't match). Fire-and-forget; failures are silent and harmless.
-    engine.preloadEmbeddingsEarly();
+    // 2026-05-11 #13: defer preloadEmbeddingsEarly even later when a
+    // cold-restore loadAndPlay is in flight. Captured v12 log showed setQueue
+    // taking 3.1s because preloadEmbeddingsEarly's meta fetch (2226ms) plus
+    // full-restore getAudioState/getQueueState bridge calls fought setQueue
+    // for the Capacitor bridge during the cold-start window. By waiting until
+    // after audioPlayStateChanged confirms playback started (via the
+    // setupNativeAudioEvents listener), we keep the bridge clear for setQueue.
+    //
+    // If no cold-restore is in flight (e.g., no quickDisplay, or user didn't
+    // tap), fire preloadEmbeddingsEarly immediately — bridge isn't contended.
+    if (!_pendingStartupResume && !nativeFileLoaded) {
+      engine.preloadEmbeddingsEarly();
+    } else {
+      _dbg('init: preloadEmbeddingsEarly deferred — cold-restore loadAndPlay in flight');
+      // Fire after a small delay; setQueue should complete by then. Worst case
+      // it runs concurrent and slows slightly, but doesn't block the play tap.
+      setTimeout(() => {
+        _dbg('init: preloadEmbeddingsEarly (deferred) firing now');
+        engine.preloadEmbeddingsEarly();
+      }, 2500);
+    }
     if (restored || pendingListenSnapshot) {
       let liveAudioState = null;
       let liveQueueState = null;
@@ -1208,6 +1223,20 @@ async function init() {
             filePath: displaySong.filePath,
             isFavorite: displaySong.isFavorite || false,
           }, restored.currentTime || nativeAudioPos || 0);
+        } else if (nativeFileLoaded) {
+          // 2026-05-11 #13: post-v12 cold-restore fix.
+          // The early-tap path in togglePauseUI fires loadAndPlay with
+          // items=[currentSong] only (queue isn't populated until full restore
+          // lands). When the song ends or user taps Next, Media3 has nothing
+          // else to play and loops back to the same song — captured as the
+          // "first song plays twice / next plays first song" bug. Fix: now
+          // that the full restore has populated engine state's queue/timeline,
+          // push the extended upcoming items to native via replaceUpcoming.
+          // syncUpcomingNativeQueue is the existing helper for this.
+          try {
+            _dbg('init: extending native queue from restored state');
+            await syncUpcomingNativeQueue();
+          } catch (e) { _dbg('init: syncUpcomingNativeQueue err: ' + (e && e.message || e)); }
         }
       }
     }
