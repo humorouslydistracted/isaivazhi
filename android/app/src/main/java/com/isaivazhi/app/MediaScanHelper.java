@@ -68,13 +68,19 @@ final class MediaScanHelper {
                 if (dotIndex > 0) ext = path.substring(dotIndex + 1).toLowerCase();
                 if (!AUDIO_EXTENSIONS.contains(ext)) continue;
 
-                seenPaths.add(path);
-                File parent = new File(path).getParentFile();
-                if (parent != null) scanRoots.add(parent.getAbsolutePath());
-
                 String filename = path;
                 int slashIndex = path.lastIndexOf('/');
                 if (slashIndex >= 0) filename = path.substring(slashIndex + 1);
+
+                // Skip Android-trash and other hidden dotfiles. Android's trash mechanism
+                // renames files in place to `.trashed-<expiration>-<name>.ext`; the
+                // `.pending-<id>-<name>` convention covers in-progress MediaStore writes.
+                // Either is unreadable as a normal song and only pollutes the library.
+                if (filename.startsWith(".")) continue;
+
+                seenPaths.add(path);
+                File parent = new File(path).getParentFile();
+                if (parent != null) scanRoots.add(parent.getAbsolutePath());
 
                 JSObject song = new JSObject();
                 song.put("path", path);
@@ -121,6 +127,12 @@ final class MediaScanHelper {
 
                 String path = file.getAbsolutePath();
                 if (seenPaths.contains(path)) continue;
+
+                // Skip Android-trash and other hidden dotfiles (e.g. `.trashed-*`, `.pending-*`).
+                // MediaStore filters these from its query, but a direct filesystem walk would
+                // pick them up since the OS only renames them in place — leading to garbage
+                // filenames in the library and embed queue.
+                if (file.getName().startsWith(".")) continue;
 
                 String pathLower = path.toLowerCase();
                 if (pathLower.contains("/alarms/") || pathLower.contains("/ringtones/") ||

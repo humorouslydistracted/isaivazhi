@@ -84,10 +84,44 @@ export async function loadFromDisk() {
   return null;
 }
 
+// In-flight tracker so concurrent saveToDisk calls don't race two tmp files
+// into the same final path (e.g., user-triggered remove-unmatched fires its
+// save while a post-batch merge is also calling saveToDisk).
+let _pendingSave = null;
+
+/**
+ * Persist the in-memory embedding object to disk:
+ *   - `local_embeddings.bin` + `local_embeddings_meta.json` (binary store —
+ *     source of truth on subsequent reads)
+ *   - `local_embeddings.json` (legacy JSON mirror — user-facing portable
+ *     format, also the path the Colab / laptop generators write to and the
+ *     fallback import when no binary store exists yet, per AGENTS_1.md +
+ *     git_upload/README.md)
+ *
+ * Both writes are awaited together so callers that need on-disk consistency
+ * (e.g., the post-batch merge) can `await saveToDisk(...)`. Callers that
+ * want UI responsiveness on user-triggered mutations (remove-unmatched,
+ * remove-orphans) should NOT await — they can fire-and-forget with
+ * `EmbeddingCache.saveToDisk(...).catch(...)` and the UI returns instantly
+ * while the encoded payload streams out. Both writes are CPU-cheaper now
+ * thanks to setTimeout yields in the inner _writeBinaryStore / _writeLegacyJson
+ * (see those functions for the yield points).
+ *
+ * Concurrent calls are serialized to avoid the .tmp / _replaceFile race.
+ */
 export async function saveToDisk(embObj) {
   const normalized = _normalizeEmbeddingObject(embObj);
-  await _writeLegacyJson(normalized);
-  await _writeBinaryStore(normalized);
+  const prior = _pendingSave || Promise.resolve();
+  const current = prior.catch(() => {}).then(async () => {
+    await _writeBinaryStore(normalized);
+    await _writeLegacyJson(normalized);
+  });
+  _pendingSave = current;
+  try {
+    await current;
+  } finally {
+    if (_pendingSave === current) _pendingSave = null;
+  }
 }
 
 export async function recoverPendingToStable() {
@@ -254,20 +288,30 @@ async function _writeBinaryStore(embObj) {
     offset += dim;
   }
 
+  // Yield once before the CPU-heavy base64 encode of a multi-MB Float32 buffer.
+  // The encode itself is a sync btoa() call and can't be split, but the yield
+  // lets the renderer paint anything pending (toast updates, page rerenders)
+  // BEFORE we burn 200–500ms on V8 mainloop. Same for JSON.stringify(meta).
+  await new Promise(r => setTimeout(r, 0));
   const base64 = _float32ToBase64(floats);
+
+  await new Promise(r => setTimeout(r, 0));
   const meta = {
     version: 2,
     dim,
     pathIndex: normalized._path_index || {},
     entries,
   };
+  const metaJson = JSON.stringify(meta);
 
   const tmpBin = _path(`${STABLE_BIN}.tmp`);
   const tmpMeta = _path(`${STABLE_META}.tmp`);
 
+  // Yield again before the JSI bridge sends the multi-MB payload over.
+  await new Promise(r => setTimeout(r, 0));
   await Promise.all([
     MusicBridge.writeBinaryFile({ path: tmpBin, data: base64 }),
-    MusicBridge.writeTextFile({ path: tmpMeta, content: JSON.stringify(meta) }),
+    MusicBridge.writeTextFile({ path: tmpMeta, content: metaJson }),
   ]);
 
   await _replaceFile(tmpBin, _path(STABLE_BIN));
@@ -281,6 +325,12 @@ async function _writeLegacyJson(embObj) {
   // Float32Array yields {"0":x,"1":y,...} (an object, not an array), which
   // would silently corrupt the legacy mirror once binary-loaded vectors
   // (Float32Array after fix C) flow through saveToDisk.
+  //
+  // Yield before the conversion loop and again before JSON.stringify. For a
+  // 2500-entry store both steps are CPU-bound on the JS thread and could
+  // together pin the renderer for ~1–2s; the yields let any pending paint
+  // (toast, page rerender) flush between them.
+  await new Promise(r => setTimeout(r, 0));
   const jsonSafe = { _path_index: normalized._path_index || {} };
   for (const [key, data] of Object.entries(normalized)) {
     if (key === '_path_index') continue;
@@ -290,10 +340,13 @@ async function _writeLegacyJson(embObj) {
       embedding: ArrayBuffer.isView(emb) ? Array.from(emb) : emb,
     };
   }
+  await new Promise(r => setTimeout(r, 0));
   const tmpJson = _path(`${LEGACY_JSON}.tmp`);
+  const serialized = JSON.stringify(jsonSafe);
+  await new Promise(r => setTimeout(r, 0));
   await MusicBridge.writeTextFile({
     path: tmpJson,
-    content: JSON.stringify(jsonSafe),
+    content: serialized,
   });
   await _replaceFile(tmpJson, _path(LEGACY_JSON));
   console.log(`Wrote local_embeddings.json mirror: ${_countEmbeddings(normalized)} entries`);

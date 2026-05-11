@@ -96,7 +96,7 @@ import {
   _triggerAutoEmbedding, _setupEmbeddingListeners,
   reembedAll, stopEmbedding, retryEmbedding, embedRemovedSongsBatch,
   _runPostBatchMerge, getEmbeddingStatus,
-  reloadEmbeddingsFromDisk,
+  reloadEmbeddingsFromDisk, resyncEmbeddingState,
   _nativeRecommendFromQueryVec,
 } from './engine-embeddings.js';
 import {
@@ -1793,6 +1793,7 @@ export {
   getEmbeddingStatus,
   _runPostBatchMerge,
   reloadEmbeddingsFromDisk,
+  resyncEmbeddingState,
   retryEmbedding,
   reembedAll,
   stopEmbedding,

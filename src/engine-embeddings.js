@@ -795,11 +795,22 @@ export async function removeUnmatchedEmbeddings() {
 
   localEmbeddings._path_index = pathIndex;
   unmatchedEmbeddings = [];
-  // Await the atomic binary-store rewrite (tmp + rename in embedding-cache.js)
-  // so the next app cold start doesn't re-load the deleted entries.
-  try { await EmbeddingCache.saveToDisk(localEmbeddings); } catch (e) {
+  // 2026-05-11: previously awaited saveToDisk(localEmbeddings). That call does
+  // a multi-MB Float32->base64 encode + JSON.stringify of the legacy mirror on
+  // the JS thread — for a ~2500-entry store the user observed a 1-2 minute UI
+  // freeze. The user-visible removal is already done above (in-memory mutation
+  // + unmatchedEmbeddings=[]). Disk persistence happens in the background:
+  //   - saveToDisk awaits the binary store write (a few hundred ms with B's
+  //     setTimeout yields between phases)
+  //   - kicks off the 10-15MB legacy JSON mirror write as a detached promise
+  //     so it can't block subsequent UI interactions
+  // Atomic tmp+rename in _writeBinaryStore / _writeLegacyJson means a mid-write
+  // app kill cannot corrupt the files. Worst case the removed entries reappear
+  // on next startup (binary store wasn't flushed) and the user re-removes —
+  // idempotent.
+  EmbeddingCache.saveToDisk(localEmbeddings).catch(e => {
     _embLog('error', `Failed to persist unmatched removal: ${e && e.message || e}`);
-  }
+  });
   _activity('embedding', 'embedding_unmatched_removed', `Removed ${removed} unmatched embeddings`, {
     removed,
   }, { important: true, tags: ['embedding', 'cleanup'] });
@@ -1088,6 +1099,9 @@ export function _setupEmbeddingListeners() {
     embeddingTotalCount = Number(data.total) || embeddingTotalCount;
     embeddingProcessedCount = Number(data.processed) || embeddingProcessedCount;
     embeddingReportedFailedCount = Number(data.failed) || embeddingReportedFailedCount;
+    if (data && typeof data.activeBackend === 'string' && data.activeBackend) {
+      _activeBackend = data.activeBackend;
+    }
     if (!embeddingStartTime) embeddingStartTime = Date.now();
     _embLog('progress', `Processing ${data.current}/${data.total}: ${data.filename}`);
   });
@@ -1148,6 +1162,10 @@ export async function reloadEmbeddingsFromDisk() {
 
 // --- Embedding status ---
 
+// Last known ONNX backend reported by :ai (e.g. "nnapi+fp16", "nnapi", "cpu").
+// Populated lazily by resyncEmbeddingState(); '' until first poll.
+let _activeBackend = '';
+
 export function getEmbeddingStatus() {
   const localCount = Object.keys(localEmbeddings).filter(k => k !== '_path_index').length;
   const playable = songs.filter(s => s.filePath);
@@ -1172,7 +1190,44 @@ export function getEmbeddingStatus() {
     orphanCount: orphanedSongs.length,
     failedCount,
     unmatchedEmbeddings,
+    activeBackend: _activeBackend,
   };
+}
+
+/**
+ * Recovery path called from the AI page on (re)open. Lightweight by design:
+ *   - asks native for a fresh MSG_STATUS broadcast, which through
+ *     MusicBridgePlugin.onEmbeddingServiceEvent will either re-emit
+ *     embeddingProgress (active batch) or a synthesized embeddingComplete
+ *     (batch finished but JS missed the original MSG_COMPLETE). The latter
+ *     drives _runPostBatchMerge -> recoverPendingToStable + _loadLocalEmbeddings
+ *     + _mergeLocalEmbeddings, so the disk-truth recovery happens through
+ *     the existing complete-event path rather than a duplicate disk reload.
+ *   - reads the current ONNX backend label so the AI page can show it.
+ *
+ * Earlier revision also did an unconditional reloadEmbeddingsFromDisk() on
+ * every AI page open. That duplicated the load that startBackgroundScan
+ * already performs at startup (~200–500ms x 2) and could also trigger a
+ * heavy recommender rebuild + library save on the JS thread, which the user
+ * felt as a perceptible page-open lag. Removed; the request-status path
+ * covers the active-batch and recently-finished-batch cases. Cold-start
+ * recovery is covered by startBackgroundScan's existing merge step.
+ *
+ * Safe to call repeatedly. Silent on failure — never throws to the UI.
+ */
+export async function resyncEmbeddingState() {
+  try {
+    if (typeof MusicBridge.getEmbeddingBackend === 'function') {
+      const r = await MusicBridge.getEmbeddingBackend();
+      if (r && typeof r.backend === 'string') _activeBackend = r.backend;
+    }
+  } catch (e) { /* ignore */ }
+
+  try {
+    if (typeof MusicBridge.requestEmbeddingStatus === 'function') {
+      await MusicBridge.requestEmbeddingStatus();
+    }
+  } catch (e) { /* ignore */ }
 }
 
 // --- Native similarity search ---

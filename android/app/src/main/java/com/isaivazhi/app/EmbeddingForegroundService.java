@@ -277,6 +277,10 @@ public class EmbeddingForegroundService extends Service {
         data.putInt(EmbeddingCommandContract.KEY_TOTAL, totalSteps);
         data.putInt(EmbeddingCommandContract.KEY_PROCESSED, processedCount);
         data.putInt(EmbeddingCommandContract.KEY_FAILED, failedCount);
+        // Expose active ONNX backend so JS can show "nnapi+fp16 | nnapi | cpu" on the
+        // AI page. Reported as empty until the EmbeddingService session is built.
+        String backend = embeddingService != null ? embeddingService.getActiveBackend() : "";
+        data.putString(EmbeddingCommandContract.KEY_ACTIVE_BACKEND, backend != null ? backend : "");
         return data;
     }
 

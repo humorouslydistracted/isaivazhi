@@ -415,7 +415,15 @@ export async function loadData() {
       const library = await resp.json();
       if (Array.isArray(library.songs)) {
         setLibrarySavedAt(library.savedAt || 0);
-        setSongs(library.songs.map((s, i) => ({
+        // Drop dotfile entries (Android trash `.trashed-*`, `.pending-*`, hidden files).
+        // Older scans could pick these up before the MediaScanHelper dotfile filter
+        // landed; without this filter they'd persist forever in song_library.json.
+        const rawCount = library.songs.length;
+        const cleaned = library.songs.filter(s => s.filename && !String(s.filename).startsWith('.'));
+        if (cleaned.length !== rawCount) {
+          console.log(`[Library] Dropping ${rawCount - cleaned.length} dotfile/trashed entries from saved library`);
+        }
+        setSongs(cleaned.map((s, i) => ({
           id: i,
           filename: s.filename,
           title: s.title || s.filename.replace(/\.[^.]+$/, ''),
@@ -446,7 +454,12 @@ export async function loadData() {
         const library = JSON.parse(result.data);
         if (Array.isArray(library.songs)) {
           setLibrarySavedAt(library.savedAt || 0);
-          setSongs(library.songs.map((s, i) => ({
+          const rawCount = library.songs.length;
+          const cleaned = library.songs.filter(s => s.filename && !String(s.filename).startsWith('.'));
+          if (cleaned.length !== rawCount) {
+            console.log(`[Library] Dropping ${rawCount - cleaned.length} dotfile/trashed entries from saved library`);
+          }
+          setSongs(cleaned.map((s, i) => ({
             id: i,
             filename: s.filename,
             title: s.title || s.filename.replace(/\.[^.]+$/, ''),

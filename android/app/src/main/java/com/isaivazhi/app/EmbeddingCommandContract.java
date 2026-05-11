@@ -38,4 +38,5 @@ final class EmbeddingCommandContract {
     static final String KEY_FAILED = "failed";
     static final String KEY_CONTENT_HASH = "contentHash";
     static final String KEY_ERROR = "error";
+    static final String KEY_ACTIVE_BACKEND = "activeBackend";
 }

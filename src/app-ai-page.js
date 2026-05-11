@@ -31,6 +31,19 @@ export function createAiPageSupport({
       const content = document.querySelector('.content');
       if (content) content.scrollTop = 0;
       _embLogTab = 'common';
+      // 2026-05-11: self-heal JS↔native drift on every fresh entry to the AI
+      // page. resyncEmbeddingState() forces a fresh MSG_STATUS from :ai (so the
+      // bridge re-emits embeddingProgress / synthesized embeddingComplete if
+      // earlier events were lost to a bind-race) AND pulls any pending->stable
+      // embeddings off disk so songs that were successfully embedded silently
+      // flip hasEmbedding=true without waiting for a cold restart. The follow-up
+      // re-render at the next embeddingProgress/embeddingComplete tick (debounced
+      // 120ms in setupEmbeddingUI) shows the recovered state.
+      try {
+        if (typeof engine.resyncEmbeddingState === 'function') {
+          engine.resyncEmbeddingState().catch(() => { /* ignore */ });
+        }
+      } catch (e) { /* ignore */ }
     }
     const _embScrollEl = document.querySelector('.content') || panel;
     const _embScrollState = wasDetailOpen ? {
@@ -71,6 +84,18 @@ export function createAiPageSupport({
 
     const disp = (flag) => flag ? 'block' : 'none';
 
+    // Compact, low-signal-strength chip showing whether ONNX inference is on
+    // the NPU/GPU (NNAPI) or CPU. Empty until the :ai service builds its first
+    // session — resyncEmbeddingState polls for it on every page entry.
+    const backendLabel = st.activeBackend
+      ? (st.activeBackend === 'nnapi+fp16' ? 'NPU / GPU (FP16)'
+        : st.activeBackend === 'nnapi' ? 'NPU / GPU (FP32)'
+        : st.activeBackend === 'cpu' ? 'CPU' : st.activeBackend)
+      : '';
+    const backendChip = backendLabel
+      ? `<div class="emb-backend-chip" title="ONNX execution provider"><span class="emb-backend-label">ONNX backend:</span> ${esc(backendLabel)}</div>`
+      : '';
+
     let statusText = '';
     if (st.inProgress) {
       const done = st.log.filter(e => e.level === 'success').length;
@@ -79,6 +104,7 @@ export function createAiPageSupport({
     } else if (pendingNewSongs.length === 0 && removedSongs.length === 0) {
       statusText = `<div class="emb-status-done"><span class="emb-done">&#10003;</span> All songs have AI embeddings</div>`;
     }
+    statusText = backendChip + statusText;
 
     const unmatchedListHtml = unmatched.length > 0
       ? `<div style="display:${disp(_embDetailExpanded.unmatched)};">

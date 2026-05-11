@@ -39,6 +39,9 @@ public class MusicBridgePlugin extends Plugin {
     private Media3PlaybackControllerClient media3PlaybackClient;
     private volatile boolean lastKnownPlaybackActive = false;
     private volatile boolean embeddingBridgeKnownActive = false;
+    // Most recent ONNX backend label reported by :ai. Surfaced to JS via
+    // getEmbeddingBackend() so the AI page can display "nnapi+fp16 | nnapi | cpu".
+    private volatile String lastKnownActiveBackend = "";
 
     @Override
     public void load() {
@@ -198,6 +201,9 @@ public class MusicBridgePlugin extends Plugin {
         data.put("total", total);
         data.put("processed", processed);
         data.put("failed", failed);
+        if (lastKnownActiveBackend != null && !lastKnownActiveBackend.isEmpty()) {
+            data.put("activeBackend", lastKnownActiveBackend);
+        }
         notifyListeners("embeddingProgress", data);
     }
 
@@ -228,6 +234,12 @@ public class MusicBridgePlugin extends Plugin {
 
     private void onEmbeddingServiceEvent(int what, Bundle data) {
         Bundle safe = data != null ? data : Bundle.EMPTY;
+        // Track the latest backend reported by :ai across every event type. Empty string
+        // means the EmbeddingService session hasn't been built yet.
+        String backend = safe.getString(EmbeddingCommandContract.KEY_ACTIVE_BACKEND, null);
+        if (backend != null && !backend.isEmpty()) {
+            lastKnownActiveBackend = backend;
+        }
         switch (what) {
             case EmbeddingCommandContract.MSG_STATUS: {
                 boolean nowActive = safe.getBoolean(EmbeddingCommandContract.KEY_IN_PROGRESS, false);
@@ -432,22 +444,45 @@ public class MusicBridgePlugin extends Plugin {
                 paths.add(pathsArray.getString(i));
             }
 
-            // Resolve immediately — progress comes via events
-            Intent intent = new Intent(getContext(), EmbeddingForegroundService.class);
-            intent.setAction(EmbeddingForegroundService.ACTION_START);
-            intent.putStringArrayListExtra(EmbeddingForegroundService.EXTRA_PATHS, paths);
-            intent.putExtra(EmbeddingForegroundService.EXTRA_PLAYBACK_ACTIVE, lastKnownPlaybackActive);
+            // Race-fix (2026-05-11): the previous code called startForegroundService()
+            // BEFORE ensureConnected(). Because EmbeddingForegroundService.onStartCommand
+            // immediately begins broadcasting MSG_PROGRESS events to its `clients` list,
+            // and clients are only populated after a successful BIND + MSG_REGISTER_CLIENT
+            // round-trip, the first few progress events (and sometimes ALL of them, if the
+            // bind stalls under process-launch contention) would be lost. With them, JS
+            // never observed `embeddingInProgress=true`, no log lines appeared, and the
+            // batch completed with songs still marked hasEmbedding=false.
+            //
+            // Now: bind FIRST, then start the service from inside onConnected so the
+            // service's `clients` list is guaranteed to contain our Messenger before any
+            // broadcast fires. Falls back to start-without-bind if the controller client
+            // is unavailable (shouldn't happen post-load() but guarded for safety).
+            final ArrayList<String> finalPaths = paths;
             embeddingBridgeKnownActive = true;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                getContext().startForegroundService(intent);
-            } else {
-                getContext().startService(intent);
-            }
+            final Intent intent = new Intent(getContext(), EmbeddingForegroundService.class);
+            intent.setAction(EmbeddingForegroundService.ACTION_START);
+            intent.putStringArrayListExtra(EmbeddingForegroundService.EXTRA_PATHS, finalPaths);
+            intent.putExtra(EmbeddingForegroundService.EXTRA_PLAYBACK_ACTIVE, lastKnownPlaybackActive);
+
+            Runnable startService = () -> {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        getContext().startForegroundService(intent);
+                    } else {
+                        getContext().startService(intent);
+                    }
+                } catch (Throwable t) {
+                    Log.w("MusicBridge", "startForegroundService failed: " + t.getMessage());
+                }
+            };
 
             if (embeddingControllerClient != null) {
                 embeddingControllerClient.ensureConnected(new EmbeddingControllerClient.ConnectionCallback() {
                     @Override
                     public void onConnected() {
+                        // Register-and-start is now ordered: client is already in the
+                        // service's clients list by the time broadcasts begin.
+                        startService.run();
                         embeddingControllerClient.setPlaybackState(
                                 lastKnownPlaybackActive,
                                 lastKnownPlaybackActive ? "embedding_started_during_playback" : "embedding_started",
@@ -458,12 +493,18 @@ public class MusicBridgePlugin extends Plugin {
 
                     @Override
                     public void onError(String message) {
-                        Log.w("MusicBridge", "Embedding controller reconnect failed after start: " + message);
+                        // Bind failed (rare). Fall back to starting the service anyway —
+                        // the JS-side recovery path (requestEmbeddingStatus + post-batch
+                        // re-merge from disk) will catch up state once the service runs.
+                        Log.w("MusicBridge", "Embedding controller bind failed: " + message + " — starting service without bind");
+                        startService.run();
                     }
                 });
+            } else {
+                startService.run();
             }
 
-            call.resolve(new JSObject().put("status", "started").put("count", paths.size()));
+            call.resolve(new JSObject().put("status", "started").put("count", finalPaths.size()));
 
         } catch (Exception e) {
             call.reject("Embedding failed: " + e.getMessage());
@@ -489,6 +530,18 @@ public class MusicBridgePlugin extends Plugin {
                 call.reject(message);
             }
         });
+    }
+
+    /**
+     * Returns the most recently observed ONNX backend label from :ai
+     * ("nnapi+fp16", "nnapi", "cpu", or empty if the session hasn't been built yet).
+     * Used by the AI page to surface whether hardware acceleration is engaged.
+     */
+    @PluginMethod
+    public void getEmbeddingBackend(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("backend", lastKnownActiveBackend != null ? lastKnownActiveBackend : "");
+        call.resolve(ret);
     }
 
     @PluginMethod

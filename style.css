@@ -63,6 +63,8 @@ body {
 
 /* Embedding detail page */
 .emb-detail-page { padding: 12px 14px; }
+.emb-backend-chip { display: inline-block; padding: 4px 10px; margin-bottom: 8px; background: var(--surface2, #1d1d22); color: var(--text2, #aaa); border-radius: 12px; font-size: 11px; }
+.emb-backend-chip .emb-backend-label { color: var(--text3, #888); margin-right: 4px; }
 .emb-stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 16px; }
 .emb-stat { background: var(--surface2); padding: 10px 8px; border-radius: 8px; text-align: center; }
 .emb-stat.clickable { cursor: pointer; } .emb-stat.clickable:active { opacity: 0.7; }
