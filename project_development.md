@@ -95,6 +95,47 @@ File modified: `style.css`. Fresh APK 390.0 MB at `2026-05-11 14:12`. GitHub rel
 
 ---
 
+### 2026-05-11 #4 — Startup-slowdown root cause (state.listened unbounded growth) + DBG dedupe + PERF markers
+
+User-captured `logs.txt` from `v2026.05.11.3` (session starting `14:17:09.697`) showed `restorePlaybackState` taking 3610 ms (vs 372 ms in the 2026-05-11 08:00 baseline) and the parallel `_loadBinaryStore` bin fetch taking 5201 ms (vs 127 ms baseline). The diff between captures wasn't in any code landed across the day's batches — same library size, same embedding count, same merge result (`2474 merged (path:2448, hash:0, fallback:0, pathIndex:26), 0 unmatched`).
+
+**Root cause traced to `state.listened` unbounded growth.** The session play log in `engine-state.js`:
+- Grows by one entry per play/skip (`engine.js:471` `state.listened.push({...})`).
+- Only ever reset by `surprise()` (`engine.js:1574`).
+- Persisted in full to Capacitor Preferences on every `savePlaybackState`.
+
+On a heavy account the persisted JSON reached an estimated 500KB–1MB. `restorePlaybackState` then:
+1. Awaits `Preferences.get('playback_state')` — JSI bridge read of the full string.
+2. `JSON.parse(value)` — proportional to JSON size.
+3. Per-entry `_filenameToId` mapping pass over `data.listenedFilenames` — O(n) with O(1) lookups but n was large.
+
+All on the JS thread, blocking startup. The bin fetch happened to be running concurrently and got starved waiting for thread time. **Both regressions track the same underlying state-size growth.**
+
+The same bloat also explains the user-reported "same songs repeatedly" symptom from #3 — a huge `state.listened` makes `sessionVec` (computed from `state.listened` entries) average the centroid of every song the user has ever played, so recommendations cluster around that centroid. The MMR inversion in #3 was a real fix for one half of the diversity problem; this is the other half.
+
+**Fix A — cap `state.listened` on persist** (`src/engine-playback.js` `savePlaybackState`).
+```js
+listenedFilenames: state.listened.slice(-200).map(entry => {...}),
+```
+In-session memory state is untouched (callers like `_blendWeights` still see the full array for the current session). Only the persisted slice is capped. 200 is well past where `sessionVec` ramp-up saturates per `_blendWeights('refresh', state.listened.length, ...)` (saturates around ~10 entries for the session-bias term, ~30 for the profile term), so first-200-plays behavior is unchanged.
+
+**Fix B — remove duplicate `_appendDbgLine` from `_dbg`** (`src/app.js`). Every line in the captured `logs.txt` appeared twice because `_dbg(msg)` did `console.log('[DBG] ' + msg)` AND `_appendDbgLine('[DBG] ' + msg)`. The console.log hook installed in #3 already mirrors `[DBG]` lines through `_appendDbgLine`, so both paths fired. Removed the direct call.
+
+**Fix C — `[PERF]` markers inside `restorePlaybackState`** (`src/engine-playback.js`). Three new lines:
+- `[PERF] restorePlaybackState: Preferences.get(playback_state) Xms, payload Y chars`
+- `[PERF] restorePlaybackState: JSON.parse Xms, listened=N history=N queue=N timeline=N`
+- `[PERF] restorePlaybackState: filename-mapping passes done Xms total`
+
+So the next regression here is one `logs.txt` capture away from a diagnosis.
+
+Files modified: `src/engine-playback.js`, `src/app.js`.
+
+Verification: `npm.cmd run build` OK (Vite 290 ms; bundle `dist/assets/index-Dll93GrY.js` 306.12 kB / 85.66 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 4 s. Fresh APK at 390.1 MB, timestamp `2026-05-11 14:25`. GitHub release `v2026.05.11.4` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.4. Commit `4880957` on `origin/main`.
+
+Real-device validation expected: second launch after install should show `restorePlaybackState` back near baseline (~300–500 ms — the first launch still reads the pre-cap bloated persist), bin fetch back to ~100–200 ms, mini-player play tap responds within ~400 ms, and Up Next variety widens further (sessionVec no longer averages thousands of historical listens). The new `[PERF] restorePlaybackState` lines should give exact timing for confirmation.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
