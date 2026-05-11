@@ -47,6 +47,45 @@ Note: `embedding_paused` is keyed in Capacitor Preferences. To clear it manually
 
 ---
 
+### 2026-05-11 #3 — Recommendation diversity + reset feedback + paused chip + DBG re-add
+
+User report (paraphrased): (a) per-knob ↺ reset button in Taste Signal feels broken — clicking it doesn't visibly snap the slider; (b) Up Next is "kind of a loop of listened songs with one or 2 new ones, feels concentrated" on a 2.5K-song library; (c) startup feels slower than before; (d) DBG button was removed (it overlapped the hamburger) so no logs are available to diagnose (c).
+
+**Root cause for diversity** (highest-impact finding): `rec.lam` was set as `_tuning.adventurous` at six call sites across `src/engine.js`, `src/engine-data.js`, `src/engine-embeddings.js`. Standard MMR is `score = lam * relevance - (1-lam) * redundancy` — high `lam` ⇒ pure relevance ⇒ clustered picks; low `lam` ⇒ diversity-biased. The UI label "Higher = more diverse" was opposite to what the math produced. The default `adventurous=0.8` therefore drove `lam=0.8` ⇒ 80% relevance + 20% diversity penalty ⇒ tight clustering around the blended query vector, which explains the user-perceived "loop of recently-listened songs" on a 2.5K library.
+
+**Fix 1 — MMR lambda inverted at all six sites:** `rec.lam = 1 - _tuning.adventurous`. Default `adventurous=0.8` now maps to `lam=0.2` (80% diversity penalty). The tuning hint text in `app-taste-ui.js` updated to make the semantic explicit ("engine maps adventurous → 1−lambda so the label matches the math"). Users who liked the previous clustered behaviour can move the slider to `adventurous=0.2` (lam=0.8) to restore it.
+
+**Fix 2 — Reset button snappy feedback.** The ↺ click flow was `await engine.setTuning({key: default})` → `showStatusToast` → `showTasteWeightsOverlay()` — the slider only visually snapped after the async chain (~200–500 ms while `buildProfileVec` reran). Now `resetTuning(key)` in `app.js`:
+1. Looks up the slider via the new `data-tuning-key="${key}"` attribute added to `app-taste-ui.js`.
+2. Sets `slider.value = String(pct)` and `valSpan.textContent = pct + '%'` synchronously.
+3. THEN awaits `engine.setTuning(...)` and re-renders.
+
+User sees instant visual response on tap; the engine state catches up in the background.
+
+**Fix 3 — Auto-embed paused chip.** A new yellow `<div class="emb-paused-chip">` rendered next to the ONNX backend chip in `app-ai-page.js` whenever `engine.getEmbeddingStatus().paused === true`. Previously the `embedding_paused=true` Preferences flag (set by `stopEmbedding()` and persisted across launches) was silent — the only signal was an obscure DBG log line "11 songs without embeddings, but embedding paused by user — use retry to resume". The chip makes the state visible. Auto-cleared by `retryEmbedding()` / `embedRemovedSongsBatch()` / `reembedAll()`.
+
+**Fix 4 — DBG capture re-added.** A small `#debugLogToggle` pill (`24px`, opacity 0.45) positioned `fixed; right: 8px; bottom: 76px;` (above the bottom-bar, clear of the hamburger). Tap to open a full-screen `#debugLogPanel` with Copy Logs + Close. `app.js` re-installs the console.log mirror via `_installDbgConsoleMirror()` — matches lines starting with `[PERF]` / `[Embedding]` / `[FAV]` / `[SCAN]` / `[DBG]` / `[REC]` / `[GPU]` / `[Library]` into the panel. Needed to diagnose the startup-slowdown report without adb access. Toggle/copy/close wired in `_wireDbgPanel()`.
+
+Files modified:
+- `src/engine.js` — Fix 1 (1 site)
+- `src/engine-data.js` — Fix 1 (2 sites)
+- `src/engine-embeddings.js` — Fix 1 (3 sites)
+- `src/app-taste-ui.js` — Fix 1 (tuning hint), Fix 2 (data-tuning-key)
+- `src/app.js` — Fix 2 (snappy reset), Fix 4 (DBG console mirror + panel wiring)
+- `src/app-ai-page.js` — Fix 3 (paused chip)
+- `index.html` — Fix 4 (DBG toggle + panel DOM)
+- `style.css` — Fix 3 (`.emb-paused-chip`), Fix 4 (DBG styling)
+
+Pre-fix safety backup: `backups/diversity_fixes_prework_20260511_160000/`.
+
+Verification this pass: `npm.cmd run build` OK (Vite 288 ms; bundle now `dist/assets/index-DNv1TQmH.js` at 305.57 kB, 85.50 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 5 s (trailing BUILD FAILED is the Gradle metadata-cache lock collision). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.9 MB, timestamp `2026-05-11 13:57`. GitHub release `v2026.05.11.2` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.2.
+
+Real-device validation pending: (1) confirm Up Next picks visibly broaden after install — adventurous default 0.8 now maps to lam=0.2 so similarity to already-selected gets a heavy penalty, the queue should feel less like a "loop of recently played"; (2) tap ↺ on each of the three tuning sliders — the slider thumb and percentage text should snap to the default position immediately, before the toast finishes; (3) AI page should show the yellow "Auto-embed: Paused" chip alongside the ONNX backend chip — tapping "Embed Pending Songs" should clear it; (4) capture fresh `logs.txt` via the bottom-right DBG pill → Copy Logs to diagnose the startup-slowdown report (compare against the 2026-05-11 08:00 baseline log in this repo).
+
+Note: the MMR inversion is a behavioral change with broad reach — every refresh, every "play X" similar-song fetch, every Up Next auto-extend is now diversity-biased by default. If recommendations feel TOO scattered (no thematic coherence), drop adventurous to ~0.3–0.4 which maps to lam=0.6–0.7 (relevance-biased).
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
