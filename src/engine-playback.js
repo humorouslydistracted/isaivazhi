@@ -1,6 +1,7 @@
 import { Preferences } from '@capacitor/preferences';
 import { SessionLogger } from './logger.js';
 import { flushActivityLog } from './activity-log.js';
+import { MusicBridge } from './music-bridge.js';
 
 import {
   PENDING_LISTEN_KEY, SIMILARITY_BOOST_KEY, TASTE_REVIEW_IGNORE_KEY,
@@ -16,6 +17,7 @@ import {
   setFavorites, setNegativeScores, setSimilarityBoostScores,
   setDislikedFilenames, setTasteReviewIgnores, setLastTasteReviewSnapshot,
   setRecentPlaybackSignalEvents, setProfileVec, setRecommendationPolicySnapshot, setLog,
+  EXTERNAL_DATA_DIR,
 } from './engine-state.js';
 import { _getFilenameMap } from './engine-indexes.js';
 import { _copySessionEntry, _activity, _songRef, _ensurePlaybackStartLogged } from './engine-taste.js';
@@ -111,10 +113,26 @@ export async function savePlaybackState(currentTimeSec, durationSec) {
       duration: data.duration,
       currentSource: data.currentSource,
     };
+    const tinyJson = JSON.stringify(tinyData);
+    // 2026-05-11 #7: ALSO write the tiny critical state to a plain JSON file
+    // in the app data dir. The captured logs proved Capacitor's Preferences
+    // plugin is ~2.3s/call regardless of payload size — payload doesn't
+    // matter, the plugin executor itself is slow on this device. Filesystem
+    // writes go through a different native executor and reads via
+    // fetch(convertFileSrc(...)) bypass the plugin entirely (proven fast in
+    // the same logs: Library 250KB / 150ms, bin 5MB / 70-162ms). Cold-start
+    // restorePlaybackStateCritical now reads this file first; falls back to
+    // Preferences if the file is missing (first launch after this change).
+    if (EXTERNAL_DATA_DIR) {
+      MusicBridge.writeTextFile({
+        path: `${EXTERNAL_DATA_DIR}/playback_state_current.json`,
+        content: tinyJson,
+      }).catch(() => { /* ignore — Preferences write below is the durable copy */ });
+    }
     // Write both. The tiny one first so a mid-write app kill leaves us with
     // a consistent (small) snapshot rather than an out-of-sync pair. Atomic
     // SharedPreferences semantics mean each `set` is durable on its own.
-    await Preferences.set({ key: 'playback_state_current', value: JSON.stringify(tinyData) });
+    await Preferences.set({ key: 'playback_state_current', value: tinyJson });
     await Preferences.set({ key: 'playback_state', value: JSON.stringify(data) });
   } catch (e) { /* ignore */ }
 }
@@ -226,13 +244,32 @@ export async function getLastPlayedDisplay() {
 export async function restorePlaybackStateCritical() {
   try {
     const tStart = performance.now();
-    const { value } = await Preferences.get({ key: 'playback_state_current' });
+    // 2026-05-11 #7: try the file fast path first. fetch(convertFileSrc(...))
+    // goes through Capacitor's WebView HTTP server, which is in a different
+    // native pool than the Preferences plugin — proven ~50–200 ms in logs.
+    // Falls back to Preferences if the file is missing.
+    let value = null;
+    let source = 'file';
+    if (EXTERNAL_DATA_DIR && typeof window !== 'undefined' && window.Capacitor && typeof window.Capacitor.convertFileSrc === 'function') {
+      try {
+        const url = window.Capacitor.convertFileSrc('file://' + EXTERNAL_DATA_DIR + '/playback_state_current.json');
+        const resp = await fetch(url);
+        if (resp && resp.ok) {
+          value = await resp.text();
+        }
+      } catch (e) { /* fall through to Preferences */ }
+    }
+    if (!value) {
+      source = 'prefs';
+      const r = await Preferences.get({ key: 'playback_state_current' });
+      value = r && r.value;
+    }
     const tGet = performance.now();
     if (!value) {
-      console.log(`[PERF] restorePlaybackStateCritical: no tiny key (cold path will fall back to full read), ${Math.round(tGet - tStart)} ms`);
+      console.log(`[PERF] restorePlaybackStateCritical: no critical state (cold path will fall back to full read), ${Math.round(tGet - tStart)} ms`);
       return null;
     }
-    console.log(`[PERF] restorePlaybackStateCritical: Preferences.get(playback_state_current) ${Math.round(tGet - tStart)} ms, payload ${value.length} chars`);
+    console.log(`[PERF] restorePlaybackStateCritical: ${source} read ${Math.round(tGet - tStart)} ms, payload ${value.length} chars`);
     const data = JSON.parse(value);
     let currentId = null;
     if (data.currentFilename) currentId = _filenameToId(data.currentFilename);
