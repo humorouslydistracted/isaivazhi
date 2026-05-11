@@ -1,6 +1,6 @@
 # Project Development Log
 
-Last updated: 2026-05-11 (latest #2: embedding-freeze follow-up — after the original four AI page fixes landed and unblocked the IPC chain, the user reported a separate 1–2 minute UI freeze when tapping "Remove N Unmatched Embeddings" plus a perceptible slowdown opening the AI page after launch. Four more fixes landed in this pass: **Fix A** serializes concurrent `EmbeddingCache.saveToDisk` calls through a single `_pendingSave` chain so user-triggered mutations never race the `_replaceFile` step against a post-batch merge; **Fix B** inserts `setTimeout(0)` yields between the CPU-bound phases of `_writeBinaryStore` (Float32→base64 encode, meta JSON.stringify, JSI bridge write) and `_writeLegacyJson` (Array conversion loop, 10–15MB JSON.stringify, bridge write) so the renderer can paint toasts / page rerenders while the multi-MB save runs; **Fix C** strips the unconditional `reloadEmbeddingsFromDisk()` from `resyncEmbeddingState()` (it duplicated the load already done in `startBackgroundScan` and triggered a heavy recommender rebuild on every AI page open); **Fix D** changes `removeUnmatchedEmbeddings` to fire `EmbeddingCache.saveToDisk(...)` as a detached promise with `.catch(...)` instead of awaiting it — the UI handler returns instantly after the in-memory mutation, the disk persist completes in the background under the atomic tmp+rename invariant. **`local_embeddings.json` is intentionally kept** as documented in `AGENTS_1.md` / `CLAUDE_1.md` lines 73/82/210/214/225 ("EmbeddingService is the sole writer", first-class persistence schema, breaking schema changes require migration) and `git_upload/README.md` lines 78–79/119/134 (user-facing portable format consumed by `colab_embedding_generator.py` / `local_embedding_generator.py`). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.7 MB, timestamp `2026-05-11 12:35` (bundle `dist/assets/index-B6ossT9s.js`). Pre-fix safety backup: `backups/embedding_freeze_fixes_prework_20260511_140000/`.)
+Last updated: 2026-05-11 (latest #18: cold-start play-tap is now structurally fixed across 18 batches today. The Capacitor bridge cold-pool tax was bypassed via `MainActivity.onCreate` SharedPreferences read + WebView `addJavascriptInterface` (`window._native.getCachedInitialState()`) — critical state read went from 4090 ms → 1 ms. "First song plays twice" was root-caused by `syncQueueFromNativeSnapshot` wiping `state.queue` with the cold-restore stub then revealed an earlier race where Media3 with items=1 loops within ~1.8 s. Solved by seeding the critical payload with `nextUpFilenames` (top 10) + new `engine.ensureColdStartQueue(minSize=10)` that builds a shuffle bridge until embeddings load, then `_doRefresh` takes over. v18 augments rather than replaces seeded items for previous-session continuity. APK 392.0 MB at `2026-05-11 17:54` / GitHub release v2026.05.11.18 / commit `3845ed3`. Previous: #2: embedding-freeze follow-up — Four more fixes landed in this pass: **Fix A** serializes concurrent `EmbeddingCache.saveToDisk` calls through a single `_pendingSave` chain so user-triggered mutations never race the `_replaceFile` step against a post-batch merge; **Fix B** inserts `setTimeout(0)` yields between the CPU-bound phases of `_writeBinaryStore` (Float32→base64 encode, meta JSON.stringify, JSI bridge write) and `_writeLegacyJson` (Array conversion loop, 10–15MB JSON.stringify, bridge write) so the renderer can paint toasts / page rerenders while the multi-MB save runs; **Fix C** strips the unconditional `reloadEmbeddingsFromDisk()` from `resyncEmbeddingState()` (it duplicated the load already done in `startBackgroundScan` and triggered a heavy recommender rebuild on every AI page open); **Fix D** changes `removeUnmatchedEmbeddings` to fire `EmbeddingCache.saveToDisk(...)` as a detached promise with `.catch(...)` instead of awaiting it — the UI handler returns instantly after the in-memory mutation, the disk persist completes in the background under the atomic tmp+rename invariant. **`local_embeddings.json` is intentionally kept** as documented in `AGENTS_1.md` / `CLAUDE_1.md` lines 73/82/210/214/225 ("EmbeddingService is the sole writer", first-class persistence schema, breaking schema changes require migration) and `git_upload/README.md` lines 78–79/119/134 (user-facing portable format consumed by `colab_embedding_generator.py` / `local_embedding_generator.py`). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.7 MB, timestamp `2026-05-11 12:35` (bundle `dist/assets/index-B6ossT9s.js`). Pre-fix safety backup: `backups/embedding_freeze_fixes_prework_20260511_140000/`.)
 
 ### 2026-05-11 #2 — Embedding save freeze + AI page open slowdown (4 fixes)
 User report after the earlier hardening batch landed: "in ai embedding, it was showing 11 songs in unmatched. when i clicked to remove them. the app literally froze for 1-2 mins and now its working properly. also the loading embedding become slower than before when launching app. i think most of the issue is when there is new songs to be embedded, remove embedding for a song or remove unmatched. not sure they are handled in separate thread or process."
@@ -644,6 +644,160 @@ Verification: `npm.cmd run build` OK (Vite 331 ms; bundle `dist/assets/index-DOl
 Expected on next launch: cold-restore play → first auto-advance (or Next-tap) lands on a DIFFERENT song from the start, even before embeddings ready. Subsequent advances continue through the restored queue normally.
 
 User credit: this whole class of bug ("Fix A pushed a stale queue") was diagnosed entirely from user observation that the bug stopped happening at `embeddingsReady`. The log markers from #13 confirmed the timing match.
+
+---
+
+### 2026-05-11 #15 — End-to-end queue-path diagnostic markers (no behavior change)
+
+After #14 the user re-tested and reported "first song STILL plays twice." I had been guessing too much without seeing the actual data — counts (`items=1`, `queue=48`) couldn't distinguish a duplicate-at-head from genuinely-empty. The user pushed back on the iteration cost: "do you think we need to modify the tech stack" / "have you added enough DBG logs."
+
+Build #15 is **diagnostic-only**, no behavior changes. Adds content (not just count) markers across the queue path so the next captured log can pinpoint where the bug actually lives:
+
+JS side (`src/app.js`, `src/engine-playback.js`):
+- `loadAndPlay: ... firstIds=[a,b,c,d,e]` — first 5 ids of items passed to `setQueue`.
+- `replaceUpcoming: items=N firstIds=[...]` + `replaceUpcoming: OK` — first 5 ids passed to native + ack.
+- `init: post-restore engine snapshot: items=N startIndex=M firstIds=[...]` — what `getNativeQueueSnapshot()` returns immediately after `restorePlaybackState` resolves.
+- `queueChanged: length=N currentIndex=M currentSongId=X nextSongId=Y firstIds=[...]` — NEW JS listener that surfaces Media3's actual internal queue state to the DBG panel.
+
+Java side (`Media3PlaybackService.java`):
+- `setQueue: starting index=N size=M firstIds=[...]` + duration of file.
+- `replaceUpcoming: entry currentIndex=N queueSize=M currentSongId=X incomingSize=K incomingFirstIds=[...]` + `after rebuild` log showing final queue state.
+- `onIsPlayingChanged: state=N mediaIdx=N mediaTotal=N` — Media3's view at the moment isPlaying flipped.
+- `onMediaItemTransition: reason=N newIndex=X currentIndex=Y suppress=...` (reasons: AUTO=0, SEEK=1, PLAYLIST_CHANGED=2, REPEAT=3).
+- `onPlaybackStateChanged: state=N (1=IDLE 2=BUFFERING 3=READY 4=ENDED)` — STATE_ENDED firing unexpectedly would explain a queueCurrentChanged with prevFrac=0.
+- `emitQueueChanged` Bundle now carries `firstIds` / `currentSongId` / `nextSongId` so the JS listener (above) sees what Media3 has WITHOUT requiring `adb logcat`.
+
+Files modified: `src/app.js`, `src/engine-playback.js`, `android/.../Media3PlaybackService.java`.
+
+Verification: web build OK (`dist/assets/index-B-iRLUu1.js`); test:unit 30/31 (pre-existing baseline); cap sync OK; `:app:assembleDebug` BUILD SUCCESSFUL. Fresh APK 391.7 MB at `2026-05-11 17:13`. GitHub release `v2026.05.11.15` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.15. Commit `68a6c40` on `origin/main`.
+
+Honest meta-note added to the release notes: "PERF markers up through #14 covered TIMING well — that's how we caught the 4090 ms native read and the bridge cold-pool issue. But for CONTENT — what's actually in the queue at each step — we had only counts. Counts can't catch a duplicate at the head. When a hypothesis depends on what's in the data, add the content marker first and read the data before proposing a fix."
+
+---
+
+### 2026-05-11 #16 — `syncQueueFromNativeSnapshot` was wiping restored `state.queue` to empty
+
+The v15 diagnostic markers pinned the root cause in one capture:
+```
+17:15:17.448 init: post-restore engine snapshot: items=68 startIndex=20 firstIds=[2047,315,1644,719,1628]
+17:15:19.464 queueChanged: length=1 currentIndex=0 currentSongId=1428 firstIds=[1428]
+17:15:19.886 replaceUpcoming: items=0 firstIds=[]                        ← EMPTY!
+17:15:19.943 queueChanged: length=1 currentIndex=0 firstIds=[1428]
+17:15:30.831 queueChanged: length=50 firstIds=[1428,941,1045,1099,1473]  ← only after auto-advance
+```
+
+Engine had 68 timeline items right after restore. But `replaceUpcoming` got an EMPTY list. Something wiped `state.queue` between restore and the sync call.
+
+**Found**: `syncQueueFromNativeSnapshot` at `engine-playback.js:696`:
+```js
+const upcoming = [];
+for (let i = currentIndex + 1; i < items.length; i++) { ... }
+state.queue = upcoming;  // ← unconditional overwrite
+```
+
+On cold-restore `preserveLivePlayback=true` triggers this sync with `liveQueueState` being our own `loadAndPlay` stub of `[1428]` (length 1). The upcoming loop runs zero iterations. `state.queue = []`. All 47 disk-restored items lost. `getUpcomingNativeItems()` then iterates empty queue → 0 items → `replaceUpcoming({items:[]})` → Media3 stays at length 1.
+
+After `embeddingsReady`, the engine's `_doRefresh` rebuilds `state.queue` via the recommender — that's why the bug 'magically' resolved at `embeddingsReady` in the user's observation.
+
+**Fix**: only overwrite `state.queue` (and `state.timelineItems`) when native's view is RICHER than what we already have. Cold-restore stub case (native=1, we have 47) preserves the disk-restored state. Warm-restart with a real live session still gets accepted.
+
+New verification marker: `syncQueueFromNativeSnapshot: keeping restored state.queue=N (native only had M upcoming)`.
+
+File modified: `src/engine-playback.js`.
+
+Verification: web build OK (`dist/assets/index-BAOjlD4C.js`); test:unit 30/31; cap sync OK; `:app:assembleDebug` BUILD SUCCESSFUL. Fresh APK 391.8 MB at `2026-05-11 17:20`. GitHub release `v2026.05.11.16` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.16. Commit `cb603bc` on `origin/main`.
+
+Validation in next user capture: `init: extending native queue from restored state` followed by `replaceUpcoming: items=49 firstIds=[1277,258,52,1694,265]` and `queueChanged length=50 firstIds=[265,1277,258,52,1694]`. **First auto-advance went 265 → 1277** instead of 265 → 265. Three subsequent transitions also correct: 265 → 1277 → 258 → 1694 → 18 → 1108. Before embeddings ready.
+
+---
+
+### 2026-05-11 #17 — Cold-start queue bridge: `nextUpFilenames` seed + shuffle fallback
+
+User captured a follow-up log on v16 that revealed the bug still happened — but now BEFORE `syncUpcomingNativeQueue` could fire. Media3 with `items=1 + loop=ALL` was transitioning the song to itself at ~1.86 s into playback for reasons not visible from JS (probably an Opus decode race with `seekTo`). Our `replaceUpcoming` extension ran AFTER that initial loop, too late to prevent the visible "first song plays twice."
+
+The user proposed a cleaner strategy:
+> "why can't we go into shuffle mode till the embedding is ready and switch to recommendation once its up. for each song that is played, save the next 5 songs in cache. user might click next maybe 10 times before embeddings up. what about if user presses seek 10 times continuously."
+
+Architectural insight: the critical state is a **bridge** for the 5–10 s cold-start window before embeddings load. After that, `_doRefresh` takes over. So we only need to cover ~10–15 transitions, not the entire queue.
+
+Two-tier fix landed:
+
+**Tier 1 — persistent seed.** `savePlaybackState` (`engine-playback.js`) now writes `nextUpFilenames` (top 10 of `state.queue` mapped to `{filename, filePath, title, artist, album}`) into the tiny critical payload alongside `currentFilename`. `restorePlaybackStateCritical` parses it and seeds `state.queue` on cold start so `engine.getNativeQueueSnapshot()` returns the full queue when `togglePauseUI`'s cold-restore branch runs. Preserves the user-curated order from the previous session.
+
+**Tier 2 — shuffle fallback.** New exported function `engine.ensureColdStartQueue(minSize=10)` called from `togglePauseUI`'s cold-restore branch BEFORE `loadAndPlay`. Tier order:
+- if `state.queue.length >= minSize` → return as-is (source `preseeded`)
+- if embeddings ready → `_doRefresh()` (source `recommender`)
+- else → `_buildShuffleQueue()` (source `shuffle`)
+
+End result: `loadAndPlay` sends **items=11** in ONE `setQueue` call. Media3 cannot loop on item 0 because there are 10 different songs after.
+
+**Rapid Next-mashing**: with items=11, Media3 advances natively through skip 1 → skip 10 without bridge roundtrips. Each skip is a ~30 ms Media3 internal transition.
+
+Files modified: `src/engine-playback.js`, `src/engine.js`, `src/app-player-ui.js`.
+
+Verification: web build OK (`dist/assets/index-BALmq_Bl.js`); test:unit 30/31; cap sync OK; `:app:assembleDebug` BUILD SUCCESSFUL. Fresh APK 391.9 MB at `2026-05-11 17:42`. GitHub release `v2026.05.11.17` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.17. Commit `bfbf98c` on `origin/main`.
+
+Validation in next user capture:
+```
+17:47:24.119 restorePlaybackStateCritical: native-sync read 1 ms, payload 2702 chars  ← was 286 before nextUpFilenames
+17:47:24.119 seeded state.queue with 9 upcoming songs from critical payload
+17:47:26.562 cold restore: ensureColdStartQueue source=shuffle size=50   ← 9 < 10, fell to shuffle
+17:47:26.563 loadAndPlay: ... items=51 firstIds=[265,1486,2130,933,2082]
+17:47:27.890 queueChanged: length=51 nextSongId=1486 firstIds=[265,1486,2130,933,2082]
+17:47:29.926 queueCurrentChanged: songId=1486 prevCurrentSong=265 prevFrac=0   ← 265 → 1486, DIFFERENT
+17:47:39.507 queueCurrentChanged: songId=1277 prevCurrentSong=1486            ← 1486 → 1277
+17:47:43.172 queueCurrentChanged: songId=258 prevCurrentSong=1277             ← 1277 → 258
+```
+
+**"First song plays twice" — fixed.** Play/pause unchanged-fast: 10–18 ms.
+
+Cosmetic note flagged for #18: `_buildShuffleQueue` overwrites `state.queue` rather than appending, so the 9 seeded items got replaced with 50 random shuffle picks. Queue was multi-item (bug fixed) but the curated order from the previous session was discarded.
+
+---
+
+### 2026-05-11 #18 — Augment cold-start seed instead of replacing
+
+Cosmetic / continuity follow-up to #17. The v17 capture showed `source=shuffle` engaging even when 9 items had been seeded — because `_buildShuffleQueue` overwrites `state.queue` rather than appending to it. So the previous-session curated order was thrown away every cold start.
+
+**Fix** in `engine.js ensureColdStartQueue`: when state.queue has SOME items but fewer than minSize, keep those AND append shuffle picks until we reach minSize. Dedup against `state.current` and previously-added ids so nothing doubles up.
+
+New tier ordering:
+- `preseeded` — seed already had ≥ minSize items
+- `preseeded+shuffle` (NEW) — kept seed, topped up with shuffle
+- `recommender` — empty seed, embeddings ready
+- `shuffle` — empty seed, embeddings not ready
+
+Validation in next user capture (when seed has < minSize items):
+```
+seeded state.queue with 9 upcoming songs from critical payload
+cold restore: ensureColdStartQueue source=preseeded+shuffle size=12
+loadAndPlay: ... items=13 firstIds=[currentSong, savedNext1, ..., shuffleFill1]
+```
+
+Continuity of the previous session's curated order is preserved at the head of the cold-restore queue; shuffle only fills any shortfall.
+
+File modified: `src/engine.js` (ensureColdStartQueue rewrite).
+
+Verification: web build OK (`dist/assets/index-Dt4wykhM.js`); test:unit 30/31; cap sync OK; `:app:assembleDebug` BUILD SUCCESSFUL. Fresh APK 392.0 MB at `2026-05-11 17:54`. GitHub release `v2026.05.11.18` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.18. Commit `3845ed3` on `origin/main`.
+
+---
+
+### 2026-05-11 thread summary (cold-start cumulative state after #18)
+
+User-visible behavior across all 18 batches today:
+- ✅ AI embedding page bugs (#1, #2): trashed-file filter, race-proof IPC bind, paused-flag chip, ONNX backend chip, queue-extension on resume, embedding-page freeze
+- ✅ Recommendation diversity (#3): MMR lambda inversion (`rec.lam = 1 - _tuning.adventurous`); per-knob reset button feedback
+- ✅ Startup slowdown root cause (#4–#7): `state.listened` cap + Preferences split + file-based critical + serialize-then-pre-warm — but the cold-bridge tax remained
+- ✅ Capacitor bridge cold-pool definitively bypassed (#11, #12): native critical-path read via `MainActivity.onCreate` SharedPreferences + `addJavascriptInterface` for synchronous, plugin-free JS access. Critical read went 4090 ms → 1 ms.
+- ✅ Queue advances on cold restore (#13–#16): post-restore queue extension + preservation against stub-overwrite
+- ✅ First song plays twice (#17, #18): seed cold-start queue from previous session + shuffle bridge fallback + augment-not-replace continuity
+- ✅ Play/pause taps: under 20 ms consistently (pre-warm holds across the session)
+- ✅ Mini-player accuracy on cold start: critical-state native read populates currentSong / progress within ~1 ms
+
+Remaining known follow-ups (off the critical user complaints):
+- Tap-to-audio at cold start: 3.2 s — most of it is now `setQueue` over the bridge serializing 51 items + Media3 prepare. Worth optimizing later if user reports it.
+- state.queue staleness: `syncQueueFromNativeSnapshot` only updates state.queue when native is RICHER; in normal warm playback native shrinks while ours stays, until `_doRefresh` rebuilds at next refresh trigger. Not breaking anything (Media3 owns its own queue) but worth a clean follow-up if the drift causes a UI sync issue.
+- One sporadic 1566 ms / 3199 ms `pauseAudio` bridge resolve mid-session — Media3 background work occasionally interferes. Localized, not a critical-path issue.
 
 ---
 
