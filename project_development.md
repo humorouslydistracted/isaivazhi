@@ -171,6 +171,64 @@ Lesson: diagnostic markers are worth their weight. The cap-state hypothesis from
 
 ---
 
+### 2026-05-11 #6 — Split playback_state to bypass slow Preferences.get on play-tap critical path
+
+User captured `logs.txt` after installing `v2026.05.11.5`. The #5 fix worked for the bin fetch (3046 ms → **86 ms**, 35× speedup) but the markers immediately exposed the next bottleneck:
+
+```
+14:38:17.282 [PERF] restorePlaybackState: Preferences.get(playback_state) 2232 ms, payload 10211 chars
+14:38:17.282 [PERF] restorePlaybackState: JSON.parse 1 ms, listened=50 history=66 queue=5 timeline=6
+14:38:19.137 [PERF] readBinaryStore bin fetch: 5013504 bytes in 86 ms
+```
+
+`Preferences.get('playback_state')` takes **2233 ms for a 10 KB payload, with no bin fetch in flight on the bridge**. JSON.parse is 1 ms, filename mapping is 2 ms, payload is 10 KB. The Capacitor `@capacitor/preferences@8.0.1` plugin call itself is just slow on this device — likely an interaction between Capacitor's plugin executor and the WebView's main thread that we can't fix from JS without forking the plugin.
+
+**Approach: route the play tap around the slow call.** We don't need the full payload (history / queue / listened / timeline) to honor a cold-start play tap — we only need the current song + position. Split persistence into two keys:
+
+- **`playback_state_current`** (new, tiny ~300 chars) — `{currentFilename, currentFilePath, currentTitle, currentArtist, currentAlbum, currentTime, duration, currentSource}`.
+- **`playback_state`** (unchanged, full ~10 KB) — history, queue, listened, timeline, etc.
+
+`savePlaybackState` writes both atomically (tiny first so a mid-write app kill leaves a consistent small snapshot rather than an out-of-sync pair).
+
+New `restorePlaybackStateCritical()` (`engine-playback.js`) reads only the tiny key, sets `state.current` + returns a display object. Returns `null` if the tiny key is missing (first launch after install or a save predating this change), in which case the existing full-restore path is the sole fallback.
+
+`app.js init()` now fires both reads **in parallel**:
+```js
+const criticalPromise = engine.restorePlaybackStateCritical();
+const fullPromise = engine.restorePlaybackState();
+const critical = await criticalPromise;
+if (critical) {
+  currentSong = critical.id;
+  // ... update mini-player display + progress + heart ...
+  if (_pendingStartupResume && critical.filePath && !nativeFileLoaded) {
+    _pendingStartupResume = false;
+    loadAndPlay({...}, critical.currentTime || 0).catch(...);
+  }
+}
+const restored = await fullPromise;
+// ... populate history / queue / listened / timeline ...
+```
+
+The tiny key lands first (Capacitor's executor parallelizes reads). As soon as it does, the queued play tap is honored via the same `loadAndPlay` path that runs after the full restore today — but it fires within ~100 ms of the critical read instead of ~2300 ms of the full read. The full restore then completes in the background; user is already hearing audio by then.
+
+Backward-compatible: a missing `playback_state_current` (fresh install, or a save from before this change landed) makes `restorePlaybackStateCritical` return null; the existing full-restore path runs as it always did, and the next save writes both keys so subsequent launches get the fast path.
+
+New PERF marker so the next capture instantly confirms the prediction:
+```
+[PERF] restorePlaybackStateCritical: Preferences.get(playback_state_current) Xms, payload Y chars
+```
+
+Files modified: `src/engine-playback.js` (split save + new `restorePlaybackStateCritical`), `src/engine.js` (re-export), `src/app.js` (critical-first parallel restore + early play-tap honor).
+
+Verification: `npm.cmd run build` OK (Vite 295 ms; bundle `dist/assets/index-CSZ7wKM6.js` 307.91 kB / 86.14 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 4 s. Fresh APK at 390.3 MB, timestamp `2026-05-11 14:48`. GitHub release `v2026.05.11.6` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.6. Commit `3d20f2b` on `origin/main`.
+
+Expected outcome on the user's NEXT-after-first launch (the first launch still writes the tiny key for the first time — second launch is where the fast path lands):
+- `restorePlaybackStateCritical`: ~50–100 ms
+- Play-tap → audio: ~400 ms (vs 2341 ms in #5 capture)
+- Full restore still takes ~2.3 s but off the user-visible critical path
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
