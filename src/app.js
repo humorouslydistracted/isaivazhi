@@ -930,13 +930,18 @@ async function init() {
   try {
     await initActivityLog();
     logActivity({ category: 'app', type: 'app_opened', message: 'App opened', tags: ['startup'], important: true });
-    // Fix D: kick off the embedding-binary load against the cached data dir
-    // BEFORE loadData() runs. This overlaps the slow ~500-1500ms binary read
-    // with loadData()'s Preferences + library reads. The promise is consumed
-    // later by startBackgroundScan(); a fresh load is started instead if the
-    // resolved data dir doesn't match the cached one.
-    // No await — fire and continue. Failures are silent and harmless.
-    engine.preloadEmbeddingsEarly();
+    // 2026-05-11 #5: do NOT call preloadEmbeddingsEarly() here anymore. The
+    // earlier design (Fix D, 2026-05-10) overlapped the multi-MB bin read
+    // with loadData()'s Preferences reads to hide the binary-store latency.
+    // After Fix G the binary read goes through fetch(convertFileSrc(...))
+    // — same Capacitor WebView native plugin executor pool that handles
+    // Preferences.get. On a cold cache the 5MB transfer pins the pool and
+    // every other plugin call queues behind it. Captured logs.txt showed
+    // Preferences.get(playback_state) blocking on a 10KB payload for
+    // 2466ms while the bin fetch was in flight — pushing the mini-player
+    // play tap to 3.3s tap-to-audio. preloadEmbeddingsEarly() is now
+    // deferred until after restorePlaybackState resolves so the critical-
+    // path Preferences read runs uncontended; see the matching call below.
     // Show mini player IMMEDIATELY from cached display info (before loadData)
     const quickDisplay = await engine.getLastPlayedDisplay();
     if (quickDisplay) {
@@ -1015,6 +1020,12 @@ async function init() {
     const restored = await engine.restorePlaybackState();
     const pendingListenSnapshot = await engine.loadPendingListenSnapshot();
     _dbg('init: restore done ' + Math.round(performance.now() - _t0) + 'ms, currentSong=' + (restored ? restored.id : 'null') + ', filePath=' + (restored ? !!restored.filePath : 'n/a'));
+    // 2026-05-11 #5: kick off the embedding bin preload NOW — restorePlaybackState
+    // has finished its critical Preferences.get, so the Capacitor native plugin
+    // pool is uncontended for the multi-MB fetch. startBackgroundScan() will
+    // reuse this in-flight promise (or discard if the resolved data dir
+    // doesn't match). Fire-and-forget; failures are silent and harmless.
+    engine.preloadEmbeddingsEarly();
     if (restored || pendingListenSnapshot) {
       let liveAudioState = null;
       let liveQueueState = null;
