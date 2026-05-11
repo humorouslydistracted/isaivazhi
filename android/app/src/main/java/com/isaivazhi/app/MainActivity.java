@@ -1,6 +1,7 @@
 package com.isaivazhi.app;
 
 import android.Manifest;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -8,6 +9,7 @@ import android.os.Environment;
 import android.content.Intent;
 import android.net.Uri;
 import android.provider.Settings;
+import android.util.Log;
 import android.webkit.WebView;
 
 import androidx.core.app.ActivityCompat;
@@ -18,9 +20,32 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
 
     private static final int PERMISSION_REQUEST_CODE = 100;
+    private static final String TAG = "MainActivity";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // 2026-05-11 #11: Native critical-path read.
+        //
+        // Capacitor Preferences plugin calls have been observed to take 2-3+
+        // seconds on cold start due to bridge / plugin-executor warmup. That
+        // delay landed exactly on the user's first play-tap because JS
+        // restorePlaybackStateCritical was waiting on a Preferences.get / file
+        // fetch. Bypass it entirely by reading the SharedPreferences directly
+        // in onCreate — synchronous, ~5-20 ms, no Capacitor bridge involved.
+        // Capacitor Preferences stores under "CapacitorStorage" by default.
+        // Stash the JSON in a static field on MusicBridgePlugin so the very
+        // first JS bridge call (getCachedInitialState) returns instantly from
+        // in-memory cache without any disk I/O or bridge plumbing.
+        try {
+            SharedPreferences prefs = getSharedPreferences("CapacitorStorage", MODE_PRIVATE);
+            String cached = prefs.getString("playback_state_current", null);
+            MusicBridgePlugin.cacheInitialPlaybackState(cached);
+            Log.i(TAG, "Native critical-path read: " + (cached != null ? cached.length() + " chars" : "null"));
+        } catch (Throwable t) {
+            Log.w(TAG, "Native critical-path read failed: " + t.getMessage());
+            MusicBridgePlugin.cacheInitialPlaybackState(null);
+        }
+
         registerPlugin(MusicBridgePlugin.class);
         super.onCreate(savedInstanceState);
         requestStoragePermissions();

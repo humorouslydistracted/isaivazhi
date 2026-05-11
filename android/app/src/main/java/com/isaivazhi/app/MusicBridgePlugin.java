@@ -43,6 +43,17 @@ public class MusicBridgePlugin extends Plugin {
     // getEmbeddingBackend() so the AI page can display "nnapi+fp16 | nnapi | cpu".
     private volatile String lastKnownActiveBackend = "";
 
+    // 2026-05-11 #11: Native critical-path cache. MainActivity.onCreate reads
+    // SharedPreferences("CapacitorStorage").getString("playback_state_current")
+    // BEFORE the WebView even loads and stashes the value here via
+    // cacheInitialPlaybackState(). When JS calls getCachedInitialState(), the
+    // value is returned instantly from in-memory cache — no disk I/O, no
+    // Preferences plugin executor, no cold-bridge timing.
+    private static volatile String sCachedInitialPlaybackState = null;
+    public static void cacheInitialPlaybackState(String json) {
+        sCachedInitialPlaybackState = json;
+    }
+
     @Override
     public void load() {
         MusicPlaybackService.pluginRef = this;
@@ -541,6 +552,30 @@ public class MusicBridgePlugin extends Plugin {
     public void getEmbeddingBackend(PluginCall call) {
         JSObject ret = new JSObject();
         ret.put("backend", lastKnownActiveBackend != null ? lastKnownActiveBackend : "");
+        call.resolve(ret);
+    }
+
+    /**
+     * Native critical-path: returns the cached playback_state_current JSON that
+     * MainActivity.onCreate read from SharedPreferences before the WebView
+     * loaded. Used by engine.restorePlaybackStateCritical() to bypass the
+     * Capacitor Preferences plugin entirely on cold start — observed 2-3s
+     * latency on the bridge-warmup path, dropped to ~5-20ms by reading
+     * SharedPreferences directly in Java and stashing the result in memory.
+     *
+     * Returns {value: string|null}. Null means MainActivity either failed to
+     * read or the key didn't exist (fresh install, or this is the first launch
+     * after the v6 split landed and savePlaybackState hasn't run yet).
+     */
+    @PluginMethod
+    public void getCachedInitialState(PluginCall call) {
+        JSObject ret = new JSObject();
+        String cached = sCachedInitialPlaybackState;
+        if (cached != null) {
+            ret.put("value", cached);
+        } else {
+            ret.put("value", JSONObject.NULL);
+        }
         call.resolve(ret);
     }
 

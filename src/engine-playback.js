@@ -244,13 +244,28 @@ export async function getLastPlayedDisplay() {
 export async function restorePlaybackStateCritical() {
   try {
     const tStart = performance.now();
-    // 2026-05-11 #7: try the file fast path first. fetch(convertFileSrc(...))
-    // goes through Capacitor's WebView HTTP server, which is in a different
-    // native pool than the Preferences plugin — proven ~50–200 ms in logs.
-    // Falls back to Preferences if the file is missing.
+    // 2026-05-11 #11: native critical-path. MainActivity.onCreate reads
+    // SharedPreferences("CapacitorStorage").getString("playback_state_current")
+    // BEFORE the WebView loads and stashes the result in
+    // MusicBridgePlugin.sCachedInitialPlaybackState. This bridge call returns
+    // the cached string from in-memory in ~5-20ms regardless of how busy the
+    // bridge is — bypasses the 2-3s Capacitor cold-start tax entirely.
+    //
+    // Order of attempts:
+    //   1. Native cached string (instant if MainActivity succeeded)
+    //   2. file fetch via convertFileSrc (works if native cache missing
+    //      but the JSON file was written by a prior session)
+    //   3. Capacitor Preferences (slowest, but most durable fallback)
     let value = null;
-    let source = 'file';
-    if (EXTERNAL_DATA_DIR && typeof window !== 'undefined' && window.Capacitor && typeof window.Capacitor.convertFileSrc === 'function') {
+    let source = 'native';
+    if (typeof MusicBridge.getCachedInitialState === 'function') {
+      try {
+        const r = await MusicBridge.getCachedInitialState();
+        if (r && typeof r.value === 'string') value = r.value;
+      } catch (e) { /* fall through */ }
+    }
+    if (!value && EXTERNAL_DATA_DIR && typeof window !== 'undefined' && window.Capacitor && typeof window.Capacitor.convertFileSrc === 'function') {
+      source = 'file';
       try {
         const url = window.Capacitor.convertFileSrc('file://' + EXTERNAL_DATA_DIR + '/playback_state_current.json');
         const resp = await fetch(url);
