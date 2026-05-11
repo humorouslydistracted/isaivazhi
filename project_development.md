@@ -367,6 +367,45 @@ If the bridge warmup itself takes 2 s, that's the inherent cold-pool cost — th
 
 ---
 
+### 2026-05-11 #10 — Front-load critical fetch before the addListener storm
+
+User captured `logs.txt` on the first v9 launch. Two findings, one decisive win and one stubborn case:
+
+**Win — pre-warm + serialization fixed play/pause and Preferences.** Every play/pause `bridge resolved` timing was now ≤61 ms (was 3279 ms for the slow first-tap-after-transition in v8). `Preferences.get(playback_state)` dropped from 2179 ms → **44 ms** (serialized).
+
+**Stubborn — critical file fetch was still 2221 ms.** Smaller payload than the Library fetch (275 chars vs 250 KB), but slower (2221 ms vs 128 ms in the SAME log). The difference: Library fired RIGHT AFTER `loadData`'s Preferences batch; Critical fired ~309 ms later, AFTER the listener-setup chain registered ~12-15 `MusicBridge.addListener` bridge calls. Capacitor's bridge queued the listener registrations ahead of the fetch and held it for 2.2 s.
+
+**Fix — front-load the critical fetch in `app.js init()`.** Was:
+```js
+await engine.loadData();
+// ... renderSongs / renderAlbums / setupNativeAudioEvents / setupNativeMediaListener / setupEmbeddingUI ...
+// ... 309ms of sync work + ~12-15 addListener bridge calls queued ...
+const critical = await engine.restorePlaybackStateCritical();  // ← waits 2221ms
+```
+
+Now:
+```js
+await engine.loadData();
+const _criticalRestorePromise = engine.restorePlaybackStateCritical();  // ← fire NOW, no await
+// ... renderSongs / renderAlbums / setupNativeAudioEvents / ... (sync setup + addListener calls)
+const critical = await _criticalRestorePromise;  // ← await later, fetch already resolved
+```
+
+The fetch runs on a quiet bridge starting at `loadData done + 0ms` instead of `loadData done + 309ms`. By the time `await` is reached, the fetch should already be done. Based on the Library fetch baseline (128 ms at this exact slot in the same v9 log), expected critical-read latency: ~150 ms.
+
+File modified: `src/app.js`.
+
+Verification: `npm.cmd run build` OK (Vite 475 ms; bundle `dist/assets/index-vjDylwgQ.js` 309.57 kB / 86.47 kB gzipped); `npm.cmd run test:unit` 30/31; `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 6 s. Fresh APK at 390.7 MB, timestamp `2026-05-11 15:29`. GitHub release `v2026.05.11.10` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.10. Commit `eaee418` on `origin/main`.
+
+Expected outcome on next launch:
+| | v9 capture | v10 (expected) |
+|---|---|---|
+| Critical file read | 2221 ms | ~150 ms |
+| Tap-to-audio (cold restore) | ~2.8 s | well under 1 s |
+| Play/pause taps | 14-61 ms | unchanged (still fast from v9 warmup) |
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
