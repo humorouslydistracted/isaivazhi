@@ -775,26 +775,52 @@ function _buildShuffleQueue() {
 }
 
 /**
- * 2026-05-11 #17/18: ensure the queue has at least `minSize` items for the
- * cold-restore loadAndPlay. Captured logs proved Media3 with items=1 +
- * loop=ALL transitions back to the same song almost immediately, causing
- * the user-visible "first song plays twice" bug. Pre-populating the queue
- * prevents the loop because Media3 always has a different "next" to advance
- * to.
+ * 2026-05-11 #17/18/19: ensure the queue has at least `minSize` items for
+ * the cold-restore loadAndPlay so Media3 receives a multi-item queue and
+ * doesn't loop on item 0.
  *
  * Tier 1: state.queue was seeded from critical payload's `nextUpFilenames`
- *         (engine-playback.js restorePlaybackStateCritical). Use as-is.
- * Tier 2: if too short / empty, build a shuffle from songs[] — works before
- *         embeddings are ready, since we don't need any vector math.
- * Tier 3: if embeddings ARE ready, refresh via the proper recommender path.
- *         Better picks but only available post-embeddings-ready.
+ *         (engine-playback.js restorePlaybackStateCritical). If it already
+ *         hits minSize, return as-is.
+ * Tier 2: if state.queue has SOME items but fewer than minSize, KEEP those
+ *         and append shuffle picks until we reach minSize. Preserves the
+ *         user-curated order from the previous session AND covers the
+ *         shortfall (#19 change — previously _buildShuffleQueue replaced
+ *         the seeded items entirely).
+ * Tier 3: if state.queue is empty AND embeddings are ready, use the proper
+ *         recommender via _doRefresh. Better picks, only available
+ *         post-embeddings-ready.
+ * Tier 4: state.queue is empty AND embeddings aren't ready — full shuffle
+ *         from songs[]. The bridge until embeddings come up.
  *
- * Returns the resulting state.queue length so the caller can log it.
+ * Returns { size, source } where source is one of:
+ *   'preseeded', 'preseeded+shuffle', 'recommender', 'shuffle'.
  */
 export function ensureColdStartQueue(minSize = 10) {
-  if (state.queue && state.queue.length >= minSize) {
-    return { size: state.queue.length, source: 'preseeded' };
+  const existing = Array.isArray(state.queue) ? state.queue.slice() : [];
+  if (existing.length >= minSize) {
+    return { size: existing.length, source: 'preseeded' };
   }
+  // Tier 2: augment when we have a seed but not enough.
+  if (existing.length > 0) {
+    _buildShuffleQueue(); // overwrites state.queue with shuffle (TOP_N items)
+    const seen = new Set();
+    if (state.current != null) seen.add(state.current);
+    const merged = [];
+    for (const item of existing) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      merged.push(item);
+    }
+    for (const item of state.queue) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      merged.push(item);
+    }
+    state.queue = merged;
+    return { size: state.queue.length, source: 'preseeded+shuffle' };
+  }
+  // Tier 3/4: empty seed.
   if (isEmbeddingsReady() && rec) {
     _doRefresh('cold_start_ensure');
     return { size: state.queue.length, source: 'recommender' };
