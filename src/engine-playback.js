@@ -681,7 +681,20 @@ export function syncQueueFromNativeSnapshot(queueState, opts = {}) {
     resolvedTimeline.push({ id: sid, similarity: 1.0, manual: false });
     if (i === currentIndex) resolvedCurrentIndex = resolvedTimeline.length - 1;
   }
-  if (resolvedCurrentIndex >= 0) {
+  // 2026-05-11 #16: preserve restored state when native's queue is just
+  // a single-item stub (which happens on cold-restore where our own
+  // loadAndPlay sent items=[currentSong] before the full restore landed).
+  // Captured v15 log proved this exact failure: restore set state.queue
+  // to 47 items, then this sync wiped it to [] because Media3 only had
+  // [1428]. Result: replaceUpcoming pushed 0 items, queue stayed at
+  // length 1, next-tap looped same song.
+  //
+  // Heuristic: if native has more timeline items than what we already
+  // have, take native's view (warm-restart case). Otherwise keep what
+  // was restored from disk (cold-restore stub case). Same logic for
+  // state.queue below.
+  const nativeBetterTimeline = resolvedTimeline.length > (state.timelineItems ? state.timelineItems.length : 0);
+  if (resolvedCurrentIndex >= 0 && nativeBetterTimeline) {
     state.timelineItems = resolvedTimeline;
     state.timelineIndex = resolvedCurrentIndex;
     if (state.timelineMode !== 'explicit') state.timelineMode = 'dynamic';
@@ -693,7 +706,14 @@ export function syncQueueFromNativeSnapshot(queueState, opts = {}) {
     if (sid == null || !songs[sid] || !songs[sid].filePath) continue;
     upcoming.push({ id: sid, similarity: 1.0 });
   }
-  state.queue = upcoming;
+  if (upcoming.length > (state.queue ? state.queue.length : 0)) {
+    // Native has a richer queue — accept it (e.g., warm restart with live session).
+    state.queue = upcoming;
+  } else {
+    // Cold-restore stub case: keep the disk-restored state.queue intact so
+    // the post-restore syncUpcomingNativeQueue can push it back to Media3.
+    console.log(`[DBG] syncQueueFromNativeSnapshot: keeping restored state.queue=${state.queue ? state.queue.length : 0} (native only had ${upcoming.length} upcoming)`);
+  }
   if (opts.ensurePlaybackStart === true) {
     _ensurePlaybackStartLogged(currentId, state.currentSource || 'native_restore', null, null, {
       playbackInstanceId: opts.playbackInstanceId,
