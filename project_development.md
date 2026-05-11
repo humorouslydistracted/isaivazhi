@@ -313,6 +313,60 @@ Verification: `npm.cmd run build` OK (Vite 628 ms; bundle `dist/assets/index-i05
 
 ---
 
+### 2026-05-11 #9 — Capacitor bridge cold-pool contention identified; serialize critical + pre-warm
+
+User captured `logs.txt` on the first v8 launch. The PERF markers isolated both startup issues to a single root cause:
+
+**1. Critical file read was 2378 ms.** v7's file-based fast path engaged correctly (`file read` source confirmed), but it ran concurrently with `Preferences.get(playback_state)` which took 2179 ms. Both took ~2.3 s. The same log shows `Library: 2474 songs via fetch in 146 ms` — fetch ALONE early in init is fast. Capacitor's bridge effectively serializes across plugins: a second concurrent op drags both to ~2.3 s. Racing reads doesn't help; it actively hurts.
+
+**2. First `pauseAudio` bridge call after a track transition was 3279 ms** — measured by the new v8 marker:
+```
+15:10:24.379 PLAY: pausing
+[3.3s bridge call in flight]
+15:10:27.658 [PERF] pauseAudio bridge resolved: 3279 ms (tap+3280 ms)
+15:10:27.720 audioPlayStateChanged: isPlaying=false
+```
+Native Media3 had nothing to do with it — the JSI bridge itself stalled. Subsequent five taps in the same session: 240 → 30 → 14 → 5 → 14 ms. The cold bridge is the long pole; once warmed, taps are sub-50 ms.
+
+Both findings share the shape: **first call into a freshly-active Capacitor pool stalls; concurrent calls during cold periods slow each other; calls after the pool is warm are fast**.
+
+**Fix A — serialize critical-then-full restore in `app.js init()`.** Was:
+```js
+const criticalPromise = engine.restorePlaybackStateCritical();
+const fullPromise = engine.restorePlaybackState();
+const critical = await criticalPromise;
+// ...
+const restored = await fullPromise;
+```
+Now:
+```js
+const critical = await engine.restorePlaybackStateCritical();
+// ... act on critical, fire queued tap ...
+const restored = await engine.restorePlaybackState();
+```
+Critical runs ALONE first. Based on the Library fetch baseline (146 ms alone), expected ~150 ms vs current 2378 ms. The queued play tap can fire ~2 seconds sooner; the full read still completes in the background.
+
+**Fix B — pre-warm the bridge.** Fire `MusicBridge.getAudioState()` fire-and-forget at the very top of `init()`, before `initActivityLog` or anything else. Spins up the Capacitor executor + JNI handle cache so the first user pause doesn't pay the cold-bridge cost. New marker:
+```
+[PERF] bridge warmup (getAudioState): Xms
+```
+
+File modified: `src/app.js`.
+
+Verification: `npm.cmd run build` OK (Vite 490 ms; bundle `dist/assets/index-B2nvAmxj.js` 309.57 kB / 86.43 kB gzipped); `npm.cmd run test:unit` 30/31; `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 6 s. Fresh APK at 390.6 MB, timestamp `2026-05-11 15:16`. GitHub release `v2026.05.11.9` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.9. Commit `6a5cf50` on `origin/main`.
+
+Expected timing on next launch:
+| | v8 capture | v9 (expected) |
+|---|---|---|
+| Critical file read | 2378 ms | ~150 ms |
+| Tap-to-audio (cold restore) | ~5 s | well under 1 s |
+| First `pauseAudio` after track transition | 3279 ms | ~50-100 ms (warm) |
+| `bridge warmup` marker | — | should appear early |
+
+If the bridge warmup itself takes 2 s, that's the inherent cold-pool cost — the user just won't notice because no user action is waiting on it.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
