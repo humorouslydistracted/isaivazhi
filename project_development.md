@@ -229,6 +229,55 @@ Expected outcome on the user's NEXT-after-first launch (the first launch still w
 
 ---
 
+### 2026-05-11 #7 — File-based critical playback state (bypass slow Preferences plugin entirely)
+
+User captured `logs.txt` after the second launch on v6 (with the tiny key written during the v6 session). The result decisively disproved the parallel-reads theory:
+
+```
+14:53:20.440 [PERF] restorePlaybackStateCritical: Preferences.get(playback_state_current) 2316 ms, payload 372 chars
+14:53:20.441 [DBG] init: critical restore — honoring queued tap early
+14:53:20.442 [DBG] loadAndPlay: songId=655 ...
+14:53:20.454 [PERF] restorePlaybackState: Preferences.get(playback_state) 2330 ms, payload 21041 chars
+14:53:20.660 [DBG] loadAndPlay: setQueue OK
+14:53:22.572 [DBG] audioPlayStateChanged: isPlaying=true
+```
+
+Two Preferences reads with 50× different payload sizes (372 chars vs 21041 chars) **both took the same ~2.3 s**. Capacitor's `@capacitor/preferences@8.0.1` plugin serializes calls internally and the call itself is just slow on this device — payload is irrelevant.
+
+The good news: the critical-fast-path architecture from #6 worked structurally. `loadAndPlay` fired **1 ms after critical restored**, `setQueue` completed in 218 ms. Tap-to-audio dropped from 3325 ms (#3) → 2341 ms (#5) → 2935 ms (#6 second launch — slightly worse because Media3 prepare contended with the meta fetch this run). But the 2.3 s Preferences read for the critical key was still the dominant single contributor.
+
+**Same log proved the WebView file path is fast in a different native pool:**
+- `Library: 2474 songs via fetch in 150 ms` (~250 KB)
+- `bin fetch: 5013504 bytes in 162 ms` (5 MB)
+
+Both `fetch(convertFileSrc(...))` reads. The WebView's HTTP server is on a separate executor from the Preferences plugin.
+
+**Fix — write the critical state to a regular JSON file, read via fetch on cold start.** `savePlaybackState` (`engine-playback.js`) now writes three things on every save:
+- `playback_state_current.json` (new file in `EXTERNAL_DATA_DIR`, ~300 chars) — via fire-and-forget `MusicBridge.writeTextFile`
+- `playback_state_current` Preferences key — kept as durable fallback
+- `playback_state` Preferences key — full state, unchanged
+
+`restorePlaybackStateCritical` tries the file first via `fetch(convertFileSrc(...))` and falls back to the Preferences key if the file is missing (first launch after this change). New `[PERF]` marker reports which source served the read:
+```
+[PERF] restorePlaybackStateCritical: file read Xms, payload Y chars
+[PERF] restorePlaybackStateCritical: prefs read Xms, payload Y chars
+```
+
+File modified: `src/engine-playback.js`.
+
+Verification: `npm.cmd run build` OK (Vite 310 ms; bundle `dist/assets/index-D7bY1V94.js` 308.27 kB / 86.26 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 5 s. Fresh APK at 390.4 MB, timestamp `2026-05-11 14:58`. GitHub release `v2026.05.11.7` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.7. Commit `8800906` on `origin/main`.
+
+Backward compatible: first launch after install has no file yet → Preferences fallback runs → still slow but no worse than v6. Once `savePlaybackState` runs once during the session, all subsequent launches hit the file fast path.
+
+Expected timing on second-after-install launch:
+| | v6 second launch | v7 (expected) |
+|---|---|---|
+| Critical state read | 2316 ms (prefs) | ~50–150 ms (file) |
+| Tap-to-audio | 2935 ms | well under 1 s |
+| Full restore | 2330 ms (off critical path) | unchanged (off critical path) |
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
