@@ -126,7 +126,7 @@ import {
 import {
   initPlaybackCallbacks, _filenameToId,
   savePlaybackState, savePendingListenSnapshot, loadPendingListenSnapshot, clearPendingListenSnapshot,
-  getLastPlayedDisplay, restorePlaybackState,
+  getLastPlayedDisplay, restorePlaybackState, restorePlaybackStateCritical,
   resetEngine, clearPlaybackSession, shutdown,
   getNativeQueueSnapshot, getNativeQueueItems, getUpcomingNativeItems,
   syncCurrentFromNativeState, syncQueueFromNativeSnapshot, onNativeAdvance,
@@ -1791,6 +1791,7 @@ export {
   clearPendingListenSnapshot,
   recordRecoveredListen,
   restorePlaybackState,
+  restorePlaybackStateCritical,
   resetEngine,
   clearPlaybackSession,
   shutdown,

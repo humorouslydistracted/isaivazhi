@@ -1015,9 +1015,57 @@ async function init() {
     // Load discover content (non-blocking) — skip if cache already rendered
     if (!discoverCache) loadDiscover();
 
-    // Now resolve full playback state (needs songs array from loadData)
-    _dbg('init: restoring playback state');
-    const restored = await engine.restorePlaybackState();
+    // 2026-05-11 #6: cold-start play-tap critical path.
+    //
+    // Captured logs showed `Preferences.get('playback_state')` taking ~2.3s
+    // for a 10KB payload on this device — independent of bin-fetch contention.
+    // We can't speed up Capacitor's Preferences plugin itself, but we DON'T
+    // need the full state to honor a queued play tap. All we need is current
+    // song + currentTime + duration. Those live in a new tiny key
+    // `playback_state_current` written alongside the full state in
+    // savePlaybackState (engine-playback.js).
+    //
+    // Strategy:
+    //   1. Fire BOTH reads in parallel (Capacitor's executor pool handles
+    //      both; the small one returns first).
+    //   2. Await critical — set currentSong + display + position so the
+    //      queued play tap can fire IMMEDIATELY via loadAndPlay.
+    //   3. Await full second — populate history/queue/listened/timeline.
+    //      The user is already hearing audio by then.
+    _dbg('init: restoring playback state (critical first)');
+    const criticalPromise = engine.restorePlaybackStateCritical();
+    const fullPromise = engine.restorePlaybackState();
+    const critical = await criticalPromise;
+    if (critical) {
+      currentSong = critical.id;
+      currentIsFav = !!critical.isFavorite;
+      if (critical.duration > 0) nativeAudioDur = critical.duration;
+      if (critical.currentTime > 0) nativeAudioPos = critical.currentTime;
+      document.getElementById('npTitle').textContent = critical.title;
+      document.getElementById('npArtist').textContent = critical.artist + ' · ' + (critical.album || '');
+      document.getElementById('nowPlaying').style.display = 'block';
+      updateHeartIcon(currentIsFav);
+      updateProgressUI(nativeAudioPos, nativeAudioDur);
+      _dbg('init: critical restore done — currentSong=' + currentSong);
+      // If the user already tapped play while the full restore is still in
+      // flight (the common "tap as soon as the mini-player appears" pattern),
+      // honor it now. loadAndPlay is fire-and-forget; the full restore
+      // continues to populate queue/history asynchronously.
+      if (_pendingStartupResume && critical.filePath && !nativeFileLoaded) {
+        _pendingStartupResume = false;
+        _dbg('init: critical restore — honoring queued tap early');
+        loadAndPlay({
+          id: critical.id,
+          title: critical.title,
+          artist: critical.artist,
+          album: critical.album,
+          filename: critical.filename,
+          filePath: critical.filePath,
+          isFavorite: currentIsFav,
+        }, critical.currentTime || 0).catch(e => _dbg('early tap loadAndPlay err: ' + (e && e.message || e)));
+      }
+    }
+    const restored = await fullPromise;
     const pendingListenSnapshot = await engine.loadPendingListenSnapshot();
     _dbg('init: restore done ' + Math.round(performance.now() - _t0) + 'ms, currentSong=' + (restored ? restored.id : 'null') + ', filePath=' + (restored ? !!restored.filePath : 'n/a'));
     // 2026-05-11 #5: kick off the embedding bin preload NOW — restorePlaybackState

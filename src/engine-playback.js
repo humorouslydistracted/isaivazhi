@@ -91,6 +91,30 @@ export async function savePlaybackState(currentTimeSec, durationSec) {
         ? songs[_lastLoggedPlaybackStartSongId].filename
         : null,
     };
+    // 2026-05-11 #6: split persistence into two Preferences keys.
+    //   - `playback_state_current` (tiny): just the play-tap-critical info.
+    //     Read first on cold start so the user's queued resume tap can fire
+    //     within ~100ms instead of waiting on the full read.
+    //   - `playback_state` (full): unchanged. Read in parallel; result
+    //     populates history/queue/listened/timeline once it lands.
+    // The captured logs.txt from v2026.05.11.5 showed Preferences.get(playback_state)
+    // taking 2233ms for a 10KB payload with bin fetch NOT in flight. Splitting
+    // the critical fields off a separate small key bypasses that latency for
+    // the play-tap path without changing the rest of the restore semantics.
+    const tinyData = {
+      currentFilename: data.currentFilename,
+      currentFilePath: data.currentFilePath,
+      currentTitle: data.currentTitle,
+      currentArtist: data.currentArtist,
+      currentAlbum: data.currentAlbum,
+      currentTime: data.currentTime,
+      duration: data.duration,
+      currentSource: data.currentSource,
+    };
+    // Write both. The tiny one first so a mid-write app kill leaves us with
+    // a consistent (small) snapshot rather than an out-of-sync pair. Atomic
+    // SharedPreferences semantics mean each `set` is durable on its own.
+    await Preferences.set({ key: 'playback_state_current', value: JSON.stringify(tinyData) });
     await Preferences.set({ key: 'playback_state', value: JSON.stringify(data) });
   } catch (e) { /* ignore */ }
 }
@@ -190,6 +214,49 @@ export async function getLastPlayedDisplay() {
       duration: data.duration || 0,
     };
   } catch (e) { return null; }
+}
+
+/**
+ * Read JUST the tiny `playback_state_current` key. Used by the cold-start path
+ * to enable the play tap before the full restorePlaybackState completes. Sets
+ * state.current and returns a display object (no queue/history/listened —
+ * those land later via restorePlaybackState). Returns null if no tiny key
+ * exists (fresh install, or a save predating the split).
+ */
+export async function restorePlaybackStateCritical() {
+  try {
+    const tStart = performance.now();
+    const { value } = await Preferences.get({ key: 'playback_state_current' });
+    const tGet = performance.now();
+    if (!value) {
+      console.log(`[PERF] restorePlaybackStateCritical: no tiny key (cold path will fall back to full read), ${Math.round(tGet - tStart)} ms`);
+      return null;
+    }
+    console.log(`[PERF] restorePlaybackStateCritical: Preferences.get(playback_state_current) ${Math.round(tGet - tStart)} ms, payload ${value.length} chars`);
+    const data = JSON.parse(value);
+    let currentId = null;
+    if (data.currentFilename) currentId = _filenameToId(data.currentFilename);
+    if (currentId == null) return null;
+    state.current = currentId;
+    state.currentSource = data.currentSource || 'restored';
+    const s = songs[currentId];
+    if (!s) return null;
+    return {
+      id: s.id,
+      title: s.title,
+      artist: s.artist,
+      album: s.album,
+      filename: s.filename,
+      filePath: s.filePath,
+      artPath: s.artPath,
+      hasEmbedding: s.hasEmbedding,
+      isFavorite: favorites.has(s.id),
+      duration: data.duration || 0,
+      currentTime: data.currentTime || 0,
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 export async function restorePlaybackState() {
