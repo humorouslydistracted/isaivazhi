@@ -387,7 +387,7 @@ export function createTasteUiSupport({
       }).join('');
     const tasteActivityHtml = _renderActivityLogHtml(tasteActivityRows);
     window._tuningHints = {
-      adventurous: "Higher = more diverse Up Next picks (MMR lambda). Lower = stick closer to what you just played.",
+      adventurous: "Higher = more diverse Up Next picks (spread across your library). Lower = stick closer to what you just played. Internally drives MMR's diversity weight (engine maps adventurous → 1−lambda so the label matches the math).",
       sessionBias: "Higher = recs follow the mood of what you're playing right now. Lower = lean on long-term taste profile.",
       negativeStrength: "Higher = songs in your Negative list (X'd, disliked, repeat-skipped) pull recommendations farther away from their sound."
     };
@@ -403,7 +403,7 @@ export function createTasteUiSupport({
             <button class="tuning-reset" title="Reset to default (${defaultPct}%)" onclick="window._app.resetTuning('${key}')">↺</button>
           </div>
           <div class="tuning-inline-hint" id="tuningHint-${key}" style="display:none;">${esc(window._tuningHints[key])}</div>
-          <input class="tuning-slider" type="range" min="0" max="100" value="${tPct(val)}"
+          <input class="tuning-slider" data-tuning-key="${key}" type="range" min="0" max="100" value="${tPct(val)}"
             oninput="document.getElementById('tune${key}Val').textContent=this.value+'%'"
             onchange="window._app.setTuning('${key}', this.value/100)">
         </div>`;

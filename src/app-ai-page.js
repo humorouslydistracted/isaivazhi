@@ -95,6 +95,13 @@ export function createAiPageSupport({
     const backendChip = backendLabel
       ? `<div class="emb-backend-chip" title="ONNX execution provider"><span class="emb-backend-label">ONNX backend:</span> ${esc(backendLabel)}</div>`
       : '';
+    // Paused chip: surfaces the persisted embedding_paused flag so the silent
+    // state (auto-embed off, "Embed N Pending Songs" needed) is visible instead
+    // of users guessing why new songs never get embedded. Cleared automatically
+    // by retryEmbedding() / embedRemovedSongsBatch() / reembedAll().
+    const pausedChip = st.paused
+      ? `<div class="emb-paused-chip" title="Auto-embedding is paused. Tap 'Embed Pending Songs' below to resume."><span class="emb-paused-label">Auto-embed:</span> Paused</div>`
+      : '';
 
     let statusText = '';
     if (st.inProgress) {
@@ -104,7 +111,7 @@ export function createAiPageSupport({
     } else if (pendingNewSongs.length === 0 && removedSongs.length === 0) {
       statusText = `<div class="emb-status-done"><span class="emb-done">&#10003;</span> All songs have AI embeddings</div>`;
     }
-    statusText = backendChip + statusText;
+    statusText = backendChip + pausedChip + statusText;
 
     const unmatchedListHtml = unmatched.length > 0
       ? `<div style="display:${disp(_embDetailExpanded.unmatched)};">

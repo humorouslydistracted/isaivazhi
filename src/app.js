@@ -345,20 +345,78 @@ const setupFullPlayerGestures = _playerUi.setupFullPlayerGestures;
 const formatTime = _playerUi.formatTime;
 
 // On-screen debug logger — writes to #debugLogText if it exists + console.
-// The DBG panel was removed from index.html, so the textContent path below
-// is a no-op now; kept so internal _dbg() calls throughout the codebase
-// continue to write [DBG]-prefixed lines to native console without any extra
-// changes. Re-uncomment the panel in index.html to bring on-screen logs back.
+// Re-enabled 2026-05-11 #3: tiny bottom-right toggle, full-screen panel on tap.
+// Mirrors any console.log line that starts with one of the well-known tags
+// ([PERF], [Embedding], [FAV], [SCAN], [DBG], [REC]) so we don't have to hunt
+// for adb logcat to get a startup trace.
 function _dbg(msg) {
   console.log('[DBG] ' + msg);
+  _appendDbgLine('[DBG] ' + msg);
+}
+
+function _appendDbgLine(line) {
   try {
     const el = document.getElementById('debugLogText');
     if (!el) return;
     const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
-    el.textContent += ts + ' ' + msg + '\n';
+    el.textContent += ts + ' ' + line + '\n';
     const panel = document.getElementById('debugLogPanel');
-    if (panel) panel.scrollTop = panel.scrollHeight;
+    if (panel && panel.style.display !== 'none') panel.scrollTop = panel.scrollHeight;
   } catch (e) { /* ignore */ }
+}
+
+// Hook console.log so tagged lines are mirrored into the DBG panel without
+// requiring every call site to invoke _dbg() explicitly. Untagged console.log
+// goes straight through.
+(function _installDbgConsoleMirror() {
+  const _origConsoleLog = console.log.bind(console);
+  const TAG_RE = /^\[(PERF|Embedding|FAV|SCAN|DBG|REC|GPU|Library)\]/;
+  console.log = function (...args) {
+    _origConsoleLog(...args);
+    try {
+      if (args.length > 0 && typeof args[0] === 'string' && TAG_RE.test(args[0])) {
+        const line = args.map(a => typeof a === 'string' ? a : (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+        _appendDbgLine(line);
+      }
+    } catch (e) { /* ignore */ }
+  };
+})();
+
+// Wire toggle / copy / close buttons once the DOM exists.
+if (typeof document !== 'undefined' && document.readyState !== 'loading') {
+  _wireDbgPanel();
+} else if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', _wireDbgPanel);
+}
+
+function _wireDbgPanel() {
+  const toggle = document.getElementById('debugLogToggle');
+  const panel = document.getElementById('debugLogPanel');
+  const closeBtn = document.getElementById('debugLogClose');
+  const copyBtn = document.getElementById('debugLogCopy');
+  if (toggle && panel) {
+    toggle.addEventListener('click', () => {
+      panel.style.display = (panel.style.display === 'none' || !panel.style.display) ? 'block' : 'none';
+      if (panel.style.display === 'block') panel.scrollTop = panel.scrollHeight;
+    });
+  }
+  if (closeBtn && panel) {
+    closeBtn.addEventListener('click', () => { panel.style.display = 'none'; });
+  }
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      try {
+        const el = document.getElementById('debugLogText');
+        const text = el ? el.textContent : '';
+        await navigator.clipboard.writeText(text);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy Logs'; }, 1200);
+      } catch (e) {
+        copyBtn.textContent = 'Copy failed';
+        setTimeout(() => { copyBtn.textContent = 'Copy Logs'; }, 1500);
+      }
+    });
+  }
 }
 
 
@@ -2813,6 +2871,16 @@ window._app = {
   resetTuning: async (key) => {
     const defaults = { adventurous: 0.8, sessionBias: 0.5, negativeStrength: 0.5 };
     if (!(key in defaults)) return;
+    // Immediate visual feedback: snap the slider and value text BEFORE awaiting
+    // engine.setTuning (which can take ~200–500ms while it rebuilds profileVec).
+    // Without this the user taps ↺ and stares at the old position until the
+    // async chain resolves and showTasteWeightsOverlay re-renders, which feels
+    // like the button is broken.
+    const pct = Math.round(defaults[key] * 100);
+    const slider = document.querySelector(`.tuning-slider[data-tuning-key="${key}"]`);
+    if (slider) slider.value = String(pct);
+    const valSpan = document.getElementById(`tune${key}Val`);
+    if (valSpan) valSpan.textContent = pct + '%';
     await engine.setTuning({ [key]: defaults[key] });
     showStatusToast('Reset to default', 1200);
     showTasteWeightsOverlay();

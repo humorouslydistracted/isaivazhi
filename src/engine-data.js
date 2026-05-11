@@ -554,7 +554,7 @@ async function _backgroundScan(embeddingPromise, force) {
       console.log(`[PERF] _mergeLocalEmbeddings: ${mergedCount} merged in ${Math.round(performance.now() - tMerge)} ms`);
       if (mergedCount > 0 && embeddings.length > 0) {
         const tRec = performance.now();
-        setRec(new Recommender(embeddings)); rec.lam = _tuning.adventurous;
+        setRec(new Recommender(embeddings)); rec.lam = 1 - _tuning.adventurous;
         console.log(`[PERF] new Recommender(${embeddings.length} embeddings): ${Math.round(performance.now() - tRec)} ms`);
         const tGpu = performance.now();
         attachGpuToRec(rec, embeddings);
@@ -705,7 +705,7 @@ async function _backgroundScan(embeddingPromise, force) {
 
     // Rebuild recommender if local embeddings were merged (new vectors added)
     if (mergedCount > 0 && embeddings.length > 0) {
-      setRec(new Recommender(embeddings)); rec.lam = _tuning.adventurous;
+      setRec(new Recommender(embeddings)); rec.lam = 1 - _tuning.adventurous;
       attachGpuToRec(rec, embeddings);
       _dcbs.invalidateArtistMap();
       _invalidateEmbIdxMap();

@@ -21,6 +21,17 @@
 
 <div id="statusToast" class="status-toast" style="display:none;"></div>
 
+<!-- 2026-05-11 #3: temporary debug capture for the startup-slowdown investigation.
+     Bottom-right small pill so it doesn't conflict with the top hamburger. -->
+<div id="debugLogToggle" title="Toggle DBG log">DBG</div>
+<div id="debugLogPanel" style="display:none;">
+    <div id="debugLogControls">
+        <button id="debugLogCopy">Copy Logs</button>
+        <button id="debugLogClose">Close</button>
+    </div>
+    <pre id="debugLogText"></pre>
+</div>
+
 <div class="content">
     <!-- 2026-05-10 follow-up #10: tabs are now a horizontal CSS scroll-snap
          strip. Browser handles the swipe gesture natively (60fps), so the

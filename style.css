@@ -63,8 +63,19 @@ body {
 
 /* Embedding detail page */
 .emb-detail-page { padding: 12px 14px; }
-.emb-backend-chip { display: inline-block; padding: 4px 10px; margin-bottom: 8px; background: var(--surface2, #1d1d22); color: var(--text2, #aaa); border-radius: 12px; font-size: 11px; }
+.emb-backend-chip { display: inline-block; padding: 4px 10px; margin-bottom: 8px; margin-right: 6px; background: var(--surface2, #1d1d22); color: var(--text2, #aaa); border-radius: 12px; font-size: 11px; }
 .emb-backend-chip .emb-backend-label { color: var(--text3, #888); margin-right: 4px; }
+.emb-paused-chip { display: inline-block; padding: 4px 10px; margin-bottom: 8px; background: rgba(255, 193, 7, 0.15); color: #ffc107; border: 1px solid rgba(255, 193, 7, 0.4); border-radius: 12px; font-size: 11px; }
+.emb-paused-chip .emb-paused-label { color: rgba(255, 193, 7, 0.75); margin-right: 4px; }
+
+/* DBG capture (re-added 2026-05-11 #3 for startup-perf investigation). Tiny
+   pill bottom-right so it doesn't fight the top-bar hamburger. */
+#debugLogToggle { position: fixed; right: 8px; bottom: 76px; z-index: 100000; padding: 4px 8px; background: rgba(0,0,0,0.65); color: #fff; font: 600 9px/1 monospace; border: 1px solid #444; border-radius: 10px; cursor: pointer; user-select: none; opacity: 0.45; }
+#debugLogToggle:active { opacity: 1; }
+#debugLogPanel { position: fixed; inset: 0; z-index: 99999; background: rgba(0,0,0,0.96); color: #0f0; font-family: monospace; font-size: 10px; padding: 8px; overflow: auto; }
+#debugLogControls { position: sticky; top: 0; text-align: right; background: rgba(0,0,0,0.85); padding: 4px 0; margin-bottom: 6px; }
+#debugLogControls button { margin-left: 6px; padding: 4px 10px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; font-size: 11px; }
+#debugLogText { white-space: pre-wrap; margin: 0; line-height: 1.35; }
 .emb-stats-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 16px; }
 .emb-stat { background: var(--surface2); padding: 10px 8px; border-radius: 8px; text-align: center; }
 .emb-stat.clickable { cursor: pointer; } .emb-stat.clickable:active { opacity: 0.7; }

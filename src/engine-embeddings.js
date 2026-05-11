@@ -543,7 +543,7 @@ export function removeOrphanedEmbeddings() {
   _invalidatePathMap();
   _invalidateEmbIdxMap();
   if (embeddings.length > 0) {
-    setRec(new Recommender(embeddings)); rec.lam = _tuning.adventurous;
+    setRec(new Recommender(embeddings)); rec.lam = 1 - _tuning.adventurous;
     attachGpuToRec(rec, embeddings);
   }
   buildProfileVec().then(v => { setProfileVec(v); }).catch(() => {});
@@ -1010,7 +1010,7 @@ export async function _runPostBatchMerge(data, source) {
 
   if (embeddings.length > 0) {
     setRec(new Recommender(embeddings));
-    rec.lam = _tuning.adventurous;
+    rec.lam = 1 - _tuning.adventurous;
     attachGpuToRec(rec, embeddings);
     _cbs.invalidateArtistMap();
     _invalidateEmbIdxMap();
@@ -1142,7 +1142,7 @@ export async function reloadEmbeddingsFromDisk() {
   _embLog('info', `Reload from disk: merged ${mergedCount} embeddings into ${songs.length} songs`);
   if (mergedCount > 0 && embeddings.length > 0) {
     setRec(new Recommender(embeddings));
-    rec.lam = _tuning.adventurous;
+    rec.lam = 1 - _tuning.adventurous;
     attachGpuToRec(rec, embeddings);
     _cbs.invalidateArtistMap();
     _invalidateEmbIdxMap();

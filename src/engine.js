@@ -143,7 +143,11 @@ async function setTuning(partial) {
   // Clamp to [0,1]
   for (const k of Object.keys(_tuning)) _tuning[k] = Math.max(0, Math.min(1, _tuning[k]));
   await _saveTuning();
-  if (rec) rec.lam = _tuning.adventurous;
+  // MMR semantics: score = lam * relevance - (1-lam) * redundancy. High lam =
+  // pure relevance (clustered picks); low lam = diversity-biased. The UI exposes
+  // this as the "adventurous" slider where the user expects high = more diverse.
+  // Invert so the math matches the label.
+  if (rec) rec.lam = 1 - _tuning.adventurous;
   // Negative β changed -> rebuild profile vector
   setProfileVec(await buildProfileVec('tuning_changed'));
   _invalidateForYouCache('tuning_changed');
