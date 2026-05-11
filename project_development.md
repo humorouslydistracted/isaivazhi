@@ -542,6 +542,71 @@ If this finally works, the cold-start play-tap latency is structurally fixed. If
 
 ---
 
+### 2026-05-11 #13 — Queue=1 fix + cold-start bridge contention reduction
+
+User captured `logs.txt` on the first v12 launch. The native-sync read landed at **1 ms** as predicted (vs 4090 ms in v11 — the bridge cold-start tax is gone for the critical path). But two follow-on issues showed up:
+
+**1. "First song plays twice / next plays first song."**
+```
+16:40:03.116 loadAndPlay: songId=2394 title="Malare" items=1 startIndex=0 seekTo=0.962
+```
+The early-tap path in `togglePauseUI` fires `loadAndPlay` with `items: [currentSong]` only, because the full restore (`history/queue/timeline`) hasn't landed yet. Media3 plays the single item, then on song-end or Next-tap loops back to the same song. Visible as the "first song plays twice" symptom.
+
+**2. Cold-start setQueue took 3118 ms.**
+```
+16:40:03.116 loadAndPlay called
+16:40:06.234 loadAndPlay setQueue OK  (3118 ms later)
+16:40:06.444 meta fetch read+parse: 2226 ms (preloadEmbeddingsEarly contending)
+```
+`preloadEmbeddingsEarly` was firing right after `restorePlaybackState` resolved, hitting the bridge with a 5MB binary fetch + meta parse while `setQueue` was queued. Bridge contention dragged setQueue from a normal ~100ms to 3.1s.
+
+**Fix A — extend Media3 queue after full restore lands** (`src/app.js` post-restore block):
+```js
+} else if (nativeFileLoaded) {
+  // The early-tap loadAndPlay used items=[currentSong] only. Now that
+  // full restore has populated state.queue / timelineItems, push the
+  // extended upcoming to native so Next advances properly.
+  try {
+    _dbg('init: extending native queue from restored state');
+    await syncUpcomingNativeQueue();
+  } catch (e) { /* log + continue */ }
+}
+```
+`syncUpcomingNativeQueue` is the existing helper that calls `MusicBridge.replaceUpcoming({items: engine.getUpcomingNativeItems()})`.
+
+**Fix B — defer `preloadEmbeddingsEarly` when cold-restore is in flight**:
+```js
+if (!_pendingStartupResume && !nativeFileLoaded) {
+  engine.preloadEmbeddingsEarly();
+} else {
+  _dbg('init: preloadEmbeddingsEarly deferred — cold-restore loadAndPlay in flight');
+  setTimeout(() => {
+    _dbg('init: preloadEmbeddingsEarly (deferred) firing now');
+    engine.preloadEmbeddingsEarly();
+  }, 2500);
+}
+```
+If `_pendingStartupResume` (queued tap) or `nativeFileLoaded` (early-tap loadAndPlay already fired), defer the 5MB bin fetch by 2.5s so the bridge stays clear for the in-flight `setQueue`. Otherwise fire immediately as before.
+
+File modified: `src/app.js`.
+
+Verification: `npm.cmd run build` OK (Vite 308 ms; bundle `dist/assets/index-DD-MKglU.js` 310.27 kB / 86.67 kB gzipped); `npm.cmd run test:unit` 30/31; `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 6 s. Fresh APK at 391.2 MB, timestamp `2026-05-11 16:51`. GitHub release `v2026.05.11.13` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.13. Commit `757a70d` on `origin/main`.
+
+Expected on next launch:
+| | v12 capture | v13 (expected) |
+|---|---|---|
+| Critical state read | 1 ms ✓ | unchanged ✓ |
+| Cold-start setQueue OK | 3118 ms | well under 1 s |
+| Next button after cold restore | played same song (queue=1 loop) | advances through restored queue |
+| Play/pause | mostly fast, one 1566 ms outlier | unchanged (separate issue, mid-session sporadic) |
+
+New DBG markers:
+- `init: extending native queue from restored state` ← if Fix A fires (cold-restore happened)
+- `init: preloadEmbeddingsEarly deferred — cold-restore loadAndPlay in flight` ← if Fix B defers
+- `init: preloadEmbeddingsEarly (deferred) firing now` ← 2.5s later
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
