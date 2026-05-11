@@ -607,6 +607,46 @@ New DBG markers:
 
 ---
 
+### 2026-05-11 #14 — Dedupe upcoming queue against state.current
+
+User caught the real root cause of "next plays same song" by observation:
+
+> till embeddings ready, next button plays current song; once embeddings ready, song proceeds to next.
+
+The v13 log proved the hypothesis exactly:
+```
+42.531 init: extending native queue from restored state   ← Fix A fired (#13)
+44.027 queueCurrentChanged 1575 → 1575 (same song!)
+44.383 EVENT: embeddingsReady
+47.646 queueCurrentChanged 1575 → 2193 (different, advances!)
+```
+
+The auto-advance picked the current song before `embeddingsReady`, and a different song after. Fix A from #13 (calling `syncUpcomingNativeQueue` post-restore) was correct, but pushed a stale queue.
+
+**Why:** After `embeddingsReady`, `_doRefresh` rebuilds `state.queue` via the recommender which excludes `state.current` through the `embExclude` set. Before `embeddingsReady`, that refresh hasn't run — `state.queue` still has whatever shape the persisted-from-disk state had. On this device the restored queue happened to start with the current song at index 0 (likely from a previous-session save where the queue rotation happened after the current pointer moved). `syncUpcomingNativeQueue` then pushed `[currentSong, currentSong, item3, ...]` to Media3, and auto-advance played the duplicate.
+
+**Fix — dedupe inside `getUpcomingNativeItems()`** (`src/engine-playback.js:605`):
+```js
+const seen = new Set();
+if (state.current != null) seen.add(state.current);
+for (const q of state.queue) {
+  if (seen.has(q.id)) continue;
+  seen.add(q.id);
+  // ... push item ...
+}
+```
+Defends against any `state.queue` shape with duplicates or the current song. Same defensive pattern the recommender uses (`embExclude.add(state.current)` before `rec.recommend`).
+
+File modified: `src/engine-playback.js` (5-line change inside `getUpcomingNativeItems`).
+
+Verification: `npm.cmd run build` OK (Vite 331 ms; bundle `dist/assets/index-DOlkdrHe.js` 310.35 kB / 86.71 kB gzipped); `npm.cmd run test:unit` 30/31; `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 10 s. Fresh APK at 391.3 MB, timestamp `2026-05-11 17:01`. GitHub release `v2026.05.11.14` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.14. Commit `9116faa` on `origin/main`.
+
+Expected on next launch: cold-restore play → first auto-advance (or Next-tap) lands on a DIFFERENT song from the start, even before embeddings ready. Subsequent advances continue through the restored queue normally.
+
+User credit: this whole class of bug ("Fix A pushed a stale queue") was diagnosed entirely from user observation that the bug stopped happening at `embeddingsReady`. The log markers from #13 confirmed the timing match.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
