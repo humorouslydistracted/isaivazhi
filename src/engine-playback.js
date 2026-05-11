@@ -603,8 +603,22 @@ export function getNativeQueueItems() {
 }
 
 export function getUpcomingNativeItems() {
+  // 2026-05-11 #14: dedupe against state.current. The restored state.queue
+  // from disk can have the just-loaded current song at index 0 — e.g., when
+  // the previous session paused mid-song with the queue rotated such that the
+  // current song was item[0]. If we push that to Media3 as upcoming, the
+  // queue becomes [currentSong, currentSong, item3, ...] and auto-advance
+  // plays the current song again — visible as the user-reported "first song
+  // plays twice; next plays the same song" bug while embeddings are still
+  // loading. (After embeddingsReady, _doRefresh rebuilds state.queue cleanly
+  // because the recommender's exclude set covers state.current — that's why
+  // the issue disappears once aiReady fires.)
   const items = [];
+  const seen = new Set();
+  if (state.current != null) seen.add(state.current);
   for (const q of state.queue) {
+    if (seen.has(q.id)) continue;
+    seen.add(q.id);
     const s = songs[q.id];
     if (s && s.filePath) {
       items.push({
