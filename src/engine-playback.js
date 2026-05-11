@@ -46,7 +46,18 @@ export async function savePlaybackState(currentTimeSec, durationSec) {
       historyFilenames: state.history.map(id => songs[id] ? songs[id].filename : null).filter(Boolean),
       historyPos: state.historyPos,
       queueFilenames: state.queue.map(q => songs[q.id] ? { filename: songs[q.id].filename, similarity: q.similarity } : null).filter(Boolean),
-      listenedFilenames: state.listened.map(entry => {
+      // Cap persisted state.listened to the most recent N entries. The runtime
+      // array grows unbounded (one push per play/skip; reset only via
+      // surprise()) and on a heavy-use account it can reach 1000+ entries.
+      // Persisting that bloats `playback_state` to 500KB–1MB which makes the
+      // cold-start `Preferences.get` + JSON.parse + filename-mapping pass on
+      // restorePlaybackState a multi-second JS-thread block (observed:
+      // 372ms baseline -> 3610ms on a heavy account on 2026-05-11). Capping
+      // to 200 keeps sessionVec ramp-up working (it saturates well before
+      // that) AND keeps recommendations diverse — a huge listened list
+      // would otherwise make sessionVec average the centroid of every song
+      // the user has ever played, clustering recs around that centroid.
+      listenedFilenames: state.listened.slice(-200).map(entry => {
         if (!songs[entry.id]) return null;
         const copy = _copySessionEntry(entry);
         return {
@@ -183,9 +194,14 @@ export async function getLastPlayedDisplay() {
 
 export async function restorePlaybackState() {
   try {
+    const tStart = performance.now();
     const { value } = await Preferences.get({ key: 'playback_state' });
+    const tGet = performance.now();
     if (!value) return null;
+    console.log(`[PERF] restorePlaybackState: Preferences.get(playback_state) ${Math.round(tGet - tStart)} ms, payload ${value.length} chars`);
     const data = JSON.parse(value);
+    const tParse = performance.now();
+    console.log(`[PERF] restorePlaybackState: JSON.parse ${Math.round(tParse - tGet)} ms, listened=${(data.listenedFilenames || []).length} history=${(data.historyFilenames || []).length} queue=${(data.queueFilenames || []).length} timeline=${(data.timelineFilenames || []).length}`);
 
     // Restore by filename (stable) — fall back to old ID-based format for migration
     let currentId = null;
@@ -290,6 +306,7 @@ export async function restorePlaybackState() {
 
     const s = songs[state.current];
     const isFav = favorites.has(s.id);
+    console.log(`[PERF] restorePlaybackState: filename-mapping passes done ${Math.round(performance.now() - tStart)} ms total`);
     console.log('[FAV] restorePlaybackState: song', s.id, s.filename, 'isFavorite =', isFav, 'favorites set:', [...favorites]);
     return {
       id: s.id,

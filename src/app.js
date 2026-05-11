@@ -350,8 +350,10 @@ const formatTime = _playerUi.formatTime;
 // ([PERF], [Embedding], [FAV], [SCAN], [DBG], [REC]) so we don't have to hunt
 // for adb logcat to get a startup trace.
 function _dbg(msg) {
+  // The console.log hook below already mirrors [DBG]-tagged lines into the
+  // panel via _appendDbgLine. No direct call here — calling both produced
+  // duplicate lines (every entry showed up twice in the captured logs.txt).
   console.log('[DBG] ' + msg);
-  _appendDbgLine('[DBG] ' + msg);
 }
 
 function _appendDbgLine(line) {
