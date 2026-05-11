@@ -928,6 +928,20 @@ function _repairDiscoverCacheOnReady() {
 
 async function init() {
   try {
+    // 2026-05-11 #9: pre-warm the Capacitor native bridge before anything
+    // else. Captured logs show the FIRST bridge call after a quiet pool
+    // returns in ~150ms but any concurrent call drags to ~2.3s, and the
+    // first MusicBridge.pauseAudio() after a track transition can take
+    // 3.3s on its own. Firing a cheap no-op call here (getAudioState
+    // returns near-instantly when nothing is playing) spins up the bridge
+    // executor + JNI handle cache so subsequent calls land hot. Fire-and-
+    // forget — we don't care about the result, just the warmup.
+    try {
+      const tWarm = performance.now();
+      MusicBridge.getAudioState().then(() => {
+        console.log(`[PERF] bridge warmup (getAudioState): ${Math.round(performance.now() - tWarm)} ms`);
+      }).catch(() => {});
+    } catch (e) { /* ignore */ }
     await initActivityLog();
     logActivity({ category: 'app', type: 'app_opened', message: 'App opened', tags: ['startup'], important: true });
     // 2026-05-11 #5: do NOT call preloadEmbeddingsEarly() here anymore. The
@@ -1025,17 +1039,20 @@ async function init() {
     // `playback_state_current` written alongside the full state in
     // savePlaybackState (engine-playback.js).
     //
-    // Strategy:
-    //   1. Fire BOTH reads in parallel (Capacitor's executor pool handles
-    //      both; the small one returns first).
-    //   2. Await critical — set currentSong + display + position so the
-    //      queued play tap can fire IMMEDIATELY via loadAndPlay.
+    // Strategy (revised 2026-05-11 #9 after captured logs.txt showed parallel
+    // reads BOTH took ~2.3s — Capacitor's bridge effectively serializes ops
+    // across plugins, so racing them doesn't help; the first solo bridge call
+    // in a quiet pool returns in ~150ms while a second concurrent call drags
+    // everything to ~2.3s):
+    //   1. Await critical ALONE. Expected ~150ms based on the Library fetch
+    //      baseline (also fetch(convertFileSrc), also early init, no concurrent
+    //      bridge ops → 146ms in the same captured log).
+    //   2. Set currentSong + display + position so the queued play tap can
+    //      fire IMMEDIATELY via loadAndPlay.
     //   3. Await full second — populate history/queue/listened/timeline.
     //      The user is already hearing audio by then.
-    _dbg('init: restoring playback state (critical first)');
-    const criticalPromise = engine.restorePlaybackStateCritical();
-    const fullPromise = engine.restorePlaybackState();
-    const critical = await criticalPromise;
+    _dbg('init: restoring playback state (critical first, serial)');
+    const critical = await engine.restorePlaybackStateCritical();
     if (critical) {
       currentSong = critical.id;
       currentIsFav = !!critical.isFavorite;
@@ -1065,7 +1082,7 @@ async function init() {
         }, critical.currentTime || 0).catch(e => _dbg('early tap loadAndPlay err: ' + (e && e.message || e)));
       }
     }
-    const restored = await fullPromise;
+    const restored = await engine.restorePlaybackState();
     const pendingListenSnapshot = await engine.loadPendingListenSnapshot();
     _dbg('init: restore done ' + Math.round(performance.now() - _t0) + 'ms, currentSong=' + (restored ? restored.id : 'null') + ', filePath=' + (restored ? !!restored.filePath : 'n/a'));
     // 2026-05-11 #5: kick off the embedding bin preload NOW — restorePlaybackState
