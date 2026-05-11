@@ -278,6 +278,41 @@ Expected timing on second-after-install launch:
 
 ---
 
+### 2026-05-11 #8 — Diagnostic build for play/pause latency
+
+User captured `logs.txt` on the first v7 launch. Two findings:
+
+**1. File fast path didn't engage yet.** Critical read source was `prefs` (2335 ms for a 347-char payload). Expected for the first v7 launch — `savePlaybackState` hadn't run yet, so the file didn't exist. Once it does run (during this session), subsequent launches should hit the file path. Will verify on the next capture.
+
+**2. Play/pause latency is real but localized.** Tap-to-ack timings from the same session (all after `embeddingsReady` and `aiReady` fired):
+
+| Tap | Action | Bridge → `audioPlayStateChanged` |
+|---|---|---|
+| 15:00:56.234 | pausing 1572 | **3302 ms** ← slow one |
+| 15:01:02.750 | pausing 1202 | 37 ms |
+| 15:01:03.604 | resuming 1202 | 21 ms |
+| 15:01:04.791 | pausing 1202 | 18 ms |
+| 15:01:07.401 | pausing 1385 | 40 ms |
+| 15:01:08.069 | resuming 1385 | 31 ms |
+
+The slow tap was at `tap+1.7s` into a freshly-transitioned song (`queueCurrentChanged` at 54.560, tap at 56.234). The subsequent five on the same audio session were all 18–40 ms. Looks like a Media3-side prepare-to-pause cost specific to the first interaction with a newly-loaded track.
+
+To isolate JS-bridge vs native cost, this build adds `[PERF]` markers around `MusicBridge.pauseAudio()` / `resumeAudio()` calls in `togglePauseUI`:
+```
+[PERF] pauseAudio bridge resolved: Xms (tap+Yms)
+[PERF] resumeAudio bridge resolved: Xms (tap+Yms)
+```
+
+Combined with the existing `audioPlayStateChanged` DBG line:
+- If bridge resolves fast but state-change event lags → Media3 native is the cost.
+- If bridge itself takes seconds → bridge call queued behind something else.
+
+File modified: `src/app-player-ui.js`. No behavior change, just instrumentation.
+
+Verification: `npm.cmd run build` OK (Vite 628 ms; bundle `dist/assets/index-i057cddD.js` 309.40 kB / 86.43 kB gzipped); `npm.cmd run test:unit` 30/31; `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 8 s. Fresh APK at 390.5 MB, timestamp `2026-05-11 15:07`. GitHub release `v2026.05.11.8` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.8. Commit `9c03a67` on `origin/main`.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
