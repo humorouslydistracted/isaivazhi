@@ -53,6 +53,14 @@ public class MusicBridgePlugin extends Plugin {
     public static void cacheInitialPlaybackState(String json) {
         sCachedInitialPlaybackState = json;
     }
+    /**
+     * Static getter for the JavascriptInterface (NativeBridgeInterface). Lets
+     * the WebView-bound bridge read the cached value without instantiating
+     * the plugin.
+     */
+    public static String getCachedInitialPlaybackStateStatic() {
+        return sCachedInitialPlaybackState;
+    }
 
     @Override
     public void load() {

@@ -48,6 +48,24 @@ public class MainActivity extends BridgeActivity {
 
         registerPlugin(MusicBridgePlugin.class);
         super.onCreate(savedInstanceState);
+
+        // 2026-05-11 #12: bind a direct WebView JavascriptInterface that
+        // bypasses Capacitor's plugin pipeline entirely. The cached playback
+        // state is now accessible from JS as a synchronous global:
+        //   window._native.getCachedInitialState()
+        // — no Promise, no bridge round-trip, no cold-start tax.
+        // v11 proved that even an empty Capacitor PluginMethod call costs
+        // 1-4s during the first 3s of init. addJavascriptInterface uses the
+        // separate Android WebView JS bridge which doesn't share that tax.
+        try {
+            if (this.bridge != null && this.bridge.getWebView() != null) {
+                this.bridge.getWebView().addJavascriptInterface(new NativeBridgeInterface(), "_native");
+                Log.i(TAG, "NativeBridgeInterface attached as window._native");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed to attach NativeBridgeInterface: " + t.getMessage());
+        }
+
         requestStoragePermissions();
     }
 

@@ -244,21 +244,30 @@ export async function getLastPlayedDisplay() {
 export async function restorePlaybackStateCritical() {
   try {
     const tStart = performance.now();
-    // 2026-05-11 #11: native critical-path. MainActivity.onCreate reads
-    // SharedPreferences("CapacitorStorage").getString("playback_state_current")
-    // BEFORE the WebView loads and stashes the result in
-    // MusicBridgePlugin.sCachedInitialPlaybackState. This bridge call returns
-    // the cached string from in-memory in ~5-20ms regardless of how busy the
-    // bridge is — bypasses the 2-3s Capacitor cold-start tax entirely.
+    // 2026-05-11 #12: TRUE native critical-path. window._native is bound via
+    // WebView.addJavascriptInterface in MainActivity.onCreate (after
+    // super.onCreate). The call is SYNCHRONOUS from JS's perspective — no
+    // Promise, no Capacitor bridge round-trip, no plugin executor. The Java
+    // method returns the string directly to JS via Android's separate WebView
+    // JS bridge (not Capacitor's). Bypasses the 1-4s cold-start tax that
+    // v11's getCachedInitialState() PluginMethod still paid because it went
+    // through Capacitor.
     //
     // Order of attempts:
-    //   1. Native cached string (instant if MainActivity succeeded)
-    //   2. file fetch via convertFileSrc (works if native cache missing
-    //      but the JSON file was written by a prior session)
-    //   3. Capacitor Preferences (slowest, but most durable fallback)
+    //   1. window._native.getCachedInitialState() — sync, no bridge, ~1ms
+    //   2. MusicBridge.getCachedInitialState() — fallback if _native missing
+    //   3. file fetch via convertFileSrc
+    //   4. Capacitor Preferences
     let value = null;
-    let source = 'native';
-    if (typeof MusicBridge.getCachedInitialState === 'function') {
+    let source = 'native-sync';
+    try {
+      if (typeof window !== 'undefined' && window._native && typeof window._native.getCachedInitialState === 'function') {
+        const s = window._native.getCachedInitialState();
+        if (s && typeof s === 'string' && s.length > 0) value = s;
+      }
+    } catch (e) { /* fall through */ }
+    if (!value && typeof MusicBridge.getCachedInitialState === 'function') {
+      source = 'native-plugin';
       try {
         const r = await MusicBridge.getCachedInitialState();
         if (r && typeof r.value === 'string') value = r.value;
