@@ -136,6 +136,41 @@ Real-device validation expected: second launch after install should show `restor
 
 ---
 
+### 2026-05-11 #5 — Cold-start regression actually root-caused (Capacitor plugin pool contention, NOT state.listened bloat)
+
+User captured `logs.txt` after installing `v2026.05.11.4`. The new `[PERF] restorePlaybackState` markers added in #4 immediately exposed that the diagnosis from #4 was wrong:
+
+```
+14:27:24.283 [PERF] restorePlaybackState: Preferences.get(playback_state) 2466 ms, payload 10028 chars
+14:27:24.283 [PERF] restorePlaybackState: JSON.parse 1 ms, listened=48 history=64 queue=5 timeline=8
+14:27:24.285 [PERF] restorePlaybackState: filename-mapping passes done 2469 ms total
+14:27:24.493 [PERF] readBinaryStore bin fetch: 5013504 bytes in 3046 ms
+```
+
+**Payload is only 10 KB. `state.listened` is only 48 entries. `JSON.parse` takes 1 ms. The filename-mapping pass takes 2 ms.** The 2466 ms is consumed entirely by the `Preferences.get` JSI call itself, on a 10 KB key. The #4 hypothesis (huge persisted state) was disproven by the very markers it added.
+
+**Actual root cause: Capacitor plugin pool contention.** `preloadEmbeddingsEarly()` (Fix D from 2026-05-10) was kicking off the 5 MB binary fetch via `convertFileSrc(...)` → `fetch(...)` → Capacitor's WebView native plugin executor pool. `Preferences.get` runs through the same pool. The 5 MB transfer pinned the pool and every other plugin call queued behind it — so `restorePlaybackState`'s tiny read paid the full latency of the in-flight binary transfer (~2.5 s) and the mini-player play tap waited ~3.3 s tap-to-audio.
+
+Fix D's original justification — "overlap the slow ~500–1500 ms binary read with `loadData()`'s own ~500–1500 ms work" — assumed `loadData` was the dominant cost. With the Fix A `Promise.all` collapse (also 2026-05-10) `loadData` is now ~258 ms. The overlap window is gone, and the parallelism actively hurts the cold-start play-tap path because the bin fetch keeps running while `restorePlaybackState` is now the long-pole step.
+
+**Fix — defer `preloadEmbeddingsEarly()` until after `restorePlaybackState` resolves.** Moved the call out of the top of `init()` and into a slot immediately after `await engine.restorePlaybackState()` / `await engine.loadPendingListenSnapshot()`. `restorePlaybackState` now runs first on an uncontended Capacitor pool (expected ~300–500 ms), then the bin preload kicks off solo (expected ~500–1000 ms per Fix G timing). `startBackgroundScan()` picks up the in-flight preload promise via the existing reuse logic at `engine-data.js:516` (`if (_earlyEmbeddingPromise && _earlyEmbeddingPath === EXTERNAL_DATA_DIR)`).
+
+Predicted change:
+- `Preferences.get(playback_state)`: ~2500 ms → ~10–50 ms
+- `restorePlaybackState` total: ~3300 ms → ~300–500 ms
+- Mini-player play tap → audio: ~3300 ms → ~400 ms (back near 2026-05-11 08:00 baseline of 406 ms)
+- AI ready: maybe ~300–500 ms later than v4 (off the user-perceived path — by the time AI ready fires, the user has already been playing for seconds)
+
+File modified: `src/app.js` (one move).
+
+Verification: `npm.cmd run build` OK (Vite 1.15 s; bundle `dist/assets/index-DD4wvGO5.js` 306.12 kB / 85.65 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing `onNativeAdvance` baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 7 s. Fresh APK at 390.2 MB, timestamp `2026-05-11 14:34`. GitHub release `v2026.05.11.5` at https://github.com/humorouslydistracted/isaivazhi/releases/tag/v2026.05.11.5. Commit `6c0754e` on `origin/main`.
+
+The `[PERF] restorePlaybackState` markers stay so the next `logs.txt` capture instantly confirms or refutes the prediction. State.listened cap from #4 stays as belt-and-suspenders against future state bloat.
+
+Lesson: diagnostic markers are worth their weight. The cap-state hypothesis from #4 sounded plausible but the very markers it added disproved it within one capture. Don't ship state-shape changes without a measurement first.
+
+---
+
 ### 2026-05-11 #1 — AI embedding page hardening batch — four coordinated fixes for the user-reported bug where 11 songs stuck in "Embed Pending Songs" never embedded, the native notification advanced `3/11` with `.trashed-…` filenames, and both Common Logs + Embedding Logs tabs stayed empty for the run. Root cause: (a) `MediaScanHelper` filesystem-fallback walker was ingesting Android-trash files (`.trashed-<epoch>-<name>.ext`) and other dotfiles that MediaStore filters out, AND (b) `MusicBridgePlugin.embedNewSongs` called `startForegroundService` BEFORE `embeddingControllerClient.ensureConnected`, so MSG_PROGRESS broadcasts hit an empty `clients` list under bind contention and the JS side never observed `embeddingInProgress=true`. Four fixes landed in one pass: Fix 1 skips dotfile audio in both MediaStore + recursive scan paths and filters existing dotfile entries on library load; Fix 2 reorders embedNewSongs so bind completes BEFORE startForegroundService (clients guaranteed registered before any broadcast); Fix 3 adds `engine.resyncEmbeddingState()` called on every AI page open (forces fresh MSG_STATUS via `requestEmbeddingStatus` + pulls disk-truth via `reloadEmbeddingsFromDisk` when no batch is running, both silent on failure); Fix 4 plumbs `EmbeddingService.getActiveBackend()` through MSG_STATUS bundle + new `getEmbeddingBackend` PluginMethod + `getEmbeddingStatus().activeBackend` so the AI page shows an "ONNX backend: NPU / GPU (FP16) | NPU / GPU (FP32) | CPU" chip. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.5 MB, timestamp `2026-05-11 11:40` (bundle `dist/assets/index-BsXpwGim.js`). Pre-fix safety backup: `backups/embedding_fixes_prework_20260511_120000/`.)
 
 ### 2026-05-11 — AI embedding page hardening (4 coordinated fixes)
