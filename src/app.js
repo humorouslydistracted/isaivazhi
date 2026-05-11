@@ -1100,6 +1100,13 @@ async function init() {
     const restored = await engine.restorePlaybackState();
     const pendingListenSnapshot = await engine.loadPendingListenSnapshot();
     _dbg('init: restore done ' + Math.round(performance.now() - _t0) + 'ms, currentSong=' + (restored ? restored.id : 'null') + ', filePath=' + (restored ? !!restored.filePath : 'n/a'));
+    // 2026-05-11 #15: log the actual head of state.queue/timeline right after
+    // restore so we can correlate with what gets pushed to replaceUpcoming.
+    try {
+      const qSnap = engine.getNativeQueueSnapshot();
+      const ids = (qSnap && qSnap.items || []).slice(0, 5).map(i => i.songId).join(',');
+      _dbg('init: post-restore engine snapshot: items=' + (qSnap && qSnap.items ? qSnap.items.length : 0) + ' startIndex=' + (qSnap && qSnap.startIndex) + ' firstIds=[' + ids + ']');
+    } catch (e) { /* ignore */ }
     // 2026-05-11 #13: defer preloadEmbeddingsEarly even later when a
     // cold-restore loadAndPlay is in flight. Captured v12 log showed setQueue
     // taking 3.1s because preloadEmbeddingsEarly's meta fetch (2226ms) plus
@@ -1788,6 +1795,16 @@ function setupNativeAudioEvents() {
         refreshStateUI();
         engine.savePlaybackState(0);
       }
+    });
+
+    // 2026-05-11 #15: surface Media3's actual queue state to the JS DBG panel.
+    // Helps diagnose 'first song plays twice' without needing adb logcat —
+    // Media3 emits queueChanged on every internal queue mutation with the
+    // currentSongId / nextSongId / firstIds fields added in this build.
+    MusicBridge.addListener('queueChanged', (data) => {
+      _dbg('queueChanged: length=' + data.length + ' currentIndex=' + data.currentIndex
+        + ' currentSongId=' + data.currentSongId + ' nextSongId=' + data.nextSongId
+        + ' firstIds=[' + (data.firstIds || '') + ']');
     });
 
     MusicBridge.addListener('queueEnded', () => {
@@ -2530,7 +2547,11 @@ async function loadAndPlay(songInfo, seekToSec) {
     const items = queueSnapshot.items || [];
     const startIndex = Number.isInteger(queueSnapshot.startIndex) ? queueSnapshot.startIndex : 0;
     const loopModeMap = { off: 0, one: 1, all: 2 };
-    _dbg('loadAndPlay: songId=' + songInfo.id + ' title="' + songInfo.title + '" items=' + items.length + ' startIndex=' + startIndex + ' seekTo=' + requestedSeek + ' embReady=' + engine.isEmbeddingsReady());
+    // 2026-05-11 #15: log the actual songIds we're about to send to Media3.
+    // The user's 'first song plays twice' bug couldn't be diagnosed from item
+    // counts alone — we need to see which IDs are at the head of the queue.
+    const firstFiveIds = items.slice(0, 5).map(i => i.songId).join(',');
+    _dbg('loadAndPlay: songId=' + songInfo.id + ' title="' + songInfo.title + '" items=' + items.length + ' startIndex=' + startIndex + ' seekTo=' + requestedSeek + ' embReady=' + engine.isEmbeddingsReady() + ' firstIds=[' + firstFiveIds + ']');
     try {
       if (items.length > 0) {
         await MusicBridge.setQueue({ items, startIndex, seekTo: requestedSeek });
@@ -2618,8 +2639,16 @@ function prefetchNext() {
 async function syncUpcomingNativeQueue() {
   if (!nativeFileLoaded) return;
   const upcoming = engine.getUpcomingNativeItems();
+  // 2026-05-11 #15: log items being pushed to replaceUpcoming. The user
+  // reports first song plays twice even with the v14 dedupe in place;
+  // need to see exactly what IDs are at the head of the upcoming list to
+  // tell whether the dedupe ran AND whether the queue Media3 actually
+  // receives starts with a different song than the current one.
+  const firstFive = upcoming.slice(0, 5).map(i => i.songId).join(',');
+  _dbg('replaceUpcoming: items=' + upcoming.length + ' firstIds=[' + firstFive + ']');
   try {
     await MusicBridge.replaceUpcoming({ items: upcoming });
+    _dbg('replaceUpcoming: OK');
   } catch (e) {
     _dbg('replaceUpcoming err: ' + e.message);
   }

@@ -269,7 +269,15 @@ public class Media3PlaybackService extends MediaSessionService {
     private final class PlayerEventListener implements Player.Listener {
         @Override
         public void onIsPlayingChanged(boolean isPlaying) {
-            Log.i(TAG, "onIsPlayingChanged: " + isPlaying + " current=" + summarizePath(currentItemPath()));
+            // 2026-05-11 #15: log more context so we can tell WHY isPlaying flipped.
+            int state = player != null ? player.getPlaybackState() : -1;
+            int idx = player != null ? player.getCurrentMediaItemIndex() : -1;
+            int total = player != null ? player.getMediaItemCount() : -1;
+            Log.i(TAG, "onIsPlayingChanged: " + isPlaying
+                    + " state=" + state    // 1=IDLE 2=BUFFERING 3=READY 4=ENDED
+                    + " mediaIdx=" + idx
+                    + " mediaTotal=" + total
+                    + " current=" + summarizePath(currentItemPath()));
             if (isPlaying) {
                 playbackCompletedState = false;
                 startProgressUpdates();
@@ -283,6 +291,11 @@ public class Media3PlaybackService extends MediaSessionService {
         @Override
         public void onMediaItemTransition(@Nullable MediaItem mediaItem, int reason) {
             int newIndex = player != null ? player.getCurrentMediaItemIndex() : C.INDEX_UNSET;
+            // 2026-05-11 #15: log transition reason (AUTO=0, SEEK=1, PLAYLIST_CHANGED=2, REPEAT=3).
+            Log.i(TAG, "onMediaItemTransition: reason=" + reason
+                    + " newIndex=" + newIndex
+                    + " currentIndex=" + currentIndex
+                    + " suppress=" + suppressNextTransitionEvent + "/" + suppressedTransitionIndex);
             if (suppressNextTransitionEvent && newIndex == suppressedTransitionIndex) {
                 suppressNextTransitionEvent = false;
                 suppressedTransitionIndex = C.INDEX_UNSET;
@@ -302,6 +315,11 @@ public class Media3PlaybackService extends MediaSessionService {
 
         @Override
         public void onPlaybackStateChanged(int playbackState) {
+            // 2026-05-11 #15: log every state change so we can tell when STATE_ENDED
+            // fires unexpectedly (which would explain isPlaying=false + immediate
+            // queueCurrentChanged at the same currentIndex).
+            Log.i(TAG, "onPlaybackStateChanged: state=" + playbackState
+                    + " (1=IDLE 2=BUFFERING 3=READY 4=ENDED)");
             if (playbackState == Player.STATE_READY) {
                 lastKnownDurationMs = currentDurationMs();
                 emitAudioTimeUpdate();
@@ -368,9 +386,16 @@ public class Media3PlaybackService extends MediaSessionService {
             playbackCompletedState = false;
             suppressUpcomingTransition(currentIndex);
             PlaybackQueueItem startItem = queue.get(currentIndex);
+            // 2026-05-11 #15: log first 5 ids of the queue for end-to-end trace.
+            StringBuilder ids = new StringBuilder();
+            for (int i = 0; i < Math.min(5, queue.size()); i++) {
+                if (i > 0) ids.append(',');
+                ids.append(queue.get(i).songId);
+            }
             Log.i(TAG, "setQueue: starting index=" + currentIndex
                     + " size=" + queue.size()
                     + " seekMs=" + Math.max(0L, seekToMs)
+                    + " firstIds=[" + ids + "]"
                     + " file=" + summarizePath(startItem.filePath));
 
             player.setMediaItems(PlaybackQueueItem.toMediaItems(queue), currentIndex, Math.max(0L, seekToMs));
@@ -384,7 +409,22 @@ public class Media3PlaybackService extends MediaSessionService {
 
     private void replaceUpcoming(List<PlaybackQueueItem> items) {
         synchronized (queueLock) {
+            // 2026-05-11 #15: log entry state + incoming items for full trace.
+            StringBuilder incomingIds = new StringBuilder();
+            int incomingSize = items != null ? items.size() : 0;
+            for (int i = 0; i < Math.min(5, incomingSize); i++) {
+                if (i > 0) incomingIds.append(',');
+                incomingIds.append(items.get(i).songId);
+            }
+            long currentSongId = (currentIndex >= 0 && currentIndex < queue.size())
+                    ? queue.get(currentIndex).songId : -1L;
+            Log.i(TAG, "replaceUpcoming: entry currentIndex=" + currentIndex
+                    + " queueSize=" + queue.size()
+                    + " currentSongId=" + currentSongId
+                    + " incomingSize=" + incomingSize
+                    + " incomingFirstIds=[" + incomingIds + "]");
             if (currentIndex == C.INDEX_UNSET || currentIndex >= queue.size()) {
+                Log.w(TAG, "replaceUpcoming: no usable current, falling back to setQueue");
                 setQueue(items, 0, 0L);
                 return;
             }
@@ -397,6 +437,16 @@ public class Media3PlaybackService extends MediaSessionService {
             int fromIndex = Math.min(currentIndex + 1, player.getMediaItemCount());
             int toIndex = player.getMediaItemCount();
             player.replaceMediaItems(fromIndex, toIndex, PlaybackQueueItem.toMediaItems(items));
+            // Log final queue state after the rebuild.
+            StringBuilder finalIds = new StringBuilder();
+            for (int i = 0; i < Math.min(5, queue.size()); i++) {
+                if (i > 0) finalIds.append(',');
+                finalIds.append(queue.get(i).songId);
+            }
+            Log.i(TAG, "replaceUpcoming: after rebuild queueSize=" + queue.size()
+                    + " currentIndex=" + currentIndex
+                    + " firstIds=[" + finalIds + "]"
+                    + " replaceMediaItems(from=" + fromIndex + ", to=" + toIndex + ")");
             emitQueueChanged();
         }
     }
@@ -539,6 +589,21 @@ public class Media3PlaybackService extends MediaSessionService {
         synchronized (queueLock) {
             bundle.putInt("length", queue.size());
             bundle.putInt("currentIndex", currentIndex);
+            // 2026-05-11 #15: include first 5 ids + 2 around currentIndex so the
+            // JS DBG log can see what Media3's queue actually looks like. Helps
+            // verify replaceUpcoming behaviour without needing adb logcat.
+            StringBuilder ids = new StringBuilder();
+            for (int i = 0; i < Math.min(5, queue.size()); i++) {
+                if (i > 0) ids.append(',');
+                ids.append(queue.get(i).songId);
+            }
+            bundle.putString("firstIds", ids.toString());
+            if (currentIndex >= 0 && currentIndex < queue.size()) {
+                bundle.putLong("currentSongId", queue.get(currentIndex).songId);
+            }
+            if (currentIndex + 1 >= 0 && currentIndex + 1 < queue.size()) {
+                bundle.putLong("nextSongId", queue.get(currentIndex + 1).songId);
+            }
         }
         emitCustomCommandToControllers(PlaybackCommandContract.EVT_QUEUE_CHANGED, bundle);
     }
