@@ -1004,6 +1004,16 @@ async function init() {
     engine.onRecommendationRebuildStatus(_handleRecommendationRebuildStatus);
     await engine.loadData();
     _dbg('init: loadData done ' + Math.round(performance.now() - _t0) + 'ms, songs=' + engine.getPlayableSongs().length);
+    // 2026-05-11 #10: front-load the critical playback-state fetch IMMEDIATELY
+    // after loadData, BEFORE the listener-setup chain. Captured v9 log showed
+    // the same fetch (file path, ~275 chars) taking 2221ms when fired AFTER
+    // ~12-15 MusicBridge.addListener bridge calls had queued — but the Library
+    // fetch (250KB) at this exact point of init landed in 128ms because the
+    // bridge was quiet. Kick off NOW (no await) so the fetch runs on a quiet
+    // bridge in parallel with the sync setup work; we await it just before
+    // the play-tap critical-restore logic, by which point it should already
+    // be resolved. Expected critical-read drop: 2221 ms -> ~150 ms.
+    const _criticalRestorePromise = engine.restorePlaybackStateCritical();
     allSongs = engine.getPlayableSongs();
     allAlbums = engine.getAlbums();
     // 2026-05-10 follow-up #11: pre-render Songs + Albums lists immediately so
@@ -1052,7 +1062,12 @@ async function init() {
     //   3. Await full second — populate history/queue/listened/timeline.
     //      The user is already hearing audio by then.
     _dbg('init: restoring playback state (critical first, serial)');
-    const critical = await engine.restorePlaybackStateCritical();
+    // 2026-05-11 #10: await the front-loaded critical promise (kicked off
+    // right after loadData above) rather than firing a new one here. By now
+    // it has been in flight for ~300-400ms while sync setup ran, so the
+    // await should resolve near-immediately (vs the ~2.2s observed when
+    // fired from this position after the addListener chain queued).
+    const critical = await _criticalRestorePromise;
     if (critical) {
       currentSong = critical.id;
       currentIsFav = !!critical.isFavorite;
