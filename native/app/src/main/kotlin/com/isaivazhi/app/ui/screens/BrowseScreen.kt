@@ -1,0 +1,329 @@
+package com.isaivazhi.app.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import com.isaivazhi.app.engine.HistoryEngine
+import com.isaivazhi.app.engine.PlaylistsEngine
+import com.isaivazhi.app.engine.Song
+
+enum class BrowseCategory(val title: String) {
+    MostPlayed("Most Played"),
+    RecentlyPlayed("Recently Played"),
+    NeverPlayed("Never Played"),
+    LastAdded("Last Added"),
+    Favorites("Favorites"),
+    Disliked("Disliked Songs"),
+}
+
+data class BrowseTile(val category: BrowseCategory, val count: Int, val previewArt: List<String?>)
+
+@Composable
+fun BrowseScreen(
+    tiles: List<BrowseTile>,
+    playlists: List<PlaylistsEngine.Playlist>,
+    onOpenCategory: (BrowseCategory) -> Unit,
+    onCreatePlaylist: (String) -> Unit,
+    onOpenPlaylist: (id: String) -> Unit,
+    onDeletePlaylist: (id: String) -> Unit,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
+) {
+    var showCreateDialog by remember { mutableStateOf(false) }
+
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(2),
+        modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+        contentPadding = contentPadding,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        items(tiles, key = { it.category.name }) { tile ->
+            TileCard(tile = tile, onClick = { onOpenCategory(tile.category) })
+        }
+
+        // Playlists section — spans both columns.
+        item(span = { GridItemSpan(2) }, key = "playlists_header") {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Playlists",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { showCreateDialog = true }) {
+                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.size(4.dp))
+                    Text("New")
+                }
+            }
+        }
+        if (playlists.isEmpty()) {
+            item(span = { GridItemSpan(2) }, key = "playlists_empty") {
+                Text(
+                    text = "No playlists yet. Tap “New” to create one.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 6.dp),
+                )
+            }
+        } else {
+            items(playlists, key = { "pl_${it.id}" }, span = { GridItemSpan(2) }) { pl ->
+                PlaylistRow(
+                    playlist = pl,
+                    onOpen = { onOpenPlaylist(pl.id) },
+                    onDelete = { onDeletePlaylist(pl.id) },
+                )
+            }
+        }
+    }
+
+    if (showCreateDialog) {
+        var draft by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showCreateDialog = false },
+            title = { Text("New playlist") },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    label = { Text("Name") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val name = draft.trim().ifBlank { "New playlist" }
+                    onCreatePlaylist(name)
+                    showCreateDialog = false
+                }) { Text("Create") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateDialog = false }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun PlaylistRow(
+    playlist: PlaylistsEngine.Playlist,
+    onOpen: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .clickable(onClick = onOpen)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.PlaylistPlay,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.size(22.dp),
+        )
+        Spacer(Modifier.size(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = playlist.name,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "${playlist.songFilenames.size} songs",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        IconButton(onClick = onDelete) {
+            Icon(
+                imageVector = Icons.Filled.DeleteOutline,
+                contentDescription = "Delete playlist",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TileCard(tile: BrowseTile, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = tile.category.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (tile.count > 0) {
+                Text(
+                    text = tile.count.toString(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Box(modifier = Modifier.fillMaxWidth().aspectRatio(1f)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)) {
+            if (tile.previewArt.isEmpty() || tile.previewArt.all { it == null }) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Empty",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                        TileArtCell(tile.previewArt.getOrNull(0), Modifier.weight(1f).fillMaxSize())
+                        TileArtCell(tile.previewArt.getOrNull(1), Modifier.weight(1f).fillMaxSize())
+                    }
+                    Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                        TileArtCell(tile.previewArt.getOrNull(2), Modifier.weight(1f).fillMaxSize())
+                        TileArtCell(tile.previewArt.getOrNull(3), Modifier.weight(1f).fillMaxSize())
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TileArtCell(path: String?, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier.background(MaterialTheme.colorScheme.surface),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (path != null) {
+            ArtThumbnail(filePath = path, size = 72.dp, cornerRadius = 0.dp)
+        }
+    }
+}
+
+/** Compute the 7 browse tiles in display order. */
+fun buildBrowseTiles(
+    songs: List<Song>,
+    historyStats: Map<String, HistoryEngine.Stats>,
+    historyEvents: List<HistoryEngine.Event>,
+    favorites: Set<String>,
+    disliked: Set<String>,
+): List<BrowseTile> {
+    val byFilename = songs.associateBy { it.filename }
+
+    val mostPlayed = historyStats.entries
+        .filter { it.value.plays > 0 }
+        .sortedByDescending { it.value.plays }
+        .mapNotNull { byFilename[it.key] }
+        .take(4)
+
+    val recentlyPlayed = historyEvents
+        .distinctBy { it.filename }
+        .mapNotNull { byFilename[it.filename] }
+        .take(4)
+
+    val neverPlayed = songs.filter { it.filename !in historyStats.keys && it.filePath != null }
+    val lastAdded = songs.filter { it.filePath != null }
+        .sortedByDescending { it.id }
+        .take(4)
+    val favSongs = songs.filter { it.filename in favorites }
+    val disSongs = songs.filter { it.filename in disliked }
+
+    return listOf(
+        BrowseTile(BrowseCategory.MostPlayed, mostPlayed.size, mostPlayed.map { it.filePath }),
+        BrowseTile(BrowseCategory.RecentlyPlayed, recentlyPlayed.size, recentlyPlayed.map { it.filePath }),
+        BrowseTile(BrowseCategory.NeverPlayed, neverPlayed.size,
+            neverPlayed.shuffled().take(4).map { it.filePath }),
+        BrowseTile(BrowseCategory.LastAdded, lastAdded.size, lastAdded.map { it.filePath }),
+        BrowseTile(BrowseCategory.Favorites, favSongs.size,
+            favSongs.take(4).map { it.filePath }),
+        BrowseTile(BrowseCategory.Disliked, disSongs.size,
+            disSongs.take(4).map { it.filePath }),
+    )
+}
+
+/** Expand a tile into its full song list (for ViewAllScreen). */
+fun browseCategorySongs(
+    category: BrowseCategory,
+    songs: List<Song>,
+    historyStats: Map<String, HistoryEngine.Stats>,
+    historyEvents: List<HistoryEngine.Event>,
+    favorites: Set<String>,
+    disliked: Set<String>,
+): List<Song> {
+    val byFilename = songs.associateBy { it.filename }
+    return when (category) {
+        BrowseCategory.MostPlayed -> historyStats.entries
+            .filter { it.value.plays > 0 }
+            .sortedByDescending { it.value.plays }
+            .mapNotNull { byFilename[it.key] }
+        BrowseCategory.RecentlyPlayed -> historyEvents
+            .distinctBy { it.filename }
+            .mapNotNull { byFilename[it.filename] }
+        BrowseCategory.NeverPlayed -> songs.filter { it.filename !in historyStats.keys && it.filePath != null }
+        BrowseCategory.LastAdded -> songs.filter { it.filePath != null }.sortedByDescending { it.id }
+        BrowseCategory.Favorites -> songs.filter { it.filename in favorites }
+        BrowseCategory.Disliked -> songs.filter { it.filename in disliked }
+    }
+}

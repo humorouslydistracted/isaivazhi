@@ -1,23 +1,16 @@
-# Node / web
-node_modules/
-dist/
-.vite/
-test-results/
-playwright-report/
-coverage/
+# IsaiVazhi (Kotlin/Compose rewrite, v2.x)
 
-# Android / Gradle
-android/build/
-android/app/build/
-android/.gradle/
-android/.idea/
-android/.kotlin/
-android/local.properties
-android/capacitor-cordova-android-plugins/build/
+# Android / Gradle build outputs
+native/build/
+native/app/build/
+native/.gradle/
+native/.idea/
+native/.kotlin/
+native/local.properties
+native/app/.cxx/
+native/captures/
+native/.externalNativeBuild/
 *.iml
-
-# `npx cap sync` output — regenerated from dist/ on every sync
-android/app/src/main/assets/public/
 
 # IDE / OS
 .vscode/
@@ -31,7 +24,9 @@ Thumbs.db
 # Local logs / scratch
 logs.txt
 *.log
-colab_embedding_generator copy.py
+crash_logs.txt
+debug.txt
+emulator_logcat*.txt
 
 # Large binaries — ship via GitHub Releases instead
 # The `releases/` folder is a staging area for Release assets; do not commit.
@@ -39,7 +34,15 @@ releases/
 app-debug.apk
 *.pkl
 
-# CLAP ONNX model — not required; on-device inference path is unused.
-# If you want it, download separately and drop into android/app/src/main/assets/.
-android/app/src/main/assets/clap_audio_encoder.onnx
-android/app/src/main/assets/clap_audio_encoder.onnx.data
+# CLAP ONNX model — not bundled. The on-device inference path is unused
+# (embeddings are produced via the Colab/local scripts and copied to the
+# app's SQLite store). If you need the encoder, download separately and
+# drop it into native/app/src/main/assets/.
+native/app/src/main/assets/clap_audio_encoder.onnx
+native/app/src/main/assets/clap_audio_encoder.onnx.data
+
+# Python helper / venv state
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Storage / media permissions: same surface as the Capacitor app. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.IsaiVazhi"
+        android:supportsRtl="true"
+        android:allowBackup="true"
+        android:requestLegacyExternalStorage="true"
+        tools:targetApi="36">
+
+        <activity
+            android:name="com.isaivazhi.app.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.IsaiVazhi.Splash"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Media3 playback service. In-process for the Kotlin app — the
+             Capacitor build kept this in :playback for crash isolation, but
+             that adds a Binder IPC hop on every play/pause/seek (30–80 ms
+             user-felt latency). In-process means MediaController <-> session
+             calls are direct JVM method dispatch. ExoPlayer is mature and a
+             playback crash is rare; the tradeoff favors latency. -->
+        <service
+            android:name="com.isaivazhi.app.Media3PlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+
+        <!-- Embedding foreground service in :ai process — ONNX inference runs here,
+             completely isolated from the UI process.
+             Push #40 Tier 3H: stopWithTask="false" so Android does NOT
+             auto-kill the service when the user swipes the app from
+             recents. The service's onTaskRemoved handler still re-posts
+             a RESUME intent as a belt-and-suspenders measure. -->
+        <service
+            android:name="com.isaivazhi.app.EmbeddingForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:process=":ai"
+            android:stopWithTask="false" />
+
+    </application>
+</manifest>
