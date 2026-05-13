@@ -126,6 +126,8 @@ fun TasteScreen(
                     inTopPositive30 = dec.inTopPositive30,
                     inTopNegative30 = dec.inTopNegative30,
                     inTop30 = dec.inTop30,
+                    isSuspicious = dec.isSuspicious,
+                    suspiciousReason = dec.suspiciousReason,
                 )
             } else {
                 val st = stats[song.filename]
@@ -487,6 +489,8 @@ private data class SignalRowData(
     val inTopPositive30: Boolean,
     val inTopNegative30: Boolean,
     val inTop30: Boolean,
+    val isSuspicious: Boolean = false,
+    val suspiciousReason: String = "",
 )
 
 private fun daysSinceFrom(lastPlayedAt: Long): Int? {
@@ -763,6 +767,7 @@ private fun SignalRowView(
                 }
                 if (row.isHardBlocked) StatusChip("Rec blocked", ScoreNegativeColor)
                 if (row.isShortListened) StatusChip("Short-listened", ScoreNegativeColor)
+                if (row.isSuspicious) StatusChip("Review", Color(0xFFFBBF24)) // amber/warning
                 if (row.inTopPositive30) StatusChip("Top +30", ScorePositiveColor)
                 else if (row.inTopNegative30) StatusChip("Top -30", ScoreNegativeColor)
                 else if (row.inTop30) StatusChip("Top 30", ChipNeutralColor)

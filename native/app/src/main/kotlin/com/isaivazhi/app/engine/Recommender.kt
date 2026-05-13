@@ -2,6 +2,7 @@ package com.isaivazhi.app.engine
 
 import com.isaivazhi.app.NativeAccelerator
 import kotlin.math.sqrt
+import java.util.Random as JavaRandom
 
 /**
  * Recommender — picks the next K songs to play based on similarity to a
@@ -23,6 +24,181 @@ class Recommender(
     private val embeddingDb: EmbeddingDbFacade,
 ) {
 
+    /**
+     * Push #67: blend weight schedule. Capacitor parity (`_blendWeights`
+     * in engine.js:653). Mode controls which entry point we're building
+     * for; the weights ramp based on how many session listens have
+     * accumulated so the first-of-session recs are current-song-heavy,
+     * and as the session grows the weights shift toward session+profile.
+     */
+    data class BlendWeights(
+        val wCurrent: Float,
+        val wSession: Float,
+        val wProfile: Float,
+    )
+
+    fun blendWeights(
+        mode: String,
+        nListened: Int,
+        hasCurrent: Boolean,
+        hasSession: Boolean,
+        hasProfile: Boolean,
+    ): BlendWeights {
+        if (mode == "refresh") {
+            if (hasSession && hasProfile && hasCurrent) return BlendWeights(0.30f, 0.40f, 0.30f)
+            if (hasSession && hasProfile) return BlendWeights(0f, 0.60f, 0.40f)
+            if (hasSession && hasCurrent) return BlendWeights(0.30f, 0.70f, 0f)
+            if (hasSession) return BlendWeights(0f, 1.0f, 0f)
+            if (hasProfile && hasCurrent) return BlendWeights(0.40f, 0f, 0.60f)
+            if (hasProfile) return BlendWeights(0f, 0f, 1.0f)
+            return BlendWeights(1.0f, 0f, 0f)
+        }
+        // mode == "play" (default): current-song-heavy, ramps to blend.
+        if (!hasCurrent) return BlendWeights(0f, if (hasSession) 0.6f else 0f, if (hasProfile) (if (hasSession) 0.4f else 1f) else 0f)
+        if (!hasSession && !hasProfile) return BlendWeights(1.0f, 0f, 0f)
+        if (!hasSession) {
+            val t = (nListened.toFloat() / 8f).coerceAtMost(1f)
+            val wCurrent = 0.5f + 0.1f * t
+            return BlendWeights(wCurrent, 0f, 1f - wCurrent)
+        }
+        if (!hasProfile) {
+            val t = (nListened.toFloat() / 10f).coerceAtMost(1f)
+            val wCurrent = 0.6f - 0.2f * t
+            return BlendWeights(wCurrent, 1f - wCurrent, 0f)
+        }
+        val t = (nListened.toFloat() / 10f).coerceAtMost(1f)
+        var wCurrent = 0.50f - 0.12f * t
+        var wSession = 0.52f * t
+        var wProfile = 1f - wCurrent - wSession
+        if (wProfile < 0.08f) wProfile = 0.08f
+        val total = wCurrent + wSession + wProfile
+        return BlendWeights(wCurrent / total, wSession / total, wProfile / total)
+    }
+
+    /**
+     * Push #67: build a blended query vector that mixes the current
+     * song's embedding with the session vector (last-N qualified
+     * listens) and the profile vector (top-30 long-term centroid).
+     * Used as the query for `recommendUpcoming` so the recommender
+     * reflects all three time scales.
+     *
+     * Capacitor parity (`_buildBlendedVec` in engine.js).
+     */
+    suspend fun buildBlendedVec(
+        currentSongHash: String?,
+        sessionListened: List<com.isaivazhi.app.engine.SessionEngine.ListenedEntry>,
+        profileVec: FloatArray?,
+        library: List<Song>,
+        mode: String = "play",
+        sessionBias: Float = 0.5f,
+    ): Triple<FloatArray?, BlendWeights, String> {
+        val byFilename = library.associateBy { it.filename }
+        // Build session vec from non-skip listened entries with frac >= 0.3.
+        val sessionHashes = sessionListened
+            .filter { it.fraction >= 0.30f }
+            .mapNotNull { byFilename[it.filename]?.contentHash }
+            .distinct()
+        val currentVec = if (!currentSongHash.isNullOrBlank()) {
+            embeddingDb.getVecsByHashes(listOf(currentSongHash))[currentSongHash]
+        } else null
+        val sessionVecs = if (sessionHashes.isNotEmpty()) {
+            embeddingDb.getVecsByHashes(sessionHashes)
+        } else emptyMap()
+        val sessionVec = if (sessionVecs.isNotEmpty()) avgVec(sessionVecs.values.toList()) else null
+        val hasCurrent = currentVec != null
+        val hasSession = sessionVec != null
+        val hasProfile = profileVec != null && profileVec.isNotEmpty()
+        val nListened = sessionListened.size
+        var w = blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)
+        // Apply sessionBias to bias session vs profile (Capacitor parity).
+        if (w.wSession > 0 && w.wProfile > 0) {
+            val sb = sessionBias.coerceIn(0f, 0.95f)
+            val rest = w.wSession + w.wProfile
+            w = BlendWeights(w.wCurrent, rest * sb, rest * (1f - sb))
+        }
+        if (!hasCurrent && !hasSession && !hasProfile) return Triple(null, w, "empty")
+        // Choose a dim from any available vec.
+        val dim = currentVec?.size ?: sessionVec?.size ?: profileVec?.size ?: 0
+        if (dim == 0) return Triple(null, w, "no_dim")
+        val out = FloatArray(dim)
+        fun add(v: FloatArray?, wgt: Float) {
+            if (v == null || wgt <= 0f || v.size != dim) return
+            for (i in 0 until dim) out[i] += v[i] * wgt
+        }
+        add(currentVec, w.wCurrent)
+        add(sessionVec, w.wSession)
+        add(profileVec, w.wProfile)
+        // L2 normalize.
+        var n2 = 0f
+        for (i in 0 until dim) n2 += out[i] * out[i]
+        val inv = if (n2 > 0f) 1f / sqrt(n2) else 0f
+        for (i in 0 until dim) out[i] *= inv
+        val label = when {
+            w.wSession > 0f && w.wProfile > 0f -> "session+profile"
+            w.wSession > 0f -> "session"
+            w.wProfile > 0f -> "profile"
+            else -> "current"
+        }
+        return Triple(out, w, label)
+    }
+
+    private fun avgVec(vecs: List<FloatArray>): FloatArray? {
+        if (vecs.isEmpty()) return null
+        val dim = vecs[0].size
+        if (dim == 0) return null
+        val out = FloatArray(dim)
+        var count = 0
+        for (v in vecs) {
+            if (v.size != dim) continue
+            for (i in 0 until dim) out[i] += v[i]
+            count++
+        }
+        if (count == 0) return null
+        for (i in 0 until dim) out[i] /= count
+        // Normalize.
+        var n2 = 0f
+        for (i in 0 until dim) n2 += out[i] * out[i]
+        val inv = if (n2 > 0f) 1f / sqrt(n2) else 0f
+        for (i in 0 until dim) out[i] *= inv
+        return out
+    }
+
+    /**
+     * Push #67: query the embedding DB by an arbitrary unit-norm vector.
+     * Used by the blended query in [recommendUpcoming]. Brute-force
+     * cosine over the library (NEON-accelerated batch dot product);
+     * acceptable for ~2.5k library size where it runs in <50ms.
+     */
+    suspend fun nearestNeighborsForVector(
+        queryVec: FloatArray,
+        library: List<Song>,
+        k: Int,
+        excludeFilenames: Set<String> = emptySet(),
+    ): List<ScoredSong> {
+        val embedded = library.asSequence()
+            .filter { !it.contentHash.isNullOrBlank() && it.filePath != null }
+            .filter { it.filename !in excludeFilenames }
+            .distinctBy { it.contentHash!! }
+            .toList()
+        if (embedded.isEmpty()) return emptyList()
+        val hashes = embedded.mapNotNull { it.contentHash }
+        val vecs = embeddingDb.getVecsByHashes(hashes)
+        if (vecs.isEmpty()) return emptyList()
+        val dim = queryVec.size
+        val scored = ArrayList<ScoredSong>(embedded.size)
+        for (song in embedded) {
+            val v = vecs[song.contentHash ?: continue] ?: continue
+            if (v.size != dim) continue
+            var dot = 0f
+            var vn = 0f
+            for (i in 0 until dim) { dot += queryVec[i] * v[i]; vn += v[i] * v[i] }
+            val norm = if (vn > 0f) sqrt(vn) else 1f
+            scored += ScoredSong(song, dot / norm)
+        }
+        scored.sortByDescending { it.similarity }
+        return scored.take(k)
+    }
+
     suspend fun recommendUpcoming(
         currentSong: Song,
         library: List<Song>,
@@ -35,19 +211,44 @@ class Recommender(
         // Capacitor engine-taste.js:751 — the recommendation policy
         // pass that prunes hard-blocked rows before MMR.
         hardBlockedFilenames: Set<String> = emptySet(),
+        // Push #67: blended query vector for current+session+profile.
+        // When non-null, candidates are ranked against this vec instead
+        // of the current song's neighbors. Caller is responsible for
+        // building it via [buildBlendedVec].
+        blendedQueryVec: FloatArray? = null,
     ): List<Song> {
         val lambda = (1f - adventurous).coerceIn(0f, 1f)
         val excludeHashes = buildList {
             currentSong.contentHash?.takeIf { it.isNotBlank() }?.let { add(it) }
         }
 
-        // Step 1: top-K*3 relevance candidates from sqlite-vec.
+        // Step 1: top-K*3 relevance candidates. When a blended query
+        // vector is supplied (Push #67), rank against it; otherwise use
+        // the current-song-only path via sqlite-vec.
         val overFetch = (k * 3).coerceAtLeast(k + 10)
-        val candidates = embeddingDb.nearestNeighborsForFilename(
-            queryFilename = currentSong.filename,
-            k = overFetch,
-            excludeHashes = excludeHashes,
-        )
+        val candidates: List<EmbeddingDbFacade.NnResult> = if (blendedQueryVec != null) {
+            val scored = nearestNeighborsForVector(
+                queryVec = blendedQueryVec,
+                library = library,
+                k = overFetch,
+                excludeFilenames = extraExcludeFilenames + hardBlockedFilenames + currentSong.filename,
+            )
+            // Adapt to NnResult shape so the rest of the pipeline is shared.
+            scored.map { ss ->
+                EmbeddingDbFacade.NnResult(
+                    contentHash = ss.song.contentHash ?: "",
+                    filepath = ss.song.filePath ?: "",
+                    filename = ss.song.filename,
+                    similarity = ss.similarity,
+                )
+            }
+        } else {
+            embeddingDb.nearestNeighborsForFilename(
+                queryFilename = currentSong.filename,
+                k = overFetch,
+                excludeHashes = excludeHashes,
+            )
+        }
         if (candidates.isEmpty()) return emptyList()
 
         // Step 2: load candidate vectors in one batch for MMR redundancy
@@ -201,6 +402,77 @@ class Recommender(
      * meaningful to refresh). If shorter than 15, only the frozen zone
      * exists and the rest is appended fresh from recommender.
      */
+    /**
+     * Push #67 — Capacitor parity (`_softRefreshQueue` in engine.js:910).
+     * Three-zone re-rank after a qualified listen so the upcoming queue
+     * reflects updated taste without yanking the user's immediate next
+     * picks. Replaces the queue-exhaust-only refresh from push #45.
+     *
+     * Zones:
+     *   [0..4]   frozen      — untouched.
+     *   [5..14]  stable      — same songs, re-sorted by NEW blended sim.
+     *   [15..]   fluid       — replaced with fresh recommendations.
+     *
+     * Returns the new tail (positions 0..end of current queue).
+     */
+    suspend fun softRefreshUpcomingTail(
+        currentSong: Song,
+        upcoming: List<Song>,
+        library: List<Song>,
+        blendedQueryVec: FloatArray,
+        adventurous: Float = 0.8f,
+        extraExcludeFilenames: Set<String> = emptySet(),
+        hardBlockedFilenames: Set<String> = emptySet(),
+        frozenZoneSize: Int = 5,
+        stableZoneEnd: Int = 15,
+    ): List<Song> {
+        if (upcoming.size <= frozenZoneSize) return upcoming
+        val frozenZone = upcoming.subList(0, minOf(frozenZoneSize, upcoming.size))
+        val stableSrc = if (upcoming.size > frozenZoneSize)
+            upcoming.subList(frozenZoneSize, minOf(stableZoneEnd, upcoming.size))
+        else emptyList()
+        val fluidSrc = if (upcoming.size > stableZoneEnd)
+            upcoming.subList(stableZoneEnd, upcoming.size)
+        else emptyList()
+
+        // Re-rank stable zone by blended-vec similarity.
+        val stableHashes = stableSrc.mapNotNull { it.contentHash }
+        val stableVecs = if (stableHashes.isNotEmpty()) embeddingDb.getVecsByHashes(stableHashes) else emptyMap()
+        val dim = blendedQueryVec.size
+        val stableSorted: List<Song> = if (stableVecs.isEmpty()) stableSrc else {
+            stableSrc.map { song ->
+                val v = song.contentHash?.let { stableVecs[it] }
+                val sim = if (v != null && v.size == dim) {
+                    var dot = 0f; var n = 0f
+                    for (i in 0 until dim) { dot += blendedQueryVec[i] * v[i]; n += v[i] * v[i] }
+                    val norm = if (n > 0f) sqrt(n) else 1f
+                    dot / norm
+                } else -1f
+                song to sim
+            }.sortedByDescending { it.second }.map { it.first }
+        }
+
+        // Rebuild fluid zone with fresh recommendations against the
+        // blended vector, excluding frozen+stable+current.
+        val excludeFns = (frozenZone + stableSorted).map { it.filename }.toMutableSet().also {
+            it += currentSong.filename
+            it += extraExcludeFilenames
+        }
+        val fluidTarget = (upcoming.size - frozenZone.size - stableSorted.size).coerceAtLeast(20)
+        val fluidNew = runCatching {
+            recommendUpcoming(
+                currentSong = currentSong,
+                library = library,
+                k = fluidTarget,
+                adventurous = adventurous,
+                extraExcludeFilenames = excludeFns,
+                hardBlockedFilenames = hardBlockedFilenames,
+                blendedQueryVec = blendedQueryVec,
+            )
+        }.getOrDefault(fluidSrc)
+        return frozenZone + stableSorted + fluidNew
+    }
+
     suspend fun softRefreshTail(
         currentSong: Song,
         oldTail: List<Song>,
@@ -421,6 +693,11 @@ class Recommender(
         }
         // Build an oversized pool, then either take top-N (deterministic)
         // or shuffle + take-N (randomized for pull-to-refresh variety).
+        // Push #64: build a LARGER pool (effSourceCount * 4) so the diversity
+        // picker has room to find anchors that span different audio
+        // "moods" in embedding space. Capacitor parity: engine-analytics.js
+        // `getBecauseYouPlayed` iteratively picks anchors that maximize the
+        // minimum cosine distance to already-picked anchors.
         val poolFromEvents: List<Song> = recentEvents
             .asSequence()
             .filter { it.fractionPlayed >= 0.3f }
@@ -429,13 +706,9 @@ class Recommender(
             .mapNotNull { byFilename[it.filename] }
             .filter { it.filePath != null }
             .distinctBy { it.filename }
-            .take(if (randomize) (effSourceCount * 3).coerceAtLeast(effSourceCount) else effSourceCount)
+            .take((effSourceCount * 4).coerceAtLeast(effSourceCount * 2))
             .toList()
-        var anchors: List<Song> = if (randomize && poolFromEvents.size > effSourceCount) {
-            poolFromEvents.shuffled().take(effSourceCount)
-        } else {
-            poolFromEvents.take(effSourceCount)
-        }
+        var anchors: List<Song> = pickDiverseAnchors(poolFromEvents, effSourceCount, randomize)
         // Fallback: stats-based anchor pool when no qualifying recent events.
         if (anchors.isEmpty() && statsFallback.isNotEmpty()) {
             val statsPool = statsFallback.entries.asSequence()
@@ -445,13 +718,9 @@ class Recommender(
                 .sortedByDescending { it.value.plays * it.value.avgFraction }
                 .mapNotNull { byFilename[it.key] }
                 .filter { it.filePath != null }
-                .take(if (randomize) (effSourceCount * 3).coerceAtLeast(effSourceCount) else effSourceCount)
+                .take((effSourceCount * 4).coerceAtLeast(effSourceCount * 2))
                 .toList()
-            anchors = if (randomize && statsPool.size > effSourceCount) {
-                statsPool.shuffled().take(effSourceCount)
-            } else {
-                statsPool.take(effSourceCount)
-            }
+            anchors = pickDiverseAnchors(statsPool, effSourceCount, randomize)
         }
         if (anchors.isEmpty()) return emptyList()
         return anchors.map { src ->
@@ -459,6 +728,77 @@ class Recommender(
                 .filter { it.song.filename !in hardBlockedFilenames }
             src to applyNegativeStrengthFilter(sims, dislikedFilenames, tuning.negativeStrength)
         }
+    }
+
+    /**
+     * Push #64: greedy max-min-distance anchor picker for the
+     * "Because you played X" sections.
+     *
+     * Algorithm (Capacitor `getBecauseYouPlayed` parity):
+     *   1. Anchor 0 = first song in [pool] (most-recent / most-played).
+     *   2. For each subsequent anchor, pick the candidate whose minimum
+     *      cosine distance to all already-picked anchors is maximal.
+     *   3. When [randomize] = true, shuffle [pool] first so anchor 0
+     *      varies between pull-to-refresh calls.
+     *
+     * Cosine distance is computed via batch dot products. Songs without a
+     * loadable embedding are kept on the candidate list but treated as
+     * "infinitely far" from picked anchors so they're picked last — that
+     * way pre-embedding states still produce some output.
+     */
+    private suspend fun pickDiverseAnchors(
+        pool: List<Song>,
+        count: Int,
+        randomize: Boolean,
+    ): List<Song> {
+        if (pool.isEmpty() || count <= 0) return emptyList()
+        if (pool.size <= count) return pool
+        val ordered = if (randomize) pool.shuffled() else pool
+        val hashes = ordered.mapNotNull { it.contentHash?.takeIf { h -> h.isNotBlank() } }.distinct()
+        val vecs = runCatching { embeddingDb.getVecsByHashes(hashes) }.getOrDefault(emptyMap())
+        // Map each pool song to its (optional) unit-norm vector.
+        val songVec: List<Pair<Song, FloatArray?>> = ordered.map { song ->
+            val v = song.contentHash?.let { vecs[it] }
+            song to v?.let { normalize(it) }
+        }
+        val picked = ArrayList<Pair<Song, FloatArray?>>(count)
+        picked.add(songVec.first())
+        while (picked.size < count) {
+            var bestIdx = -1
+            var bestMinDot = Float.MAX_VALUE  // smaller dot = farther in cosine.
+            for ((i, cand) in songVec.withIndex()) {
+                if (picked.any { it.first.filename == cand.first.filename }) continue
+                val cv = cand.second
+                if (cv == null) {
+                    // No vector — treat as already-far (pick last).
+                    if (bestIdx == -1) bestIdx = i
+                    continue
+                }
+                var maxDotToPicked = -Float.MAX_VALUE
+                for ((_, pv) in picked) {
+                    if (pv == null) continue
+                    var dot = 0f
+                    for (d in cv.indices) dot += cv[d] * pv[d]
+                    if (dot > maxDotToPicked) maxDotToPicked = dot
+                }
+                if (maxDotToPicked < bestMinDot) {
+                    bestMinDot = maxDotToPicked
+                    bestIdx = i
+                }
+            }
+            if (bestIdx < 0) break
+            picked.add(songVec[bestIdx])
+        }
+        return picked.map { it.first }
+    }
+
+    private fun normalize(v: FloatArray): FloatArray {
+        var s = 0f
+        for (x in v) s += x * x
+        val inv = if (s > 0f) 1f / sqrt(s) else 0f
+        val out = FloatArray(v.size)
+        for (i in v.indices) out[i] = v[i] * inv
+        return out
     }
 
     /**
@@ -528,6 +868,270 @@ class Recommender(
         k: Int = 12,
     ): List<Song> = unexploredClusters(library, playedFilenames, embeddedFilepaths, kPerCluster = k, clusters = 1)
         .flatten()
+
+    /**
+     * Push #64 — Capacitor parity For You: builds a single "profile vector"
+     * as the weighted average of the user's top-30 played-and-completed
+     * songs' embeddings, then returns the songs whose embeddings sit
+     * closest to that centroid. Replaces the anchor-based approach in
+     * `forYou()` for cases where the user has enough listening evidence;
+     * `forYou()` is kept as the lighter fallback.
+     *
+     * Capacitor reference: engine-analytics.js:316-356 (`profileVec`
+     * derivation + nearest neighbors + shuffle).
+     *
+     * Algorithm:
+     *  1. Rank songs by `plays × avgFraction` descending, keep top 30.
+     *  2. Pull their embedding vectors via [EmbeddingDbFacade.getVecsByHashes].
+     *  3. Compute weighted average; L2-normalize.
+     *  4. Compute cosine similarity from profileVec to every other
+     *     embedded library song.
+     *  5. Take top (k × 6) as pool; shuffle when [randomize] = true.
+     *  6. Return top k.
+     */
+    suspend fun forYouByProfileVector(
+        library: List<Song>,
+        stats: Map<String, com.isaivazhi.app.engine.HistoryEngine.Stats>,
+        embeddedFilepaths: Set<String>,
+        dislikedFilenames: Set<String> = emptySet(),
+        hardBlockedFilenames: Set<String> = emptySet(),
+        k: Int = 12,
+        randomize: Boolean = false,
+    ): List<ScoredSong> {
+        val byFilename = library.associateBy { it.filename }
+        val topPlays = stats.entries.asSequence()
+            .filter { it.value.plays > 0 && it.value.avgFraction >= 0.3f }
+            .filter { it.key !in dislikedFilenames }
+            .filter { it.key !in hardBlockedFilenames }
+            .sortedByDescending { it.value.plays * it.value.avgFraction }
+            .take(30)
+            .toList()
+        if (topPlays.isEmpty()) return emptyList()
+        val anchorSongs = topPlays.mapNotNull { byFilename[it.key] }
+            .filter { !it.contentHash.isNullOrBlank() && it.filePath in embeddedFilepaths }
+        if (anchorSongs.isEmpty()) return emptyList()
+        val anchorWeights = topPlays.associate { it.key to (it.value.plays * it.value.avgFraction) }
+        val anchorHashes = anchorSongs.mapNotNull { it.contentHash }.distinct()
+        val vecsByHash = embeddingDb.getVecsByHashes(anchorHashes)
+        if (vecsByHash.isEmpty()) return emptyList()
+
+        val dim = vecsByHash.values.first().size
+        val profileVec = FloatArray(dim)
+        var totalWeight = 0f
+        for (song in anchorSongs) {
+            val v = vecsByHash[song.contentHash ?: continue] ?: continue
+            val w = anchorWeights[song.filename] ?: continue
+            for (d in 0 until dim) profileVec[d] += v[d] * w
+            totalWeight += w
+        }
+        if (totalWeight <= 0f) return emptyList()
+        var n2 = 0f
+        for (d in 0 until dim) { profileVec[d] /= totalWeight; n2 += profileVec[d] * profileVec[d] }
+        val inv = if (n2 > 0f) 1f / sqrt(n2) else 0f
+        for (d in 0 until dim) profileVec[d] *= inv
+
+        // Build candidate pool: every embedded song that's NOT one of the
+        // anchors and not disliked/hard-blocked. De-dupe by contentHash so
+        // duplicate file copies don't dominate.
+        val anchorFilenames = anchorSongs.map { it.filename }.toHashSet()
+        val candidates = library.asSequence()
+            .filter { it.filePath != null && it.filePath in embeddedFilepaths }
+            .filter { !it.contentHash.isNullOrBlank() }
+            .filter { it.filename !in anchorFilenames }
+            .filter { it.filename !in dislikedFilenames }
+            .filter { it.filename !in hardBlockedFilenames }
+            .distinctBy { it.contentHash!! }
+            .toList()
+        if (candidates.isEmpty()) return emptyList()
+        val candHashes = candidates.mapNotNull { it.contentHash }
+        val candVecs = embeddingDb.getVecsByHashes(candHashes)
+        if (candVecs.isEmpty()) return emptyList()
+
+        // Cosine similarity = dot(profileVec, candVec) / |candVec|
+        // (profileVec is unit-norm). Use the existing flat-array NEON batch
+        // path when the pool is big enough to make it worthwhile.
+        val scored = ArrayList<ScoredSong>(candidates.size)
+        for (song in candidates) {
+            val v = candVecs[song.contentHash ?: continue] ?: continue
+            if (v.size != dim) continue
+            var dot = 0f
+            var vn = 0f
+            for (d in 0 until dim) { dot += profileVec[d] * v[d]; vn += v[d] * v[d] }
+            val norm = if (vn > 0f) sqrt(vn) else 1f
+            scored += ScoredSong(song, dot / norm)
+        }
+        if (scored.isEmpty()) return emptyList()
+        scored.sortByDescending { it.similarity }
+
+        val poolSize = (k * 6).coerceAtMost(scored.size)
+        val pool = scored.subList(0, poolSize).toList()
+        return if (randomize && pool.size > k) pool.shuffled().take(k) else pool.take(k)
+    }
+
+    /**
+     * Push #64 — Capacitor parity Unexplored Sounds: real k-means clustering
+     * on embedding vectors instead of `filename.hashCode() % N` bucketing.
+     * Each returned cluster is a musically coherent group of songs the user
+     * has barely engaged with.
+     *
+     * Capacitor reference: engine-analytics.js:540-625 (`getUnexploredClusters`).
+     *
+     * Algorithm:
+     *  1. Load embeddings for every eligible (embedded + filePath != null)
+     *     song into a flat row-major float[].
+     *  2. Seeded RNG (seed=42) picks [kClusters] initial centroid indices.
+     *  3. Lloyd's iterations (max 20, early-exit on stable assignment).
+     *  4. Score each cluster by Σ(plays × avgFraction) / size ascending.
+     *  5. Take the lowest-engagement [displayClusters] clusters; within
+     *     each, drop songs in [playedFilenames] and shuffle/cap at
+     *     [kPerCluster].
+     *
+     * Falls back to [unexploredClusters] (hash-bucket) when there aren't
+     * enough eligible songs for meaningful clustering.
+     */
+    suspend fun unexploredClustersKMeans(
+        library: List<Song>,
+        stats: Map<String, com.isaivazhi.app.engine.HistoryEngine.Stats>,
+        playedFilenames: Set<String>,
+        embeddedFilepaths: Set<String>,
+        kClusters: Int = 15,
+        displayClusters: Int = 3,
+        kPerCluster: Int = 8,
+        seed: Long = 42L,
+    ): List<List<Song>> {
+        val eligible = library.asSequence()
+            .filter { it.filePath != null && it.filePath in embeddedFilepaths }
+            .filter { !it.contentHash.isNullOrBlank() }
+            .distinctBy { it.contentHash!! }
+            .toList()
+        if (eligible.size < kClusters * 2) {
+            return unexploredClusters(library, playedFilenames, embeddedFilepaths, kPerCluster, displayClusters)
+        }
+        val hashes = eligible.mapNotNull { it.contentHash }
+        val vecsByHash = embeddingDb.getVecsByHashes(hashes)
+        if (vecsByHash.size < kClusters * 2) {
+            return unexploredClusters(library, playedFilenames, embeddedFilepaths, kPerCluster, displayClusters)
+        }
+        // Build a parallel filtered list keeping only songs whose vector we got.
+        val keptSongs = eligible.filter { vecsByHash[it.contentHash] != null }
+        val n = keptSongs.size
+        val dim = vecsByHash.values.first().size
+        if (n < kClusters * 2 || dim <= 0) {
+            return unexploredClusters(library, playedFilenames, embeddedFilepaths, kPerCluster, displayClusters)
+        }
+
+        // Row-major flat array of L2-normalized vectors for cosine-as-dot.
+        val flat = FloatArray(n * dim)
+        for (i in 0 until n) {
+            val src = vecsByHash[keptSongs[i].contentHash]!!
+            var s = 0f
+            val srcLen = minOf(dim, src.size)
+            for (j in 0 until srcLen) s += src[j] * src[j]
+            val invN = if (s > 0f) 1f / sqrt(s) else 0f
+            val base = i * dim
+            for (j in 0 until srcLen) flat[base + j] = src[j] * invN
+        }
+
+        val rng = JavaRandom(seed)
+        val initIdx = (0 until n).toMutableList().also {
+            for (i in it.size - 1 downTo 1) {
+                val j = rng.nextInt(i + 1)
+                val tmp = it[i]; it[i] = it[j]; it[j] = tmp
+            }
+        }.subList(0, kClusters)
+        // centroids[c] is a flat dim-length float array.
+        val centroids = Array(kClusters) { c ->
+            val base = initIdx[c] * dim
+            FloatArray(dim).also { System.arraycopy(flat, base, it, 0, dim) }
+        }
+        val assignments = IntArray(n)
+        val scratch = FloatArray(n)
+        val maxIter = 20
+        for (iter in 0 until maxIter) {
+            var changes = 0
+            // For each centroid c, batch-dot against the pool; track best
+            // (centroid, similarity) per row.
+            val bestDot = FloatArray(n) { -Float.MAX_VALUE }
+            val bestC = IntArray(n)
+            for (c in 0 until kClusters) {
+                val used = NativeAccelerator.dotProductBatch(centroids[c], flat, n, dim, scratch)
+                if (!used) {
+                    for (i in 0 until n) {
+                        var d = 0f
+                        val base = i * dim
+                        val cv = centroids[c]
+                        for (j in 0 until dim) d += cv[j] * flat[base + j]
+                        scratch[i] = d
+                    }
+                }
+                for (i in 0 until n) {
+                    val s = scratch[i]
+                    if (s > bestDot[i]) { bestDot[i] = s; bestC[i] = c }
+                }
+            }
+            for (i in 0 until n) {
+                if (assignments[i] != bestC[i]) { assignments[i] = bestC[i]; changes++ }
+            }
+            if (changes == 0 && iter > 0) break
+            // Recompute centroids = mean of assigned rows, then L2-normalize.
+            val sums = Array(kClusters) { FloatArray(dim) }
+            val counts = IntArray(kClusters)
+            for (i in 0 until n) {
+                val a = assignments[i]
+                counts[a]++
+                val base = i * dim
+                val s = sums[a]
+                for (j in 0 until dim) s[j] += flat[base + j]
+            }
+            for (c in 0 until kClusters) {
+                if (counts[c] == 0) continue
+                val s = sums[c]
+                for (j in 0 until dim) s[j] /= counts[c]
+                var nrm = 0f
+                for (j in 0 until dim) nrm += s[j] * s[j]
+                val invN = if (nrm > 0f) 1f / sqrt(nrm) else 0f
+                for (j in 0 until dim) s[j] *= invN
+                centroids[c] = s
+            }
+        }
+
+        // Score clusters by engagement; lowest first.
+        data class ClusterStat(val cluster: Int, val score: Float, val songs: List<Song>)
+        val byCluster = HashMap<Int, MutableList<Song>>(kClusters)
+        for (i in 0 until n) byCluster.getOrPut(assignments[i]) { mutableListOf() }.add(keptSongs[i])
+        val clusterScores = byCluster.entries.mapNotNull { (cid, songs) ->
+            if (songs.size < 3) return@mapNotNull null
+            var total = 0f
+            for (s in songs) {
+                val st = stats[s.filename] ?: continue
+                total += st.plays * st.avgFraction
+            }
+            ClusterStat(cid, total / songs.size, songs)
+        }.sortedBy { it.score }
+
+        val outRng = JavaRandom(seed)
+        val out = ArrayList<List<Song>>(displayClusters)
+        for (cs in clusterScores) {
+            if (out.size >= displayClusters) break
+            val unplayed = cs.songs.filter { it.filename !in playedFilenames }
+            if (unplayed.isEmpty()) continue
+            // Stable-shuffle so repeated calls in the same session pull the
+            // same picks; pull-to-refresh callers can pass a fresh rng if
+            // they want variety.
+            val shuffled = unplayed.toMutableList().also {
+                for (i in it.size - 1 downTo 1) {
+                    val j = outRng.nextInt(i + 1)
+                    val tmp = it[i]; it[i] = it[j]; it[j] = tmp
+                }
+            }
+            out += shuffled.take(kPerCluster)
+        }
+        android.util.Log.i(
+            "Recommender",
+            "kmeans: n=$n dim=$dim kClusters=$kClusters → displayed=${out.size}/${clusterScores.size} (scores=${clusterScores.take(displayClusters).map { "%.3f".format(it.score) }})"
+        )
+        return out
+    }
 
     private data class PoolEntry(
         val song: Song,

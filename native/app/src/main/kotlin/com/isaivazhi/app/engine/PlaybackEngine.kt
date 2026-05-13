@@ -53,6 +53,24 @@ class PlaybackEngine(
     @Volatile
     var pendingTransitionSource: String = "auto_advance"
 
+    /**
+     * Push #70: the kind of content currently loaded as the queue. Drives
+     * the queue-exhaust LE's "should I append AI?" decision and threads
+     * into all queue-op logs for diagnostics.
+     *
+     *   LIBRARY           — Songs-tab tap or any "play a single song" flow.
+     *                       AI tail appends on queue exhaust (LOOP=OFF).
+     *   ALBUM             — Album-track tap. NO AI tail ever; album is
+     *                       self-contained. LOOP=OFF stops; LOOP=ALL loops.
+     *   BROWSE_SECTION    — View-All section (Most Played, Last Added,
+     *                       Recently Played, etc.). Same as ALBUM: no AI.
+     *   DISCOVER_SECTION  — Most Similar / For You / Because You Played /
+     *                       Unexplored. AI tail appends on queue exhaust.
+     *   AI_RECOMMENDED    — Set after an AI tail append so the next
+     *                       exhaust knows the queue was already extended.
+     */
+    enum class QueueContext { LIBRARY, ALBUM, BROWSE_SECTION, DISCOVER_SECTION, AI_RECOMMENDED }
+
     data class PlaybackState(
         val currentSongId: Int? = null,
         val currentMediaId: String? = null,
@@ -74,6 +92,14 @@ class PlaybackEngine(
         val shuffleEnabled: Boolean = false,
         /** Media3 repeat mode: 0=OFF, 1=ONE, 2=ALL. */
         val repeatMode: Int = androidx.media3.common.Player.REPEAT_MODE_OFF,
+        /** Push #70: what kind of content the queue holds. Default LIBRARY. */
+        val queueContext: QueueContext = QueueContext.LIBRARY,
+        /**
+         * Push #70: filenames inserted via "Play Next" that should survive
+         * queue rebuilds (Songs-tab taps, refresh button, etc.). Entries
+         * are auto-removed when the song actually plays.
+         */
+        val playNextFilenames: Set<String> = emptySet(),
     )
 
     private val _state = MutableStateFlow(PlaybackState())
@@ -171,9 +197,17 @@ class PlaybackEngine(
             }
             if (prevState.currentMediaId != null && prevState.currentMediaId != mediaItem?.mediaId) {
                 val frac = if (prevDuration > 0) (prevPlayed.toFloat() / prevDuration.toFloat()).coerceIn(0f, 1f) else 0f
+                // Push #66: read the playback instance ID associated with
+                // this transition. The service incremented it just before
+                // resetting accumulator, so it identifies the just-ended
+                // playback session uniquely.
+                val transitionInstId = svc?.let {
+                    runCatching { svc.javaClass.getMethod("getCurrentPlaybackInstanceId").invoke(svc) as? Long }
+                        .getOrNull() ?: 0L
+                } ?: 0L
                 android.util.Log.i(
                     "PlaybackEngine",
-                    "transition: prev=${prevState.currentMediaId} played=${prevPlayed}ms dur=${prevDuration}ms frac=$frac source=$pendingTransitionSource origin=$origin → next=${mediaItem?.mediaId}"
+                    "transition: prev=${prevState.currentMediaId} played=${prevPlayed}ms dur=${prevDuration}ms frac=$frac source=$pendingTransitionSource origin=$origin instId=$transitionInstId → next=${mediaItem?.mediaId}"
                 )
                 history?.recordEnd(prevState.currentMediaId, frac)
                 // Feed the taste signal pipeline. Snapshot before/after and
@@ -181,12 +215,19 @@ class PlaybackEngine(
                 val source = pendingTransitionSource
                 val t = taste
                 if (t != null) {
-                    val (before, after) = t.recordPlaybackEvent(prevState.currentMediaId, frac, source)
+                    val (before, after) = t.recordPlaybackEvent(prevState.currentMediaId, frac, source, transitionInstId)
                     val isSkip = frac < TasteEngine.SKIP_THRESHOLD
                     val isManual = source.startsWith("manual_") || source == "song_tap" ||
                         source == "queue_tap" || source == "neutral_skip"
-                    // Push #63: session counters before/after.
-                    val sessionPair = session?.recordEvent(frac, isSkip, isManual)
+                    // Push #63 + #67: session counters before/after, with
+                    // filename + source so the listened rolling list grows.
+                    val sessionPair = session?.recordEvent(
+                        fraction = frac,
+                        isSkip = isSkip,
+                        isManual = isManual,
+                        filename = prevState.currentMediaId,
+                        source = source,
+                    )
                     signalTimeline?.let { tl ->
                         val cls = if (isSkip) SignalTimelineEngine.Classification.SKIP
                             else SignalTimelineEngine.Classification.LISTEN
@@ -220,6 +261,24 @@ class PlaybackEngine(
                             )
                         )
                     }
+                    // Push #66: this transition is authoritative for this
+                    // playback session. Clear any pending listen snapshot
+                    // that matches the just-ended instanceId so cold-start
+                    // reconciliation doesn't re-record this listen.
+                    if (transitionInstId > 0L) {
+                        scope.launch(Dispatchers.IO) {
+                            runCatching {
+                                val pend = preferences.loadPendingEvidence()
+                                if (pend != null && pend.playbackInstanceId == transitionInstId) {
+                                    preferences.clearPendingEvidence()
+                                    android.util.Log.i(
+                                        "PlaybackEngine",
+                                        "cleared pending snapshot resolved by transition instId=$transitionInstId"
+                                    )
+                                }
+                            }
+                        }
+                    }
                     // Push #63: propagate the resulting directScore delta to
                     // the song's top-10 embedding neighbors. Capacitor parity
                     // (engine.js:535).
@@ -237,12 +296,23 @@ class PlaybackEngine(
                 // Reset to auto for the next implicit transition.
                 pendingTransitionSource = "auto_advance"
             }
+            // Push #70: if the song transitioning IN is in the Play Next
+            // marker set, clear its marker — it's about to start playing,
+            // no longer needs the "preserve through rebuilds" badge.
+            val newMediaId = mediaItem?.mediaId
+            val updatedPlayNext = if (newMediaId != null && newMediaId in prevState.playNextFilenames) {
+                android.util.Log.i("QueueOp", "playNext cleared on transition: $newMediaId")
+                prevState.playNextFilenames - newMediaId
+            } else {
+                prevState.playNextFilenames
+            }
             _state.value = prevState.copy(
                 currentMediaId = mediaItem?.mediaId,
                 title = md?.title?.toString() ?: "",
                 artist = md?.artist?.toString() ?: "",
                 album = md?.albumTitle?.toString() ?: "",
                 queueIndex = ctrl?.currentMediaItemIndex ?: prevState.queueIndex,
+                playNextFilenames = updatedPlayNext,
             )
             // Reset live position/duration for the new track. duration may be
             // unknown until Media3 reports it via onMediaMetadataChanged or
@@ -303,21 +373,79 @@ class PlaybackEngine(
      * Plays a queue starting from `startIndex`. Replaces any existing queue.
      * Songs with null/blank filePath are filtered out before submission.
      */
-    fun playQueue(songs: List<Song>, startIndex: Int = 0, source: String = "manual_tap") {
+    fun playQueue(
+        songs: List<Song>,
+        startIndex: Int = 0,
+        source: String = "manual_tap",
+        queueContext: QueueContext = QueueContext.LIBRARY,
+    ) {
         pendingTransitionSource = source
+        // Push #69: if the queue is being REPLACED while another song is
+        // currently playing, flush evidence for the displaced previous
+        // song as a pending snapshot so the listen isn't lost.
+        val prevMediaId = _state.value.currentMediaId
+        val replacingDifferent = prevMediaId != null && prevMediaId != songs.getOrNull(startIndex)?.filename
+        if (replacingDifferent) {
+            val svc = serviceRef()
+            if (svc != null) {
+                val played = svc.getAccumulatedPlayedMsSnapshot()
+                val dur = svc.getCurrentDurationMsSnapshot()
+                val instId = svc.getCurrentPlaybackInstanceId()
+                if (played >= 1000L && dur > 0L) {
+                    scope.launch(Dispatchers.IO) {
+                        runCatching {
+                            preferences.savePendingEvidence(prevMediaId!!, played, dur, instId)
+                            android.util.Log.i(
+                                "QueueOp",
+                                "playQueue replace flush: prev=$prevMediaId played=${played}ms dur=${dur}ms instId=$instId"
+                            )
+                        }
+                    }
+                }
+            }
+        }
         // Push #39: the service captures its own pre-transition snapshot
         // in Media3PlaybackService.onMediaItemTransition. No Kotlin-side
         // snapshot needed.
         val playable = songs.filter { !it.filePath.isNullOrEmpty() }
-        if (playable.isEmpty()) return
+        if (playable.isEmpty()) {
+            android.util.Log.i("QueueOp", "playQueue ABORT: no playable songs (input=${songs.size})")
+            return
+        }
         val safeStart = startIndex.coerceIn(0, playable.size - 1)
+        // Push #70: Play Next songs survive queue rebuilds. Filter them
+        // from `playable` to avoid duplicates, then re-insert right after
+        // the starting song so they play before anything else in the new
+        // queue.
+        val playNextSet = _state.value.playNextFilenames
+        val playNextSongs = if (playNextSet.isEmpty()) emptyList() else {
+            playable.filter { it.filename in playNextSet }
+                .distinctBy { it.filename }
+        }
+        val rebuilt: List<Song> = if (playNextSongs.isEmpty()) {
+            playable
+        } else {
+            val playNextFns = playNextSongs.map { it.filename }.toHashSet()
+            val withoutPlayNext = playable.filterNot { it.filename in playNextFns }
+            val safeStart2 = startIndex.coerceIn(0, withoutPlayNext.size - 1)
+            val before = withoutPlayNext.subList(0, safeStart2 + 1)
+            val after = withoutPlayNext.subList(safeStart2 + 1, withoutPlayNext.size)
+            before + playNextSongs + after
+        }
+        val finalSafeStart = if (playNextSongs.isEmpty()) safeStart
+        else rebuilt.indexOfFirst { it.filename == playable[safeStart].filename }.coerceAtLeast(0)
+        android.util.Log.i(
+            "QueueOp",
+            "playQueue ctx=$queueContext src=$source input=${songs.size} playable=${playable.size} " +
+                "playNextPreserved=${playNextSongs.size} startIndex=$startIndex→$finalSafeStart first=${rebuilt.getOrNull(finalSafeStart)?.filename}"
+        )
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            val items = playable.map { buildMediaItem(it) }
-            ctrl.setMediaItems(items, safeStart, 0L)
+            val items = rebuilt.map { buildMediaItem(it) }
+            ctrl.setMediaItems(items, finalSafeStart, 0L)
             ctrl.prepare()
             ctrl.play()
-            val first = playable[safeStart]
+            val first = rebuilt[finalSafeStart]
             _state.value = _state.value.copy(
                 currentSongId = first.id,
                 currentMediaId = first.filename,
@@ -325,13 +453,14 @@ class PlaybackEngine(
                 artist = first.artist,
                 album = first.album,
                 isPlaying = true,
-                queueFilenames = playable.map { it.filename },
-                queueIndex = safeStart,
+                queueFilenames = rebuilt.map { it.filename },
+                queueIndex = finalSafeStart,
                 preparedNotPlaying = false,
+                queueContext = queueContext,
             )
             _livePosition.value = 0L
             _liveDuration.value = 0L
-            persistQueue(playable.map { it.filename }, safeStart)
+            persistQueue(rebuilt.map { it.filename }, finalSafeStart)
             persistCurrent(first.filename, 0L)
         }
     }
@@ -347,10 +476,73 @@ class PlaybackEngine(
      * the Capacitor build (batches #11–#18) but achieves it from Kotlin
      * synchronously instead of via SharedPreferences cache tricks.
      */
+    /**
+     * Push #71: sync Kotlin `_state.value` from the controller's live
+     * state (current MediaItem, queue items, index, position). Called
+     * by MainActivity at cold start when the service is alive with an
+     * active session — avoids the prepareForResume destructive replace
+     * that was clobbering background headphone-skip advances.
+     *
+     * Looks up Song objects from the library to populate metadata fields.
+     */
+    suspend fun syncStateFromController(library: List<Song>) {
+        val ctrl = runCatching { ensureController() }.getOrNull() ?: return
+        val byFilename = library.associateBy { it.filename }
+        val total = ctrl.mediaItemCount
+        if (total <= 0) {
+            android.util.Log.i("PlaybackEngine", "syncStateFromController: controller has no items")
+            return
+        }
+        val curIdx = ctrl.currentMediaItemIndex.coerceIn(0, total - 1)
+        val curItem = ctrl.currentMediaItem
+        val curMediaId = curItem?.mediaId
+        val filenames = (0 until total).mapNotNull {
+            runCatching { ctrl.getMediaItemAt(it).mediaId }.getOrNull()
+        }
+        val song = curMediaId?.let { byFilename[it] }
+        val durationMs = runCatching { ctrl.duration.takeIf { it > 0 } ?: 0L }.getOrDefault(0L)
+        val positionMs = runCatching { ctrl.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
+        val isPlayingNow = runCatching { ctrl.isPlaying }.getOrDefault(false)
+        val repeatModeNow = runCatching { ctrl.repeatMode }.getOrDefault(androidx.media3.common.Player.REPEAT_MODE_OFF)
+        val shuffleOnNow = runCatching { ctrl.shuffleModeEnabled }.getOrDefault(false)
+        _state.value = _state.value.copy(
+            currentSongId = song?.id,
+            currentMediaId = curMediaId,
+            title = song?.title ?: curItem?.mediaMetadata?.title?.toString() ?: "",
+            artist = song?.artist ?: curItem?.mediaMetadata?.artist?.toString() ?: "",
+            album = song?.album ?: curItem?.mediaMetadata?.albumTitle?.toString() ?: "",
+            isPlaying = isPlayingNow,
+            queueFilenames = filenames,
+            queueIndex = curIdx,
+            preparedNotPlaying = !isPlayingNow,
+            shuffleEnabled = shuffleOnNow,
+            repeatMode = repeatModeNow,
+        )
+        _livePosition.value = positionMs
+        _liveDuration.value = durationMs
+        android.util.Log.i(
+            "PlaybackEngine",
+            "syncStateFromController: mediaId=$curMediaId idx=$curIdx/$total pos=${positionMs}ms isPlaying=$isPlayingNow repeat=$repeatModeNow"
+        )
+        // Persist the fresh values so the next true cold-start sees
+        // accurate state if the service later dies.
+        curMediaId?.let { persistCurrent(it, positionMs) }
+        persistQueue(filenames, curIdx)
+    }
+
     fun prepareForResume(songs: List<Song>, startIndex: Int, seekToMs: Long) {
         val playable = songs.filter { !it.filePath.isNullOrEmpty() }
         if (playable.isEmpty()) return
         val safeStart = startIndex.coerceIn(0, playable.size - 1)
+        // Push #65: log the seek target + first item filename so we can
+        // confirm cross-session position-resume is actually happening.
+        // If logs show seekToMs > 0 but the user reports playback starts
+        // at 0, the issue is downstream of this call (Media3 setMediaItems
+        // not honoring the position, or another seek racing it).
+        android.util.Log.i(
+            "PlaybackEngine",
+            "prepareForResume queueSize=${playable.size} safeStart=$safeStart seekToMs=$seekToMs first=${playable.getOrNull(safeStart)?.filename ?: "?"}"
+        )
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val items = playable.map { buildMediaItem(it) }
@@ -497,6 +689,7 @@ class PlaybackEngine(
     fun toggleShuffle() {
         val next = !_state.value.shuffleEnabled
         _state.value = _state.value.copy(shuffleEnabled = next)
+        android.util.Log.i("QueueOp", "toggleShuffle → $next (ctx=${_state.value.queueContext})")
         toaster?.show(if (next) "Shuffle on — queue randomized" else "Shuffle off")
         if (!next) return  // off: no structural change (matches Capacitor)
         scope.launch {
@@ -557,6 +750,7 @@ class PlaybackEngine(
             else -> androidx.media3.common.Player.REPEAT_MODE_OFF
         }
         _state.value = _state.value.copy(repeatMode = next)
+        android.util.Log.i("QueueOp", "cycleRepeat $cur → $next (ctx=${_state.value.queueContext})")
         toaster?.show(when (next) {
             androidx.media3.common.Player.REPEAT_MODE_OFF -> "Loop off"
             androidx.media3.common.Player.REPEAT_MODE_ONE -> "Loop: repeat this song"
@@ -629,7 +823,20 @@ class PlaybackEngine(
                 if (index < it.size) it.removeAt(index)
             }
             val nextIdx = ctrl.currentMediaItemIndex
-            _state.value = cur.copy(queueFilenames = nextFilenames, queueIndex = nextIdx)
+            // Push #70: if the removed song was a Play Next marker, drop
+            // its entry so it doesn't get re-prepended on the next rebuild.
+            val newPlayNext = if (removedFilename != null && removedFilename in cur.playNextFilenames) {
+                cur.playNextFilenames - removedFilename
+            } else cur.playNextFilenames
+            _state.value = cur.copy(
+                queueFilenames = nextFilenames,
+                queueIndex = nextIdx,
+                playNextFilenames = newPlayNext,
+            )
+            android.util.Log.i(
+                "QueueOp",
+                "removeFromQueue idx=$index removed=$removedFilename remaining=${nextFilenames.size} ctx=${cur.queueContext}"
+            )
             persistQueue(nextFilenames, nextIdx)
             // Push #63: signal capture for queue-remove.
             val t = taste
@@ -658,17 +865,36 @@ class PlaybackEngine(
             // De-dupe against everything already in Kotlin queueFilenames.
             val have = _state.value.queueFilenames.toSet()
             val toAdd = playable.filter { it.filename !in have }
-            if (toAdd.isEmpty()) return@launch
+            if (toAdd.isEmpty()) {
+                android.util.Log.i("QueueOp", "appendToQueue SKIP: all ${playable.size} already in queue")
+                return@launch
+            }
             ctrl.addMediaItems(toAdd.map { buildMediaItem(it) })
             val cur = _state.value
             val nextFilenames = cur.queueFilenames + toAdd.map { it.filename }
-            _state.value = cur.copy(queueFilenames = nextFilenames)
+            // Push #70: AI tail append flips context to AI_RECOMMENDED so
+            // future queue-exhausts know the queue was already extended
+            // by the recommender. Keeps the ALBUM/BROWSE skip-AI rule
+            // intact for sections that haven't been AI-extended.
+            val newCtx = when (cur.queueContext) {
+                QueueContext.LIBRARY, QueueContext.DISCOVER_SECTION -> QueueContext.AI_RECOMMENDED
+                else -> cur.queueContext  // ALBUM / BROWSE_SECTION / AI_RECOMMENDED keep their context
+            }
+            _state.value = cur.copy(queueFilenames = nextFilenames, queueContext = newCtx)
             persistQueue(nextFilenames, cur.queueIndex)
-            android.util.Log.i("PlaybackEngine", "appendToQueue: added ${toAdd.size} songs; total=${nextFilenames.size}")
+            android.util.Log.i(
+                "QueueOp",
+                "appendToQueue: added ${toAdd.size} (deduped from ${playable.size}); total=${nextFilenames.size} ctx=${cur.queueContext}→$newCtx"
+            )
         }
     }
 
-    /** Insert a song right after the current track ("Play Next" action). */
+    /**
+     * Insert a song right after the current track ("Play Next" action).
+     * Push #70: tracks the filename in `playNextFilenames` so the song
+     * survives queue rebuilds (Songs-tab taps, refresh button, etc.).
+     * The marker auto-clears when the song actually transitions to play.
+     */
     fun playNext(song: Song) {
         if (song.filePath.isNullOrEmpty()) return
         scope.launch {
@@ -679,7 +905,15 @@ class PlaybackEngine(
             val nextFilenames = cur.queueFilenames.toMutableList().also {
                 if (insertAt <= it.size) it.add(insertAt, song.filename) else it.add(song.filename)
             }
-            _state.value = cur.copy(queueFilenames = nextFilenames)
+            val newPlayNextSet = cur.playNextFilenames + song.filename
+            _state.value = cur.copy(
+                queueFilenames = nextFilenames,
+                playNextFilenames = newPlayNextSet,
+            )
+            android.util.Log.i(
+                "QueueOp",
+                "playNext: inserted ${song.filename} at $insertAt; playNextSet size=${newPlayNextSet.size}"
+            )
             persistQueue(nextFilenames, ctrl.currentMediaItemIndex)
         }
     }
@@ -694,40 +928,53 @@ class PlaybackEngine(
      * Replace the entire current queue while keeping the current song playing.
      * Used by the Up Next AI/Shuffle toggle: when the user flips modes we
      * rebuild the upcoming portion without restarting playback.
+     *
+     * Push #70: when [preservePlayNext] is true, any songs in the current
+     * queue whose filename is in `playNextFilenames` are prepended to
+     * the new upcoming list so they survive the replacement. Used by
+     * the Refresh button on UpNextScreen.
      */
-    fun replaceUpcoming(newUpcoming: List<Song>) {
+    fun replaceUpcoming(newUpcoming: List<Song>, newContext: QueueContext? = null) {
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val curIdx = ctrl.currentMediaItemIndex
             val totalBefore = ctrl.mediaItemCount
             if (curIdx < 0 || totalBefore == 0) return@launch
+            val curState = _state.value
+            val curFilename = curState.currentMediaId
             // Push #42 Tier 2J: remove ALL items before AND after the
             // current MediaItem so Media3's queue ends as
-            // [current, ...newTail]. Previously we only removed items
-            // after curIdx, leaving history in Media3 while Kotlin
-            // state's queueFilenames dropped it — `queueIndex` then
-            // drifted (Media3 stayed at curIdx, Kotlin reset to 0). The
-            // next transition would highlight the wrong "Now Playing"
-            // row.
+            // [current, ...newTail].
             if (curIdx + 1 < totalBefore) {
                 ctrl.removeMediaItems(curIdx + 1, totalBefore)
             }
             if (curIdx > 0) {
                 ctrl.removeMediaItems(0, curIdx)
             }
-            // Media3 now has exactly 1 item (current). Append the tail,
-            // de-duped against the current track.
-            val playable = newUpcoming.filter { !it.filePath.isNullOrEmpty() && it.filename != _state.value.currentMediaId }
-            if (playable.isNotEmpty()) {
-                ctrl.addMediaItems(playable.map { buildMediaItem(it) })
+            // De-dupe newUpcoming against current and itself.
+            val seen = HashSet<String>()
+            curFilename?.let { seen += it }
+            val nextSongs = newUpcoming.filter {
+                !it.filePath.isNullOrEmpty() && seen.add(it.filename)
             }
-            val cur = _state.value
-            val curFilename = cur.currentMediaId
+            if (nextSongs.isNotEmpty()) {
+                ctrl.addMediaItems(nextSongs.map { buildMediaItem(it) })
+            }
             val nextFilenames = buildList {
                 if (curFilename != null) add(curFilename)
-                addAll(playable.map { it.filename })
+                addAll(nextSongs.map { it.filename })
             }
-            _state.value = cur.copy(queueFilenames = nextFilenames, queueIndex = 0)
+            val resolvedContext = newContext ?: curState.queueContext
+            android.util.Log.i(
+                "QueueOp",
+                "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +
+                    "ctx=${curState.queueContext}→$resolvedContext playNextSet=${curState.playNextFilenames.size}"
+            )
+            _state.value = curState.copy(
+                queueFilenames = nextFilenames,
+                queueIndex = 0,
+                queueContext = resolvedContext,
+            )
             persistQueue(nextFilenames, 0)
         }
     }

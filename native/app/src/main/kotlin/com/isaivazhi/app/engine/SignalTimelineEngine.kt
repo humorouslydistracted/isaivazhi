@@ -92,11 +92,17 @@ class SignalTimelineEngine(private val appContext: Context) {
             android.util.Log.w("SignalTimeline", "  dropped: fraction<0")
             return
         }
-        // Capacitor parity: drop skips under 10% as noise.
-        if (event.classification == Classification.SKIP && event.fraction < 0.10f) {
-            android.util.Log.w("SignalTimeline", "  dropped: early skip < 10%")
+        if (event.filename.isBlank()) {
+            android.util.Log.w("SignalTimeline", "  dropped: blank filename")
             return
         }
+        // Push #65: removed the "<10% skip" noise filter. It was inherited
+        // from Capacitor where the timeline was a curated "interesting
+        // signals" feed, but Kotlin users have used the timeline as an
+        // audit trail of every transition. Hiding tap-through events made
+        // the page look broken ("Last 30 = 0") when in fact every
+        // transition was being dropped as noise. Now every valid event
+        // shows up; users can mentally filter the short ones.
         _events.value = (listOf(event) + _events.value).take(MAX_EVENTS)
         scope.launch { persist() }
     }

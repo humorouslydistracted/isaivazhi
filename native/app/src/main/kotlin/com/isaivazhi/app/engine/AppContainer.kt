@@ -28,15 +28,18 @@ class AppContainer(private val appContext: Context) {
     // supervisor-rooted so a propagation failure can never crash the app.
     private val sideEffectScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // Favorites + Disliked are wired with onChangeHook callbacks that
-    // synchronously update TasteEngine.directScore when the user toggles
-    // a heart or thumbs-down. Capacitor parity: a favorited unplayed song
-    // immediately gets a +2.0 favoritePrior boost; a disliked song gets
-    // a −3.0 dislikePrior penalty. Without these hooks the manual prior
-    // was inert and only the per-song filter set was updated (push #38).
-    // Push #63: after the directScore recompute, also propagate the
-    // resulting delta to the song's top-10 embedding neighbors (Capacitor
-    // engine-favorites.js:77, engine-disliked.js:132).
+    /**
+     * Push #67: signal that fires AFTER a favorite/dislike toggle has
+     * completed, so MainActivity can trigger an immediate Up Next /
+     * Discover rebuild. Capacitor parity (`scheduleRecommendationRebuild`
+     * with refreshQueue=true, refreshDiscover=true on toggles).
+     */
+    private val _rebuildSignal = kotlinx.coroutines.flow.MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 4,
+    )
+    val rebuildSignal: kotlinx.coroutines.flow.SharedFlow<String> = _rebuildSignal
+
     val favorites: FavoritesEngine by lazy {
         FavoritesEngine(appContext).also { fav ->
             fav.onChangeHook = { fn, _ ->
@@ -46,8 +49,16 @@ class AppContainer(private val appContext: Context) {
                     isDisliked = disliked.isDisliked(fn),
                 )
                 val delta = after.directScore - before.directScore
+                val nowFav = fav.isFavorite(fn)
+                activityLog.log(
+                    category = "taste",
+                    type = if (nowFav) "favorite_added" else "favorite_removed",
+                    message = (if (nowFav) "Favorited " else "Unfavorited ") + fn,
+                    data = mapOf("filename" to fn, "delta" to delta),
+                )
                 sideEffectScope.launch {
                     taste.propagateSimilarityBoost(fn, delta, "favorite_toggle")
+                    _rebuildSignal.emit("favorite_toggle")
                 }
             }
         }
@@ -62,8 +73,16 @@ class AppContainer(private val appContext: Context) {
                     isDisliked = dis.isDisliked(fn),
                 )
                 val delta = after.directScore - before.directScore
+                val nowDis = dis.isDisliked(fn)
+                activityLog.log(
+                    category = "taste",
+                    type = if (nowDis) "dislike_added" else "dislike_removed",
+                    message = (if (nowDis) "Disliked " else "Undisliked ") + fn,
+                    data = mapOf("filename" to fn, "delta" to delta),
+                )
                 sideEffectScope.launch {
                     taste.propagateSimilarityBoost(fn, delta, "dislike_toggle")
+                    _rebuildSignal.emit("dislike_toggle")
                 }
             }
         }
@@ -99,6 +118,15 @@ class AppContainer(private val appContext: Context) {
     // build the session-level snapshots that the SignalTimeline records.
     val session: SessionEngine by lazy { SessionEngine() }
 
+    // Push #64: persistent Discover snapshot so cold start renders the
+    // page from cache instantly while fresh data overlays in the
+    // background. Capacitor parity: `lastProfile` cache.
+    val discoverCache: DiscoverCacheEngine by lazy { DiscoverCacheEngine(appContext) }
+
+    // Push #69: app-wide activity log for non-playback events. Capacitor
+    // parity: `engine.activity` separate from SignalTimeline.
+    val activityLog: ActivityLogEngine by lazy { ActivityLogEngine(appContext) }
+
     val playback: PlaybackEngine by lazy {
         PlaybackEngine(appContext, preferences, history, taste, signalTimeline, session, toaster)
     }
@@ -124,11 +152,21 @@ class AppContainer(private val appContext: Context) {
      *  embeddings, playlists, common logs."
      */
     fun resetEngine() {
+        activityLog.log("engine", "reset", "Engine reset triggered", level = ActivityLogEngine.Level.WARN)
         playback.stop()
         history.resetAllStats()
         taste.resetAllSignals()
         signalTimeline.clear()
         session.reset()
+        discoverCache.clear()
+        activityLog.clear()
+        // Push #66: clear the transitions history buffer + pending evidence
+        // so cold-start reconciliation doesn't replay pre-reset listens.
+        com.isaivazhi.app.Media3PlaybackService.clearRecentTransitionsStatic(appContext)
+        try {
+            appContext.getSharedPreferences("playback_pending_evidence", android.content.Context.MODE_PRIVATE)
+                .edit().clear().apply()
+        } catch (_: Throwable) {}
         toaster.show("Engine reset")
         // Favorites + Disliked are part of the user's intentional taste —
         // include them in the reset per the Capacitor parity contract.

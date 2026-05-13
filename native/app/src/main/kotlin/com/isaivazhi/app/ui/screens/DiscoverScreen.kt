@@ -69,6 +69,10 @@ fun DiscoverScreen(
     // their on-disk filename).
     embeddedFilepaths: Set<String> = emptySet(),
     currentSongHasEmbedding: Boolean = true,
+    // Push #64: compact blend/engine info strip at the top of the page.
+    // Null hides the strip (e.g. before tuning has loaded).
+    engineSnapshot: EngineSnapshot? = null,
+    onOpenTaste: () -> Unit = {},
     onOpenAiPage: () -> Unit = {},
     onCardTap: (Song) -> Unit,
     onSongLongPress: (Song) -> Unit = {},
@@ -109,6 +113,13 @@ fun DiscoverScreen(
             modifier = Modifier.fillMaxSize(),
             contentPadding = contentPadding,
         ) {
+            // Push #64: compact blend / queue-mode strip at top. Tapping
+            // navigates to the Taste page where the full snapshot lives.
+            if (engineSnapshot != null) {
+                item("insights_strip") {
+                    DiscoverInsightsStrip(snapshot = engineSnapshot, onClick = onOpenTaste)
+                }
+            }
             if (embeddingProgress != null) {
                 item("emb_progress") {
                     Text(
@@ -276,6 +287,54 @@ private fun NoEmbeddingPlaceholder(onOpenAiPage: () -> Unit) {
                 color = MaterialTheme.colorScheme.primary,
             )
         }
+    }
+}
+
+/**
+ * Push #64: one-line blend/engine info at the top of Discover. Capacitor
+ * parity: surfaces `getInsights().blend` (Current/Session/Profile split +
+ * mode label) plus the queue mode (AI/Shuffle) without forcing users to
+ * navigate to the Taste page to see the recommender's current state.
+ *
+ * Tap → opens the Taste page where the full collapsible snapshot lives.
+ */
+@Composable
+private fun DiscoverInsightsStrip(snapshot: EngineSnapshot, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Blend",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = "${snapshot.blendCurrent} / ${snapshot.blendSession} / ${snapshot.blendProfile}",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "· ${snapshot.blendMode}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "Up Next: ${snapshot.queueSize} ${snapshot.queueMode}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 

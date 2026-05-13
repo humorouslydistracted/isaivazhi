@@ -176,6 +176,15 @@ class MainActivity : ComponentActivity() {
         // landed via :ai recovery while the user was idle). Atomic
         // tmp+rename so a process kill while writing can't corrupt.
         if (::container.isInitialized) {
+            // Push #65: flush mid-song listening evidence into the
+            // SignalTimeline before the process can be killed. Without
+            // this, a user who plays a song to 30-50% then closes the
+            // app / installs an update loses ALL signal for that listen
+            // — no plays/avgFraction/xScore update, no timeline entry,
+            // no similarity propagation. Capacitor README parity:
+            // "JS only saves evidence snapshots on background / close;
+            //  cold-start recovery reconciles the two."
+            flushCurrentPlayback(reason = "app_background")
             CoroutineScope(Dispatchers.IO).launch {
                 runCatching { container.embeddingDb.exportLegacyMirror() }
             }
@@ -184,8 +193,61 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        if (::container.isInitialized) container.playback.release()
+        if (::container.isInitialized) {
+            // Push #65: also flush on onDestroy. onPause should have
+            // caught the common case, but onDestroy is a second chance
+            // for activity recreation / system-driven teardown.
+            flushCurrentPlayback(reason = "app_destroy")
+            container.playback.release()
+        }
         super.onDestroy()
+    }
+
+    /**
+     * Push #66 (reworked from #65): save a TENTATIVE listen snapshot —
+     * do NOT fire a SignalTimeline event. The service keeps accumulating
+     * across background; if a real transition fires later (user comes
+     * back and changes song / song ends), THAT transition is the
+     * authoritative event and the snapshot is cleared. If the process
+     * dies before a real transition, cold-start reconciliation replays
+     * the snapshot via [ingestPendingEvidence].
+     *
+     * Capacitor parity: `_persistPendingListenEvidence` in app.js:534.
+     * Major change from Push #65:
+     *   - No more immediate signalTimeline.append → no duplicate events.
+     *   - No more markEvidenceFlushed → accumulator keeps growing across
+     *     background so continued listening accumulates into ONE listen.
+     *   - playbackInstanceId is captured so cold-start can correlate.
+     */
+    private fun flushCurrentPlayback(reason: String) {
+        val svc = Media3PlaybackService.INSTANCE ?: return
+        val mediaId = svc.getCurrentMediaIdSnapshot()
+        if (mediaId.isBlank()) return
+        val played = svc.getAccumulatedPlayedMsSnapshot()
+        val duration = svc.getCurrentDurationMsSnapshot()
+        if (played < 1000L || duration <= 0L) {
+            android.util.Log.i(
+                "MainActivity",
+                "flushCurrentPlayback skip reason=$reason mediaId=$mediaId played=${played}ms dur=${duration}ms (no evidence)"
+            )
+            return
+        }
+        val instId = svc.getCurrentPlaybackInstanceId()
+        val frac = (played.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+        android.util.Log.i(
+            "MainActivity",
+            "flushCurrentPlayback (tentative snapshot) reason=$reason mediaId=$mediaId played=${played}ms dur=${duration}ms frac=${"%.3f".format(frac)} instId=$instId"
+        )
+        // Tentative snapshot only — no SignalTimeline event, no
+        // recordPlaybackEvent, no markEvidenceFlushed. The actual scoring
+        // happens when (a) a real native transition fires for this
+        // playbackInstanceId — in which case the snapshot is cleared, OR
+        // (b) cold-start reconciliation runs.
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching {
+                container.preferences.savePendingEvidence(mediaId, played, duration, instId)
+            }
+        }
     }
 }
 
@@ -460,7 +522,103 @@ private fun AppRoot(container: AppContainer) {
 
     LaunchedEffect(songs) {
         if (songs.isEmpty()) return@LaunchedEffect
+        // Push #65: ingest pending playback evidence BEFORE preparing
+        // resume playback. Two sources, both belt-and-suspenders for the
+        // "user closed the app mid-song" case where the in-memory
+        // accumulator value would otherwise be lost:
+        //   1. DataStore record written by MainActivity.onPause's
+        //      flushCurrentPlayback.
+        //   2. SharedPreferences record written by
+        //      Media3PlaybackService.onTaskRemoved (force-kill path
+        //      that may bypass onPause entirely).
+        // Push #66 — Capacitor parity (`_recoverPendingListenIfNeeded` in
+        // app.js:601). Three-path reconciliation:
+        //   A. If a recent native transition's prevPlaybackInstanceId
+        //      matches the pending snapshot's instanceId, the transition
+        //      is authoritative — use ITS values (more accurate than
+        //      our pre-transition guess). Clear the snapshot.
+        //   B. If the same playback instance is still active in the
+        //      service, defer — the eventual transition will record it
+        //      naturally. Don't double-record now.
+        //   C. Otherwise the service is gone and no transition fired —
+        //      use the snapshot's playedMs/durationMs as-is.
         try {
+            val transitionsJson = com.isaivazhi.app.Media3PlaybackService
+                .readRecentTransitionsStatic(ctx)
+            val recentTransitions = parseRecentTransitions(transitionsJson)
+            val liveInstanceId = com.isaivazhi.app.Media3PlaybackService.INSTANCE?.let {
+                runCatching { it.javaClass.getMethod("getCurrentPlaybackInstanceId").invoke(it) as? Long }
+                    .getOrNull() ?: 0L
+            } ?: 0L
+
+            val pending = container.preferences.loadPendingEvidence()
+            if (pending != null) {
+                reconcilePending(
+                    container = container,
+                    songs = songs,
+                    snapshot = pending,
+                    recentTransitions = recentTransitions,
+                    liveInstanceId = liveInstanceId,
+                    originLabel = "datastore",
+                )
+                container.preferences.clearPendingEvidence()
+            }
+            // Service-side SharedPreferences fallback (force-kill via task swipe).
+            val sp = ctx.getSharedPreferences("playback_pending_evidence", android.content.Context.MODE_PRIVATE)
+            val svcMediaId = sp.getString("mediaId", "") ?: ""
+            val svcPlayed = sp.getLong("playedMs", 0L)
+            val svcDur = sp.getLong("durationMs", 0L)
+            val svcInstId = sp.getLong("playbackInstanceId", 0L)
+            if (svcMediaId.isNotBlank() && svcPlayed >= 1000L && svcDur > 0L) {
+                reconcilePending(
+                    container = container,
+                    songs = songs,
+                    snapshot = com.isaivazhi.app.engine.AppPreferences.PendingEvidence(
+                        mediaId = svcMediaId,
+                        playedMs = svcPlayed,
+                        durationMs = svcDur,
+                        playbackInstanceId = svcInstId,
+                    ),
+                    recentTransitions = recentTransitions,
+                    liveInstanceId = liveInstanceId,
+                    originLabel = "task_removed",
+                )
+                sp.edit().clear().apply()
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "pending evidence reconciliation failed: ${t.message}")
+        }
+        try {
+            // Push #71: BEFORE calling prepareForResume (which destructively
+            // replaces Media3's queue), check whether the service is alive
+            // and already has an active playback session. If yes, the
+            // service's state is the source of truth — background headphone
+            // skips, auto-advances, queue manipulations all happened on the
+            // service while the Activity was destroyed. Calling
+            // prepareForResume with the Activity's stale DataStore values
+            // would CLOBBER the service's current track (the bug the user
+            // reported: "Kanne Kanne restarted from middle after I used
+            // headphone skip in background").
+            val svc = com.isaivazhi.app.Media3PlaybackService.INSTANCE
+            val svcMediaId = svc?.getCurrentMediaIdSnapshot() ?: ""
+            val svcInstId = svc?.getCurrentPlaybackInstanceId() ?: 0L
+            if (svc != null && svcMediaId.isNotBlank() && svcInstId > 0L) {
+                val svcPos = svc.getCurrentPositionMsSnapshot()
+                val snap = container.preferences.snapshot()
+                android.util.Log.i(
+                    "MainActivity",
+                    "cold-start: service alive at mediaId=$svcMediaId instId=$svcInstId pos=${svcPos}ms — " +
+                        "skipping prepareForResume (DataStore had mediaId=${snap.mediaId} pos=${snap.positionMs}ms)"
+                )
+                // Sync Activity state from the service's actual current
+                // state. The MediaController listener will keep it
+                // up-to-date going forward.
+                container.playback.syncStateFromController(songs)
+                return@LaunchedEffect
+            }
+            // Truly cold start: service is dead, no current session. Use
+            // the DataStore snapshot to rebuild the queue and seek to the
+            // saved position.
             val snap = container.preferences.snapshot()
             val mediaId = snap.mediaId ?: return@LaunchedEffect
             val queue = if (snap.queueFilenames.isNotEmpty()) {
@@ -468,6 +626,10 @@ private fun AppRoot(container: AppContainer) {
             } else listOf(songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect)
             if (queue.isEmpty()) return@LaunchedEffect
             val resolvedIndex = queue.indexOfFirst { it.filename == mediaId }.coerceAtLeast(0)
+            android.util.Log.i(
+                "MainActivity",
+                "cold-start: service NOT alive — rebuilding from DataStore mediaId=$mediaId pos=${snap.positionMs}ms idx=$resolvedIndex"
+            )
             container.playback.prepareForResume(queue, resolvedIndex, snap.positionMs)
         } catch (t: Throwable) {
             android.util.Log.w("MainActivity", "cold-start prepare failed: ${t.message}")
@@ -544,31 +706,250 @@ private fun AppRoot(container: AppContainer) {
     // sections. Result: sessionBias + negativeStrength are no longer
     // dormant — moving any slider visibly re-sorts Discover sections.
     // 250 ms debounce prevents thrashing during slider drags.
+    // Push #64: subscribe to the session "qualified listens" counter so
+    // we can auto-refresh For You after every 5 non-skip listens within
+    // the current session. Capacitor parity (`tickForYouListenWindow`).
+    val forYouTick by container.session.forYouTick.collectAsState()
+    // Push #67: immediate rebuild trigger on favorite/dislike toggle.
+    // SharedFlow emits a reason string; LaunchedEffect re-fires the
+    // Discover builders and prepends fresh recommendations to Up Next.
+    var rebuildPulse by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) {
+        container.rebuildSignal.collect { reason ->
+            android.util.Log.i("MainActivity", "rebuildSignal received: $reason → triggering refresh")
+            rebuildPulse++
+        }
+    }
+
+    // Push #68: profileVec cache. Loaded from disk on cold start for
+    // instant blended-query availability; recomputed and persisted when
+    // taste signals drift enough that the fingerprint changes.
+    var cachedProfileVec by remember { mutableStateOf<FloatArray?>(null) }
+    LaunchedEffect(Unit) {
+        runCatching { container.preferences.loadProfileVec() }.getOrNull()?.let {
+            cachedProfileVec = it.vec
+            android.util.Log.i("MainActivity", "loaded profileVec from disk dim=${it.vec.size} fp=${it.fingerprint}")
+        }
+    }
+    // Recompute profileVec when historyStats changes substantially.
+    // Fingerprint = sorted top-30 filenames joined; if it changes,
+    // recompute via forYouByProfileVector helper (which already builds
+    // the centroid internally) — but we need the raw vec, so use a
+    // dedicated helper. For now we compute inline.
+    LaunchedEffect(historyStats.size, embeddingsRowCount, rebuildPulse) {
+        if (songs.isEmpty()) return@LaunchedEffect
+        if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
+        kotlinx.coroutines.delay(300)
+        val byFilename = songs.associateBy { it.filename }
+        val topPlays = historyStats.entries
+            .asSequence()
+            .filter { it.value.plays > 0 && it.value.avgFraction >= 0.3f }
+            .filter { it.key !in dislikedSet }
+            .filter { it.key !in hardBlockedFilenames }
+            .sortedByDescending { it.value.plays * it.value.avgFraction }
+            .take(30)
+            .toList()
+        if (topPlays.isEmpty()) return@LaunchedEffect
+        val anchorSongs = topPlays.mapNotNull { byFilename[it.key] }
+            .filter { !it.contentHash.isNullOrBlank() && it.filePath in embeddedFilepaths }
+        if (anchorSongs.isEmpty()) return@LaunchedEffect
+        val fingerprint = anchorSongs.map { it.filename }.sorted().joinToString("|").hashCode().toString()
+        val current = runCatching { container.preferences.loadProfileVec() }.getOrNull()
+        if (current?.fingerprint == fingerprint && cachedProfileVec != null) return@LaunchedEffect
+        // Build centroid.
+        val hashes = anchorSongs.mapNotNull { it.contentHash }.distinct()
+        val vecsByHash = runCatching { container.embeddingDb.getVecsByHashes(hashes) }.getOrDefault(emptyMap())
+        if (vecsByHash.isEmpty()) return@LaunchedEffect
+        val dim = vecsByHash.values.first().size
+        val pv = FloatArray(dim)
+        var totalWeight = 0f
+        for (song in anchorSongs) {
+            val v = vecsByHash[song.contentHash ?: continue] ?: continue
+            val st = historyStats[song.filename] ?: continue
+            val w = st.plays * st.avgFraction
+            for (d in 0 until dim) pv[d] += v[d] * w
+            totalWeight += w
+        }
+        if (totalWeight <= 0f) return@LaunchedEffect
+        var n2 = 0f
+        for (d in 0 until dim) { pv[d] /= totalWeight; n2 += pv[d] * pv[d] }
+        val inv = if (n2 > 0f) 1f / kotlin.math.sqrt(n2) else 0f
+        for (d in 0 until dim) pv[d] *= inv
+        cachedProfileVec = pv
+        runCatching { container.preferences.saveProfileVec(pv, fingerprint) }
+        android.util.Log.i("MainActivity", "profileVec rebuilt dim=$dim anchors=${anchorSongs.size} fp=$fingerprint")
+    }
+    val discoverCacheState by container.discoverCache.snapshot.collectAsState()
+    val discoverCacheLoaded by container.discoverCache.loaded.collectAsState()
+    // Push #42 Tier 1C: keyed on all 3 tuning knobs + drop the .isEmpty()
+    // gates so each slider change re-runs the recommender for these
+    // sections. Result: sessionBias + negativeStrength are no longer
+    // dormant — moving any slider visibly re-sorts Discover sections.
+    // 250 ms debounce prevents thrashing during slider drags.
+    //
+    // Push #64: forYouTick / 5 → integer division ramps each time the
+    // user crosses a 5-listen boundary; including it in the key list
+    // triggers an auto-refresh of For You (and the cluster pages too,
+    // cheap). The session.resetForYouTick() call closes the window so
+    // the next 5 listens start a new one.
+    // Push #70: manual refresh trigger for Unexplored Sounds. Incremented
+    // only by pull-to-refresh in DiscoverScreen.onRefresh. The Unexplored
+    // LE keys on this so it does NOT recompute on every qualified listen.
+    var unexploredManualRefreshCounter by remember { mutableStateOf(0) }
+
+    // Push #70 — For You + Because You Played LE (the "listen-responsive"
+    // sections). Dropped `qualifyingEventCount` from the key set because
+    // it changed on every qualified listen, which thrashed the LE. We
+    // now rely on `forYouTick / 5` (intentional 5-listen window) and
+    // `historyStats.size` (which only changes when a brand-new song is
+    // added to history). `rebuildPulse` fires on favorite/dislike toggle.
     LaunchedEffect(
-        qualifyingEventCount, historyStats.size, songs.isNotEmpty(), embeddingsRowCount,
+        historyStats.size, songs.isNotEmpty(), embeddingsRowCount,
         tuning.adventurous, tuning.sessionBias, tuning.negativeStrength,
+        forYouTick / 5,
+        rebuildPulse,
     ) {
         val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
         if (songs.isEmpty() || !hasEmbeddings) return@LaunchedEffect
         kotlinx.coroutines.delay(250)
+        val randomize = forYouTick >= 5
+        val tStart = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.i(
+            "DiscoverLE",
+            "ForYou+BYP fire: historyStats=${historyStats.size} forYouTick=$forYouTick(/5=${forYouTick / 5}) rebuildPulse=$rebuildPulse randomize=$randomize"
+        )
         forYou = runCatching {
-            container.recommender.forYou(
+            val pv = container.recommender.forYouByProfileVector(
+                songs, historyStats, embeddedFilepaths, dislikedSet,
+                hardBlockedFilenames = hardBlockedFilenames,
+                k = 12, randomize = randomize,
+            )
+            if (pv.isNotEmpty()) pv
+            else container.recommender.forYou(
                 songs, historyStats, tuning, dislikedSet,
-                hardBlockedFilenames = hardBlockedFilenames, k = 12,
+                hardBlockedFilenames = hardBlockedFilenames, k = 12, randomize = randomize,
             )
         }.getOrDefault(forYou)
+        val qualifyingRecent = historyEvents.count { it.fractionPlayed >= 0.3f }
         becauseYouPlayed = runCatching {
             container.recommender.becauseYouPlayed(
                 songs, historyEvents, tuning, dislikedSet,
                 hardBlockedFilenames = hardBlockedFilenames,
                 statsFallback = historyStats, kPerSource = 8, sourceCount = 3,
+                randomize = randomize,
             )
         }.getOrDefault(becauseYouPlayed)
+        val builtMs = android.os.SystemClock.elapsedRealtime() - tStart
+        android.util.Log.i(
+            "DiscoverLE",
+            "ForYou+BYP done: forYou=${forYou.size} BYP=${becauseYouPlayed.size}/${becauseYouPlayed.sumOf { it.second.size }} qualifyingRecent=$qualifyingRecent (took ${builtMs}ms)"
+        )
+        if (becauseYouPlayed.isEmpty()) {
+            android.util.Log.w(
+                "DiscoverLE",
+                "BYP empty: qualifyingHistoryEvents=$qualifyingRecent — need more listened songs at >=30%"
+            )
+        }
+        if (randomize) container.session.resetForYouTick()
+        container.discoverCache.save(
+            mostSimilarFilenames = mostSimilar.map { it.song.filename },
+            forYouFilenames = forYou.map { it.song.filename },
+            byp = becauseYouPlayed.map { (src, sims) ->
+                com.isaivazhi.app.engine.DiscoverCacheEngine.BypEntry(
+                    anchorFilename = src.filename,
+                    anchorTitle = src.title.ifBlank { src.filename },
+                    recommendationFilenames = sims.map { it.song.filename },
+                )
+            },
+            unexploredFilenamesByCluster = unexploredClusters.map { cl -> cl.map { it.filename } },
+            currentMediaId = playbackState.currentMediaId,
+            recommendationFingerprint = container.taste.recommendationFingerprint(),
+        )
+    }
+
+    // Push #70 — Unexplored Clusters LE (separate, narrower keys). Only
+    // recomputes on:
+    //   • Cold start (songs.isNotEmpty() becomes true)
+    //   • New embeddings landed (embeddingsRowCount changes)
+    //   • User pulls to refresh (unexploredManualRefreshCounter ticks)
+    // Does NOT recompute after every qualified listen, which was the
+    // visible "Unexplored Sounds shuffles after every song" bug.
+    LaunchedEffect(songs.isNotEmpty(), embeddingsRowCount, unexploredManualRefreshCounter) {
+        val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
+        if (songs.isEmpty() || !hasEmbeddings) {
+            android.util.Log.i(
+                "DiscoverLE",
+                "Unexplored SKIP: songs=${songs.size} hasEmbeddings=$hasEmbeddings"
+            )
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(250)
+        val tStart = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.i(
+            "DiscoverLE",
+            "Unexplored fire: embeddingsRowCount=$embeddingsRowCount manualRefresh=$unexploredManualRefreshCounter"
+        )
         unexploredClusters = runCatching {
-            container.recommender.unexploredClusters(
-                songs, historyStats.keys, embeddedFilepaths, kPerCluster = 8, clusters = 3,
+            container.recommender.unexploredClustersKMeans(
+                songs, historyStats, historyStats.keys, embeddedFilepaths,
+                kPerCluster = 8, displayClusters = 3,
             )
         }.getOrDefault(unexploredClusters)
+        val builtMs = android.os.SystemClock.elapsedRealtime() - tStart
+        android.util.Log.i(
+            "DiscoverLE",
+            "Unexplored done: clusters=${unexploredClusters.size} totalSongs=${unexploredClusters.sumOf { it.size }} (took ${builtMs}ms)"
+        )
+    }
+
+    // Push #64: on cold start, hydrate the Discover sections from the
+    // persisted cache BEFORE the heavy LaunchedEffect above kicks in.
+    // Runs once when the cache finishes loading and the library is
+    // available. Sections still in `emptyList()` after hydration mean
+    // either no cache yet or no library overlap.
+    LaunchedEffect(discoverCacheLoaded, songs.isNotEmpty()) {
+        if (!discoverCacheLoaded || songs.isEmpty()) return@LaunchedEffect
+        val snap = discoverCacheState
+        if (snap.computedAt == 0L) return@LaunchedEffect
+        // Push #68: validate cache freshness via fingerprint comparison.
+        // If the recommendation policy has materially shifted since the
+        // cache was written (top ±30 reshuffled, hard-block set changed),
+        // skip hydration and wait for the LE to recompute.
+        val liveFingerprint = container.taste.recommendationFingerprint()
+        if (snap.recommendationFingerprint.isNotBlank() &&
+            snap.recommendationFingerprint != liveFingerprint
+        ) {
+            android.util.Log.i(
+                "MainActivity",
+                "Discover cache fingerprint mismatch — skipping hydration cached=${snap.recommendationFingerprint} live=$liveFingerprint"
+            )
+            return@LaunchedEffect
+        }
+        val byFn = songs.associateBy { it.filename }
+        fun hydrate(fns: List<String>): List<Song> = fns.mapNotNull { byFn[it] }
+        if (mostSimilar.isEmpty()) {
+            mostSimilar = hydrate(snap.mostSimilarFilenames).map {
+                com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
+            }
+        }
+        if (forYou.isEmpty()) {
+            forYou = hydrate(snap.forYouFilenames).map {
+                com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
+            }
+        }
+        if (becauseYouPlayed.isEmpty()) {
+            becauseYouPlayed = snap.byp.mapNotNull { e ->
+                val src = byFn[e.anchorFilename] ?: return@mapNotNull null
+                val sims = hydrate(e.recommendationFilenames).map {
+                    com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
+                }
+                if (sims.isEmpty()) null else src to sims
+            }
+        }
+        if (unexploredClusters.isEmpty()) {
+            unexploredClusters = snap.unexploredFilenamesByCluster.map { hydrate(it) }
+                .filter { it.isNotEmpty() }
+        }
     }
 
     val currentSongFilePath: String? = playbackState.currentMediaId?.let { mediaId ->
@@ -620,7 +1001,17 @@ private fun AppRoot(container: AppContainer) {
         // (background IO): build the AI tail and append via
         // `replaceUpcoming` so Up Next fills in over the next ~200-500 ms.
         // Capacitor parity for `_doRefresh('manual')` 2-phase behavior.
-        container.playback.playQueue(listOf(song), startIndex = 0, source = "manual_tap")
+        //
+        // Push #70: this is the "Songs-tab tap" path — single song + AI
+        // tail. Context = LIBRARY so the queue-exhaust LE knows it's
+        // allowed to keep appending fresh recs if the queue runs low.
+        android.util.Log.i("CardTap", "playFromTap song=${song.filename} → LIBRARY single-song + AI tail")
+        container.playback.playQueue(
+            songs = listOf(song),
+            startIndex = 0,
+            source = "manual_tap",
+            queueContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.LIBRARY,
+        )
         // Prefetch the now-playing art in parallel with audio start, so
         // the MiniPlayer's ArtThumbnail finds it in the LRU on the first
         // recomposition after currentMediaId updates. Without this, the
@@ -670,29 +1061,60 @@ private fun AppRoot(container: AppContainer) {
     // on). Library-recommendation-mode flag routes back to playFromTap
     // for Songs-tab taps. Recommender appends a tail when the queue
     // exhausts (Tier 2G LaunchedEffect below).
-    val playFromSection: (sectionSongs: List<Song>, tappedIndex: Int, isLibraryRecommendationMode: Boolean) -> Unit =
-        playFromSection@ { sectionSongs, tappedIndex, isLibraryRecommendationMode ->
-            val playable = sectionSongs.filter { it.filePath != null }
-            val tappedSong = playable.getOrNull(tappedIndex.coerceIn(0, (playable.size - 1).coerceAtLeast(0)))
-                ?: return@playFromSection
-            if (isLibraryRecommendationMode) {
-                playFromTap(tappedSong)
-                return@playFromSection
-            }
-            val shuffleOn = playbackState.shuffleEnabled
-            val queueSongs: List<Song> = if (shuffleOn) {
-                playable.shuffled()
-            } else {
-                playable.subList(tappedIndex.coerceIn(0, playable.size - 1), playable.size)
-            }
-            val startIdx = if (shuffleOn) queueSongs.indexOf(tappedSong).coerceAtLeast(0) else 0
-            container.playback.playQueue(queueSongs, startIndex = startIdx, source = "manual_tap")
-            tappedSong.filePath?.let { path ->
-                coroutineScope.launch(Dispatchers.IO) {
-                    runCatching { AlbumArtRepository.load(ctx, path, sampleSize = 4) }
-                }
+    /**
+     * Push #70: section-tap handler. The `queueContext` parameter drives
+     * the queue-exhaust LE's "should I append AI?" decision.
+     *
+     *   QueueContext.DISCOVER_SECTION  — Most Similar / For You / BYP /
+     *                                    Unexplored. AI tail appends on
+     *                                    queue exhaust if LOOP=OFF.
+     *   QueueContext.ALBUM             — Album-track tap. No AI ever.
+     *                                    LOOP=OFF stops at end.
+     *   QueueContext.BROWSE_SECTION    — View-All / Favorites / Playlist /
+     *                                    Search results. No AI ever.
+     *
+     * Library single-song mode is handled by [playFromTap] directly,
+     * not via this path.
+     */
+    val playFromSection: (
+        sectionSongs: List<Song>,
+        tappedIndex: Int,
+        queueContext: com.isaivazhi.app.engine.PlaybackEngine.QueueContext,
+        sectionLabel: String,
+    ) -> Unit = playFromSection@ { sectionSongs, tappedIndex, queueContext, sectionLabel ->
+        val playable = sectionSongs.filter { it.filePath != null }
+        val tappedSong = playable.getOrNull(tappedIndex.coerceIn(0, (playable.size - 1).coerceAtLeast(0)))
+            ?: return@playFromSection
+        val shuffleOn = playbackState.shuffleEnabled
+        val queueSongs: List<Song> = if (shuffleOn) {
+            playable.shuffled()
+        } else {
+            playable.subList(tappedIndex.coerceIn(0, playable.size - 1), playable.size)
+        }
+        val startIdx = if (shuffleOn) queueSongs.indexOf(tappedSong).coerceAtLeast(0) else 0
+        val source = when (queueContext) {
+            com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM -> "album"
+            com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION -> "browse_section"
+            com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION -> "discover_section"
+            else -> "manual_tap"
+        }
+        android.util.Log.i(
+            "CardTap",
+            "playFromSection label=$sectionLabel ctx=$queueContext tapped=${tappedSong.filename} " +
+                "idx=$tappedIndex sectionSize=${playable.size} shuffleOn=$shuffleOn"
+        )
+        container.playback.playQueue(
+            songs = queueSongs,
+            startIndex = startIdx,
+            source = source,
+            queueContext = queueContext,
+        )
+        tappedSong.filePath?.let { path ->
+            coroutineScope.launch(Dispatchers.IO) {
+                runCatching { AlbumArtRepository.load(ctx, path, sampleSize = 4) }
             }
         }
+    }
 
     // Push #42 Tier 1D: REMOVED — the LaunchedEffect that rebuilt the
     // active playback queue on every tuning slider release. That was the
@@ -720,24 +1142,71 @@ private fun AppRoot(container: AppContainer) {
     // (REPEAT_ALL loops the section; REPEAT_ONE loops the song), append
     // 50 AI recommendations as a tail so playback continues seamlessly
     // after the section ends. Capacitor parity: `_doRefresh('queue_exhausted')`.
-    LaunchedEffect(playbackState.currentMediaId, playbackState.queueFilenames.size) {
+    LaunchedEffect(playbackState.currentMediaId, playbackState.queueFilenames.size, playbackState.queueContext) {
         val mediaId = playbackState.currentMediaId ?: return@LaunchedEffect
         val queueSize = playbackState.queueFilenames.size
         if (queueSize == 0) return@LaunchedEffect
         // Only fire when we're on the LAST item of the queue.
         val curIdx = playbackState.queueIndex
-        if (curIdx < queueSize - 1) return@LaunchedEffect
+        if (curIdx < queueSize - 1) {
+            android.util.Log.i(
+                "QueueExhaust",
+                "skip: not on last item (curIdx=$curIdx of $queueSize, ctx=${playbackState.queueContext})"
+            )
+            return@LaunchedEffect
+        }
+        // Push #70: queueContext drives the AI-append decision before loop mode.
+        //   ALBUM / BROWSE_SECTION → never append AI. Section is finite.
+        //   LIBRARY / DISCOVER_SECTION / AI_RECOMMENDED → append AI when loop=OFF.
+        val ctx = playbackState.queueContext
+        if (ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM ||
+            ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION
+        ) {
+            android.util.Log.i(
+                "QueueExhaust",
+                "skip AI append: section context $ctx (no AI ever)"
+            )
+            return@LaunchedEffect
+        }
         // Respect repeat modes: ALL loops the section; ONE loops the song.
         // Both = no append. Only OFF gets the recommender tail.
-        if (playbackState.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) return@LaunchedEffect
+        if (playbackState.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
+            android.util.Log.i(
+                "QueueExhaust",
+                "skip AI append: repeat=${playbackState.repeatMode} (OFF=0 ONE=1 ALL=2)"
+            )
+            return@LaunchedEffect
+        }
         val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
-        if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
+        if ((embeddingsRowCount ?: 0) == 0) {
+            android.util.Log.i("QueueExhaust", "skip AI append: no embeddings")
+            return@LaunchedEffect
+        }
         // Debounce + check that we're still on the last item after the delay
         // (user may have already tapped Next to a different queue).
         kotlinx.coroutines.delay(500)
         if (playbackState.currentMediaId != mediaId) return@LaunchedEffect
         if (playbackState.queueIndex < playbackState.queueFilenames.size - 1) return@LaunchedEffect
+        android.util.Log.i(
+            "QueueExhaust",
+            "appending AI tail: ctx=$ctx queueSize=$queueSize mediaId=$mediaId"
+        )
         val excludeFns = playbackState.queueFilenames.toSet()
+        // Push #67: build a blended query vector that mixes the current
+        // song with the session-listened rolling window and the long-
+        // term profile centroid. This is the recommender's view of
+        // "what should come next" instead of pure neighbors-of-current.
+        val blendedTriple = runCatching {
+            container.recommender.buildBlendedVec(
+                currentSongHash = current.contentHash,
+                sessionListened = container.session.listened.value,
+                profileVec = cachedProfileVec,  // Push #68: persisted centroid.
+                library = songs,
+                mode = "play",
+                sessionBias = tuning.sessionBias,
+            )
+        }.getOrNull()
+        val blendedVec = blendedTriple?.first
         val tail = runCatching {
             container.recommender.recommendUpcoming(
                 currentSong = current,
@@ -746,12 +1215,65 @@ private fun AppRoot(container: AppContainer) {
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = excludeFns,
                 hardBlockedFilenames = hardBlockedFilenames,
+                blendedQueryVec = blendedVec,
             )
         }.getOrDefault(emptyList())
         if (tail.isNotEmpty()) {
-            // Append, not replace. Use addMediaItems via a thin engine method.
             container.playback.appendToQueue(tail)
-            container.toaster.show("Up Next refreshed with recommendations")
+            container.toaster.show("Up Next refreshed with recommendations (${blendedTriple?.third ?: "current"})")
+        }
+    }
+
+    // Push #67: SOFT-REFRESH UPCOMING TAIL after a qualified listen.
+    // Capacitor parity (`_softRefreshQueue`): when the session vector
+    // changes (new evidence accumulated), re-rank the queue's tail —
+    // frozen [0..4] untouched, stable [5..14] re-sorted by new blended
+    // similarity, fluid [15+] replaced with fresh recommendations. Keyed
+    // on session.listened size so it fires after each new listen.
+    val sessionListened by container.session.listened.collectAsState()
+    LaunchedEffect(sessionListened.size, playbackState.currentMediaId) {
+        if (songs.isEmpty()) return@LaunchedEffect
+        val mediaId = playbackState.currentMediaId ?: return@LaunchedEffect
+        val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
+        if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
+        // Debounce so rapid-fire transitions don't thrash the recommender.
+        kotlinx.coroutines.delay(750)
+        // Verify state didn't change during the debounce.
+        if (playbackState.currentMediaId != mediaId) return@LaunchedEffect
+        if (sessionListened.size < 2) return@LaunchedEffect  // need some session evidence first
+        val upcomingFilenames = playbackState.queueFilenames
+            .drop(playbackState.queueIndex + 1)
+        if (upcomingFilenames.size <= 5) return@LaunchedEffect  // too short to bother
+        val byFn = songs.associateBy { it.filename }
+        val upcomingSongs = upcomingFilenames.mapNotNull { byFn[it] }
+        val blendedTriple = runCatching {
+            container.recommender.buildBlendedVec(
+                currentSongHash = current.contentHash,
+                sessionListened = sessionListened,
+                profileVec = cachedProfileVec,  // Push #68
+                library = songs,
+                mode = "play",
+                sessionBias = tuning.sessionBias,
+            )
+        }.getOrNull()
+        val blendedVec = blendedTriple?.first ?: return@LaunchedEffect
+        val newTail = runCatching {
+            container.recommender.softRefreshUpcomingTail(
+                currentSong = current,
+                upcoming = upcomingSongs,
+                library = songs,
+                blendedQueryVec = blendedVec,
+                adventurous = tuning.adventurous,
+                extraExcludeFilenames = upcomingFilenames.toSet(),
+                hardBlockedFilenames = hardBlockedFilenames,
+            )
+        }.getOrDefault(emptyList())
+        if (newTail.isNotEmpty() && newTail != upcomingSongs) {
+            container.playback.replaceUpcoming(newTail)
+            android.util.Log.i(
+                "MainActivity",
+                "soft-refresh applied to upcoming tail: size=${newTail.size}"
+            )
         }
     }
     val isMenuSongFavorite = menuSong?.filename?.let { it in favoritesSet } ?: false
@@ -989,6 +1511,19 @@ private fun AppRoot(container: AppContainer) {
                                 currentSongHasEmbedding = currentSongFilePath?.let {
                                     embeddedFilepaths.isEmpty() || it in embeddedFilepaths
                                 } ?: true,
+                                // Push #64: pass the same EngineSnapshot the
+                                // Taste page uses so the Discover strip stays
+                                // in sync with it. Tap → opens Taste.
+                                engineSnapshot = buildEngineSnapshot(
+                                    tuning = tuning,
+                                    discoverQueueSize = playbackState.queueFilenames.size,
+                                    aiMode = recMode,
+                                    embeddingsCovered = embeddedFilepaths.size,
+                                    embeddingsTotal = songs.count { it.filePath != null },
+                                    nowPlayingTitle = playbackState.title,
+                                    nowPlayingArtist = playbackState.artist,
+                                ),
+                                onOpenTaste = { overlay = Overlay.Taste },
                                 onOpenAiPage = { overlay = Overlay.Ai },
                                 // Push #42 Tier 2F: Discover card tap is a SECTION tap
                                 // — find which section the tapped song belongs to and
@@ -1004,20 +1539,24 @@ private fun AppRoot(container: AppContainer) {
                                     val unexploredCluster = unexploredClusters.firstOrNull { cluster ->
                                         cluster.any { it.filename == song.filename }
                                     }
-                                    val (sectionSongs, idx) = when {
+                                    val (sectionSongs, idx, label) = when {
                                         mostSimSongs.any { it.filename == song.filename } ->
-                                            mostSimSongs to mostSimSongs.indexOfFirst { it.filename == song.filename }
+                                            Triple(mostSimSongs, mostSimSongs.indexOfFirst { it.filename == song.filename }, "MostSimilar")
                                         fySongs.any { it.filename == song.filename } ->
-                                            fySongs to fySongs.indexOfFirst { it.filename == song.filename }
+                                            Triple(fySongs, fySongs.indexOfFirst { it.filename == song.filename }, "ForYou")
                                         bypMatch != null -> {
                                             val bypSongs = bypMatch.second.map { it.song }
-                                            bypSongs to bypSongs.indexOfFirst { it.filename == song.filename }
+                                            Triple(bypSongs, bypSongs.indexOfFirst { it.filename == song.filename }, "BYP:${bypMatch.first.filename}")
                                         }
                                         unexploredCluster != null ->
-                                            unexploredCluster to unexploredCluster.indexOfFirst { it.filename == song.filename }
-                                        else -> listOf(song) to 0
+                                            Triple(unexploredCluster, unexploredCluster.indexOfFirst { it.filename == song.filename }, "Unexplored")
+                                        else -> Triple(listOf(song), 0, "Single")
                                     }
-                                    playFromSection(sectionSongs, idx, /* isLibraryRecommendationMode = */ false)
+                                    playFromSection(
+                                        sectionSongs, idx,
+                                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION,
+                                        label,
+                                    )
                                 },
                                 onSongLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
                                 onRefresh = {
@@ -1038,16 +1577,30 @@ private fun AppRoot(container: AppContainer) {
                                     // existing list on transient errors instead of
                                     // hiding the section.
                                     forYou = runCatching {
-                                        container.recommender.forYou(songs, historyStats, tuning, dislikedSet, hardBlockedFilenames = hardBlockedFilenames, k = 12, randomize = true)
+                                        // Push #64: profile-vector path with fallback.
+                                        val pv = container.recommender.forYouByProfileVector(
+                                            songs, historyStats, embeddedFilepaths, dislikedSet,
+                                            hardBlockedFilenames = hardBlockedFilenames,
+                                            k = 12, randomize = true,
+                                        )
+                                        if (pv.isNotEmpty()) pv
+                                        else container.recommender.forYou(songs, historyStats, tuning, dislikedSet, hardBlockedFilenames = hardBlockedFilenames, k = 12, randomize = true)
                                     }.getOrElse { forYou }
                                     becauseYouPlayed = runCatching {
                                         container.recommender.becauseYouPlayed(songs, historyEvents, tuning, dislikedSet, hardBlockedFilenames = hardBlockedFilenames, statsFallback = historyStats, kPerSource = 8, sourceCount = 3, randomize = true)
                                     }.getOrElse { becauseYouPlayed }
-                                    unexploredClusters = runCatching {
-                                        container.recommender.unexploredClusters(
-                                            songs, historyStats.keys, embeddedFilepaths, kPerCluster = 8, clusters = 3,
-                                        )
-                                    }.getOrElse { unexploredClusters }
+                                    // Push #70: pull-to-refresh is the ONLY trigger
+                                    // for Unexplored Sounds. Bumping the counter
+                                    // re-fires the dedicated Unexplored LE which
+                                    // now lives separately from the listen-driven
+                                    // For You + BYP refresh.
+                                    unexploredManualRefreshCounter++
+                                    android.util.Log.i(
+                                        "DiscoverLE",
+                                        "Pull-to-refresh: tick Unexplored counter → $unexploredManualRefreshCounter"
+                                    )
+                                    // Pull-to-refresh resets the auto-refresh window.
+                                    container.session.resetForYouTick()
                                     container.toaster.show("Recommendations refreshed")
                                 },
                                 onOpenSection = { ref ->
@@ -1105,7 +1658,11 @@ private fun AppRoot(container: AppContainer) {
                             // all tracks shuffled if shuffle is on). Recommender
                             // appends a tail when the album exhausts (Tier 2G).
                             onPlayAlbum = { tracks, idx ->
-                                playFromSection(tracks, idx, /* isLibraryRecommendationMode = */ false)
+                                playFromSection(
+                                    tracks, idx,
+                                    com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM,
+                                    "Album",
+                                )
                             },
                             onSongLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
                             // Push #62: album-level long-press → open a
@@ -1126,14 +1683,33 @@ private fun AppRoot(container: AppContainer) {
                                 val mediaId = playbackState.currentMediaId ?: return@UpNextScreen
                                 val current = songs.firstOrNull { it.filename == mediaId } ?: return@UpNextScreen
                                 coroutineScope.launch {
+                                    // Push #70: AI/Shuffle toggle on UpNext preserves Play Next.
+                                    val playNextSet = playbackState.playNextFilenames
+                                    val byFn = songs.associateBy { it.filename }
+                                    val playNextSongs = playNextSet.mapNotNull { byFn[it] }
+                                    val excludeFns = playNextSet + mediaId
                                     val newTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
-                                            container.recommender.recommendUpcoming(current, songs, k = 50, adventurous = tuning.adventurous, hardBlockedFilenames = hardBlockedFilenames)
+                                            container.recommender.recommendUpcoming(
+                                                current, songs, k = 50,
+                                                adventurous = tuning.adventurous,
+                                                extraExcludeFilenames = excludeFns,
+                                                hardBlockedFilenames = hardBlockedFilenames,
+                                            )
                                         }.getOrDefault(emptyList())
                                     } else {
-                                        songs.filter { it.filePath != null && it.filename != mediaId }.shuffled().take(50)
+                                        songs.filter { it.filePath != null && it.filename !in excludeFns }
+                                            .shuffled().take(50)
                                     }
-                                    container.playback.replaceUpcoming(newTail)
+                                    val finalUpcoming = playNextSongs + newTail
+                                    android.util.Log.i(
+                                        "QueueOp",
+                                        "UpNext toggle aiMode=$aiMode: preserved ${playNextSongs.size} Play Next + ${newTail.size} new"
+                                    )
+                                    container.playback.replaceUpcoming(
+                                        newUpcoming = finalUpcoming,
+                                        newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+                                    )
                                 }
                             },
                             onJumpTo = { index -> container.playback.playAtIndex(index) },
@@ -1144,14 +1720,36 @@ private fun AppRoot(container: AppContainer) {
                                 val mediaId = playbackState.currentMediaId ?: return@UpNextScreen
                                 val current = songs.firstOrNull { it.filename == mediaId } ?: return@UpNextScreen
                                 coroutineScope.launch {
+                                    // Push #70: refresh button rebuilds AI tail
+                                    // but PRESERVES Play Next songs at the front
+                                    // of the new upcoming list. Reset queue
+                                    // context to AI_RECOMMENDED.
+                                    val playNextSet = playbackState.playNextFilenames
+                                    val byFn = songs.associateBy { it.filename }
+                                    val playNextSongs = playNextSet.mapNotNull { byFn[it] }
+                                    val excludeFns = playNextSet + mediaId
                                     val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
-                                            container.recommender.recommendUpcoming(current, songs, k = 50, adventurous = tuning.adventurous, hardBlockedFilenames = hardBlockedFilenames)
+                                            container.recommender.recommendUpcoming(
+                                                current, songs, k = 50,
+                                                adventurous = tuning.adventurous,
+                                                extraExcludeFilenames = excludeFns,
+                                                hardBlockedFilenames = hardBlockedFilenames,
+                                            )
                                         }.getOrDefault(emptyList())
                                     } else {
-                                        songs.filter { it.filePath != null && it.filename != mediaId }.shuffled().take(50)
+                                        songs.filter { it.filePath != null && it.filename !in excludeFns }
+                                            .shuffled().take(50)
                                     }
-                                    if (newTail.isNotEmpty()) container.playback.replaceUpcoming(newTail)
+                                    val finalUpcoming = playNextSongs + newTail
+                                    android.util.Log.i(
+                                        "QueueOp",
+                                        "Refresh button: preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
+                                    )
+                                    if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
+                                        newUpcoming = finalUpcoming,
+                                        newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+                                    )
                                 }
                             },
                             contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
@@ -1245,7 +1843,10 @@ private fun AppRoot(container: AppContainer) {
         SearchOverlay(
             songs = songs,
             onDismiss = { overlay = Overlay.None },
-            onPlay = { queue, idx -> container.playback.playQueue(queue, idx, source = "manual_tap") },
+            // Push #70: Search result tap = single song + AI tail (LIBRARY).
+            onPlay = { queue, idx ->
+                queue.getOrNull(idx)?.let { playFromTap(it) }
+            },
         )
     }
 
@@ -1282,7 +1883,14 @@ private fun AppRoot(container: AppContainer) {
             currentMediaId = playbackState.currentMediaId,
             onBack = { overlay = Overlay.None },
             onUnfavorite = { container.favorites.remove(it) },
-            onPlay = { q, idx -> container.playback.playQueue(q, idx, source = "manual_tap") },
+            // Push #70: Favorites = BROWSE_SECTION (no AI tail).
+            onPlay = { q, idx ->
+                playFromSection(
+                    q, idx,
+                    com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION,
+                    "Favorites",
+                )
+            },
         )
     }
 
@@ -1310,7 +1918,14 @@ private fun AppRoot(container: AppContainer) {
                 songs = songs,
                 currentMediaId = playbackState.currentMediaId,
                 onBack = { overlay = Overlay.Playlists },
-                onPlay = { q, idx -> container.playback.playQueue(q, idx, source = "manual_tap") },
+                // Push #70: Playlist = BROWSE_SECTION (no AI tail).
+                onPlay = { q, idx ->
+                    playFromSection(
+                        q, idx,
+                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION,
+                        "Playlist:${currentDetailPlaylist.name}",
+                    )
+                },
                 onRemove = { container.playlists.removeSong(currentDetailPlaylist.id, it) },
             )
         }
@@ -1381,7 +1996,15 @@ private fun AppRoot(container: AppContainer) {
             },
             onCopyTimelineText = { container.toaster.show("Copied last 30 signals") },
             onCopyTimelineSummary = { /* unused stub */ },
-            onPlayOrderedList = { q, idx -> container.playback.playQueue(q, idx, source = "manual_tap") },
+            // Push #70: Taste page row tap plays the Taste-ordered list
+            // as a BROWSE_SECTION (no AI tail; user wants the signal list as-is).
+            onPlayOrderedList = { q, idx ->
+                playFromSection(
+                    q, idx,
+                    com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION,
+                    "TasteOrdered",
+                )
+            },
         )
     }
 
@@ -1675,9 +2298,14 @@ private fun AppRoot(container: AppContainer) {
                 songs = listSongs,
                 currentMediaId = playbackState.currentMediaId,
                 onBack = { overlay = Overlay.None },
-                // Push #42 Tier 2F: Browse-tile ViewAll tap = SECTION tap.
+                // Push #70: Browse-tab ViewAll = BROWSE_SECTION context.
+                // Section plays through, no AI tail appended at end.
                 onPlay = { q, idx ->
-                    playFromSection(q, idx, /* isLibraryRecommendationMode = */ false)
+                    playFromSection(
+                        q, idx,
+                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION,
+                        viewAllCat.title,
+                    )
                 },
                 onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
             )
@@ -1694,9 +2322,14 @@ private fun AppRoot(container: AppContainer) {
                 songs = sectionViewAll.songs,
                 currentMediaId = playbackState.currentMediaId,
                 onBack = { overlay = Overlay.None },
-                // Push #42 Tier 2F: Discover section "View all" tap = SECTION tap.
+                // Push #70: Discover section "View all" = DISCOVER_SECTION
+                // context. AI tail appends on queue exhaust.
                 onPlay = { q, idx ->
-                    playFromSection(q, idx, /* isLibraryRecommendationMode = */ false)
+                    playFromSection(
+                        q, idx,
+                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION,
+                        sectionViewAll.title,
+                    )
                 },
                 onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
             )
@@ -1802,7 +2435,14 @@ private fun AppRoot(container: AppContainer) {
             // Songs library linearly from the tapped position.
             onPlayInOrder = menuSongsTabIndex?.let { idx ->
                 {
-                    playFromSection(songs, idx, /* isLibraryRecommendationMode = */ false)
+                    // Push #70: Songs-tab "Play in order" = LIBRARY context.
+                    // Plays the full Songs list from the tapped position.
+                    // AI tail appends when this huge queue exhausts (rare).
+                    playFromSection(
+                        songs, idx,
+                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.LIBRARY,
+                        "SongsTabLinear",
+                    )
                 }
             },
         )
@@ -1831,7 +2471,13 @@ private fun AppRoot(container: AppContainer) {
                             albumMenuName = null
                             val playable = albumTracks.filter { it.filePath != null }
                             if (playable.isNotEmpty()) {
-                                container.playback.playQueue(playable, 0, source = "manual_tap")
+                                // Push #70: album = ALBUM context (no AI tail).
+                                container.playback.playQueue(
+                                    songs = playable,
+                                    startIndex = 0,
+                                    source = "album",
+                                    queueContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM,
+                                )
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
@@ -1846,7 +2492,13 @@ private fun AppRoot(container: AppContainer) {
                             albumMenuName = null
                             val shuffled = albumTracks.filter { it.filePath != null }.shuffled()
                             if (shuffled.isNotEmpty()) {
-                                container.playback.playQueue(shuffled, 0, source = "manual_tap")
+                                // Push #70: shuffled album = still ALBUM context.
+                                container.playback.playQueue(
+                                    songs = shuffled,
+                                    startIndex = 0,
+                                    source = "album_shuffle",
+                                    queueContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM,
+                                )
                                 container.toaster.show("Shuffling \"$albumName\"")
                             }
                         },
@@ -1944,6 +2596,170 @@ private fun AppRoot(container: AppContainer) {
                     color = MaterialTheme.colorScheme.inverseOnSurface,
                     maxLines = 2,
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Push #66: a parsed entry from the service's transitions history buffer.
+ */
+private data class RecentTransition(
+    val prevPlaybackInstanceId: Long,
+    val prevPlayedMs: Long,
+    val prevDurationMs: Long,
+    val prevFraction: Float,
+    val prevFilename: String,
+    val action: String,
+)
+
+private fun parseRecentTransitions(arr: org.json.JSONArray): List<RecentTransition> {
+    val out = ArrayList<RecentTransition>(arr.length())
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        out += RecentTransition(
+            prevPlaybackInstanceId = o.optLong("prevPlaybackInstanceId", 0L),
+            prevPlayedMs = o.optLong("prevPlayedMs", 0L),
+            prevDurationMs = o.optLong("prevDurationMs", 0L),
+            prevFraction = o.optDouble("prevFraction", 0.0).toFloat(),
+            prevFilename = o.optString("prevFilename", ""),
+            action = o.optString("action", ""),
+        )
+    }
+    return out
+}
+
+/**
+ * Push #66 — Capacitor parity (`_recoverPendingListenIfNeeded`):
+ * three-path reconciliation between a pending listen snapshot and the
+ * native transitions buffer.
+ */
+private fun reconcilePending(
+    container: AppContainer,
+    songs: List<Song>,
+    snapshot: com.isaivazhi.app.engine.AppPreferences.PendingEvidence,
+    recentTransitions: List<RecentTransition>,
+    liveInstanceId: Long,
+    originLabel: String,
+) {
+    val match = recentTransitions.firstOrNull { it.prevPlaybackInstanceId == snapshot.playbackInstanceId }
+    if (match != null) {
+        // Case A: a real native transition fired for this playback
+        // instance. The transition's data is authoritative.
+        android.util.Log.i(
+            "MainActivity",
+            "reconcilePending case=A (transition match) origin=$originLabel mediaId=${snapshot.mediaId} instId=${snapshot.playbackInstanceId} action=${match.action}"
+        )
+        ingestPendingEvidence(
+            container = container,
+            songs = songs,
+            mediaId = match.prevFilename.ifBlank { snapshot.mediaId },
+            playedMs = match.prevPlayedMs,
+            durationMs = match.prevDurationMs,
+            origin = "transition_history_${match.action}",
+            playbackInstanceId = snapshot.playbackInstanceId,
+        )
+        return
+    }
+    if (liveInstanceId > 0L && liveInstanceId == snapshot.playbackInstanceId) {
+        // Case B: the same playback session is still active in the
+        // service. Defer — the eventual transition will record it.
+        android.util.Log.i(
+            "MainActivity",
+            "reconcilePending case=B (defer, same instance still live) origin=$originLabel instId=${snapshot.playbackInstanceId}"
+        )
+        return
+    }
+    // Case C: no matching transition, no live session. Use snapshot as-is.
+    android.util.Log.i(
+        "MainActivity",
+        "reconcilePending case=C (use snapshot) origin=$originLabel mediaId=${snapshot.mediaId} played=${snapshot.playedMs}ms"
+    )
+    ingestPendingEvidence(
+        container = container,
+        songs = songs,
+        mediaId = snapshot.mediaId,
+        playedMs = snapshot.playedMs,
+        durationMs = snapshot.durationMs,
+        origin = originLabel,
+        playbackInstanceId = snapshot.playbackInstanceId,
+    )
+}
+
+/**
+ * Push #65 (updated #66): ingest a leftover pending-evidence record into
+ * TasteEngine + SignalTimeline. Source is set to "background_recovery"
+ * (not on the user-skip whitelist) so partial listens DON'T bump xScore.
+ */
+private fun ingestPendingEvidence(
+    container: AppContainer,
+    songs: List<Song>,
+    mediaId: String,
+    playedMs: Long,
+    durationMs: Long,
+    origin: String,
+    playbackInstanceId: Long = 0L,
+) {
+    if (mediaId.isBlank() || playedMs < 1000L || durationMs <= 0L) return
+    val frac = (playedMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    val song = songs.firstOrNull { it.filename == mediaId }
+    android.util.Log.i(
+        "MainActivity",
+        "ingestPendingEvidence origin=$origin mediaId=$mediaId played=${playedMs}ms dur=${durationMs}ms frac=${"%.3f".format(frac)} songResolved=${song != null} instId=$playbackInstanceId"
+    )
+    // Push #66: source = "background_recovery" (NOT on the user-skip
+    // whitelist) so partial listens recovered from background DON'T
+    // bump xScore. Strong listens still get the -0.5 NEG_LISTEN_DECAY
+    // benefit. Capacitor parity.
+    val source = "background_recovery"
+    val (before, after) = container.taste.recordPlaybackEvent(mediaId, frac, source, playbackInstanceId)
+    val isSkip = frac < com.isaivazhi.app.engine.TasteEngine.SKIP_THRESHOLD
+    val cls = if (isSkip) com.isaivazhi.app.engine.SignalTimelineEngine.Classification.SKIP
+        else com.isaivazhi.app.engine.SignalTimelineEngine.Classification.LISTEN
+    val sessionPair = container.session.recordEvent(frac, isSkip, isManual = false)
+    val sessionPull = container.taste.tuning.value.sessionBias.coerceIn(0f, 1f)
+    val avgLib = run {
+        val sigs = container.taste.signals.value
+        if (sigs.isEmpty()) 0f else sigs.values.map { it.avgFraction }.average().toFloat()
+    }
+    container.signalTimeline.append(
+        com.isaivazhi.app.engine.SignalTimelineEngine.Event(
+            timestamp = System.currentTimeMillis(),
+            filename = mediaId,
+            title = song?.title?.ifBlank { mediaId } ?: mediaId,
+            artist = song?.artist ?: "",
+            source = "${source}_$origin",
+            fraction = frac,
+            classification = cls,
+            tasteBefore = com.isaivazhi.app.engine.SignalTimelineEngine.Snapshot(
+                score = before.directScore, direct = before.directScore,
+                similarity = before.similarityBoost, plays = before.plays,
+                skips = before.skips, avgFraction = before.avgFraction,
+            ),
+            tasteAfter = com.isaivazhi.app.engine.SignalTimelineEngine.Snapshot(
+                score = after.directScore, direct = after.directScore,
+                similarity = after.similarityBoost, plays = after.plays,
+                skips = after.skips, avgFraction = after.avgFraction,
+            ),
+            xScoreBefore = before.xScore,
+            xScoreAfter = after.xScore,
+            sessionPullBefore = sessionPull,
+            sessionPullAfter = sessionPull,
+            libraryAvgBefore = avgLib,
+            libraryAvgAfter = avgLib,
+            sessionEncountersBefore = sessionPair.first.encounters,
+            sessionEncountersAfter = sessionPair.second.encounters,
+            sessionSkipsBefore = sessionPair.first.skips,
+            sessionSkipsAfter = sessionPair.second.skips,
+            sessionPositivesBefore = sessionPair.first.positives,
+            sessionPositivesAfter = sessionPair.second.positives,
+        )
+    )
+    val delta = after.directScore - before.directScore
+    if (kotlin.math.abs(delta) > 0.001f) {
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching {
+                container.taste.propagateSimilarityBoost(mediaId, delta, "${source}_$origin")
             }
         }
     }

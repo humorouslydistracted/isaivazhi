@@ -6,6 +6,375 @@ Pre-Kotlin history (Capacitor + WebView build, pushes #1–#21 plus all earlier 
 
 Each entry below is dated and numbered. Most recent first.
 
+### 2026-05-14 #71 — Cold-start: skip prepareForResume when service has an active session
+
+**The bug user reported.** Played "Kanne Kanne" through to ~37% in foreground. Backgrounded the app. Used HEADPHONE SKIP to advance the service to subsequent songs. Returned to the app. Activity cold-started and seeked Kanne Kanne back to position ~133s, restarting the song from the middle even though the service had already advanced past it.
+
+**Root cause traced from logs (push #70 build).** At 23:56:22 the Activity onDestroyed and `PlaybackEngine.release()` cancelled the position-save coroutine. The service stayed alive (foreground service) and kept playing. The user's headphone-skip advanced the service from idx=0 (Kanne Kanne) to idx=1 (Chudithar Aninthu). But the Activity-owned position-save was dead, so DataStore still showed `CURRENT_MEDIA_ID=Kanne Kanne, CURRENT_POSITION_MS=133872`. When the Activity recreated, the cold-start LaunchedEffect read those STALE values and called `prepareForResume(queue, 0, 133872)` → `ctrl.setMediaItems(items, 0, 133872)` which DESTRUCTIVELY REPLACED the service's actual state ("playing Chudithar Aninthu paused at 5s") with Kanne Kanne at 133s.
+
+The push #66 reconciliation captured the headphone-skip correctly as a SignalTimeline event (`reconcilePending case=A (transition match) action=user_jump`), so listen evidence wasn't lost. But the resume position pipeline was a separate path that pushes #66-#70 didn't touch.
+
+**Fix.** Before calling `prepareForResume`, check whether the Media3 service is alive with a current playback session. If yes, the service's state is the source of truth — do NOT push the Activity's stale DataStore values to it. Instead, sync the Activity from the service.
+
+`Media3PlaybackService.java` — added `getCurrentPositionMsSnapshot()` for diagnostics logging.
+
+`PlaybackEngine.kt` — added `syncStateFromController(library)` that reads the MediaController's live state (current MediaItem, queue items, index, position, play state, shuffle, repeat) and writes it into the Kotlin `_state.value`. Persists the fresh values back to DataStore so the next true cold-start has accurate state if the service dies later.
+
+`MainActivity.kt` cold-start LaunchedEffect — new check at the top:
+```kotlin
+val svc = Media3PlaybackService.INSTANCE
+val svcMediaId = svc?.getCurrentMediaIdSnapshot() ?: ""
+val svcInstId = svc?.getCurrentPlaybackInstanceId() ?: 0L
+if (svc != null && svcMediaId.isNotBlank() && svcInstId > 0L) {
+    // Service alive — skip prepareForResume, just sync state from controller.
+    container.playback.syncStateFromController(songs)
+    return@LaunchedEffect
+}
+// Truly cold start: fall through to existing prepareForResume.
+```
+
+Diagnostic log on both branches makes it clear which path ran:
+- `[MainActivity] cold-start: service alive at mediaId=X instId=Y pos=Zms — skipping prepareForResume (DataStore had mediaId=A pos=Bms)`
+- `[MainActivity] cold-start: service NOT alive — rebuilding from DataStore mediaId=X pos=Yms idx=N`
+
+**Files affected**
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java` — `getCurrentPositionMsSnapshot()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — `syncStateFromController(library)`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — service-alive check before prepareForResume in the cold-start LE.
+
+BUILD SUCCESSFUL in 10s. APK 328.9 MB at `2026-05-14 00:21`.
+
+**Verification**
+1. **The exact bug scenario.** Play song A (say Kanne Kanne) for 30+ seconds. Press home (don't kill the app). Switch to another app. Use headphone skip 1-2 times — should advance to songs B and C in the background. Return to the music app. Logcat should show:
+   - `[MainActivity] cold-start: service alive at mediaId=<songC> instId=Y ...` — confirms the new code path fires.
+   - `[PlaybackEngine] syncStateFromController: mediaId=<songC> ...` — confirms the state sync.
+   - The mini-player should show song C (the one the service is actually playing), NOT song A.
+2. **True cold-start still works.** Force-kill the app (swipe from recents — note: this also kills the service if it's not actively playing). Wait a moment. Reopen. Logcat should show:
+   - `[MainActivity] cold-start: service NOT alive — rebuilding from DataStore ...`
+   - The last-played song should resume at its saved position.
+3. **No regression on push #70.** All push #70 behaviors (QueueContext rules, Play Next preservation, Discover LE split) still work — the change is purely additive in the cold-start path.
+
+### 2026-05-14 #70 — Up Next reliability: QueueContext rules + Play Next preservation + Discover LE split + diagnostic logging
+
+User flagged two reliability problems after pushes #66-#69 stabilized signal capture:
+1. **Discover refresh too eager** — Unexplored Sounds appeared to reshuffle after every song, "Because You Played" never showed up. User explicitly asked for diagnostic logs to see what's firing when.
+2. **Up Next behavior didn't match expected rules** — Songs-tab tap queued 800+ library songs, albums and Browse "All" sections incorrectly appended AI tails, refresh button wiped user's Play Next songs.
+
+**Phase-1 audit found the Discover refresh smoking gun:** the Discover LE in MainActivity was keyed on `qualifyingEventCount` (count of history events with `fractionPlayed ≥ 0.3`). That increments after every qualified listen. Even with deterministic k-means (seed=42), the unplayed filter for Unexplored Sounds changed as `historyStats.keys` grew, producing visibly different output each time.
+
+User locked 3 design decisions:
+- Songs-tab tap = [single song] + AI tail (not the full library).
+- Album/Browse-section playback = section only, no AI ever (LOOP=OFF stops at end, LOOP=ALL loops the section).
+- LOOP=OFF + SHUFFLE=ON = Capacitor pattern (only upcoming songs in shuffle; AI tail appends after upcoming exhausts).
+
+**Tier 1 — `QueueContext` enum + Play Next state.**
+New `PlaybackEngine.QueueContext` enum with values `LIBRARY`, `ALBUM`, `BROWSE_SECTION`, `DISCOVER_SECTION`, `AI_RECOMMENDED`. Stored in `PlaybackState.queueContext` (defaults to `LIBRARY`). New `PlaybackState.playNextFilenames: Set<String>` for Play-Next tracking.
+
+`playQueue` signature gains `queueContext: QueueContext` parameter. New behavior: when called with a `playNextFilenames`-tracked song in the input list, those songs are filtered out and re-inserted immediately after the starting position. `appendToQueue` flips context to `AI_RECOMMENDED` after a successful AI tail append so the next exhaust knows the queue was already extended.
+
+`playNext(song)` adds the filename to `playNextFilenames`. Auto-clears when the song actually transitions to play (the `onMediaItemTransition` handler removes it). `removeFromQueue` also drops the removed song from the set.
+
+**Tier 2 — Section-tap rules wired into MainActivity.**
+- `playFromTap` (Songs-tab single song): passes `QueueContext.LIBRARY`. Phase-1 plays the single song; Phase-2 background-builds AI tail via `replaceUpcoming`.
+- `playFromSection` reworked to take `(sectionSongs, tappedIndex, queueContext, sectionLabel)`. Threads context all the way to `playQueue`. The boolean `isLibraryRecommendationMode` parameter is GONE — replaced by the typed enum.
+- Discover card tap → `DISCOVER_SECTION` (AI tail appends on exhaust).
+- Album tap (both list and dialog Play/Shuffle) → `ALBUM` (no AI ever).
+- Browse View-All / Section View-All → `BROWSE_SECTION`.
+- Favorites overlay → `BROWSE_SECTION`.
+- Playlist detail → `BROWSE_SECTION`.
+- Search overlay → routes to `playFromTap` (single song).
+- Taste page row tap → `BROWSE_SECTION`.
+- Songs-tab "Play in order" long-press option → `LIBRARY`.
+
+**Queue-exhaust LE updated** to check `queueContext` BEFORE the loop-mode check:
+```kotlin
+if (ctx == ALBUM || ctx == BROWSE_SECTION) {
+    Log.i("QueueExhaust", "skip AI append: section context $ctx (no AI ever)")
+    return@LaunchedEffect
+}
+```
+Now albums/browse sections finish naturally; AI tail appends only for LIBRARY / DISCOVER_SECTION / AI_RECOMMENDED contexts with LOOP=OFF.
+
+**Tier 3 — Refresh button preserves Play Next.**
+`replaceUpcoming(newUpcoming, newContext)` simplified — the caller is responsible for prepending Play Next songs. The Up Next Refresh button and the AI/Shuffle toggle both:
+1. Read `playbackState.playNextFilenames`.
+2. Look up the full Song objects from the library map.
+3. Build `finalUpcoming = [playNext songs] + [new AI tail]`.
+4. Exclude Play Next from the recommender's pool (so AI doesn't duplicate them).
+5. Call `replaceUpcoming(finalUpcoming, AI_RECOMMENDED)`.
+
+Result: Play Next survives a refresh button press, an AI/Shuffle toggle, and Songs-tab taps. Only cleared when the song actually transitions to play, or the user removes it via swipe.
+
+**Tier 4 — Discover LE split + comprehensive diagnostic logging.**
+
+Previously one monolithic LE rebuilt `forYou + becauseYouPlayed + unexploredClusters` together. Now split:
+
+1. **For You + BYP LE** — keys: `historyStats.size, songs.isNotEmpty(), embeddingsRowCount, tuning.*, forYouTick/5, rebuildPulse`. CRITICALLY: `qualifyingEventCount` removed from key set. Re-fires only on a major library change, slider move, every 5 qualified listens (intentional window), or favorite/dislike toggle.
+
+2. **Unexplored Clusters LE** — keys: `songs.isNotEmpty(), embeddingsRowCount, unexploredManualRefreshCounter`. Only re-fires on cold start, embedding count change, or explicit pull-to-refresh. The counter is incremented inside the DiscoverScreen.onRefresh callback.
+
+Both LEs log when they fire (with key state) and when they finish (with output size + duration). BYP empty case has a dedicated warn log telling the user how many qualifying recent events exist.
+
+**Logging tags** added throughout:
+- `[QueueOp]` — every PlaybackEngine queue mutation (playQueue, playNext, removeFromQueue, appendToQueue, replaceUpcoming, toggleShuffle, cycleRepeat).
+- `[QueueExhaust]` — queue-exhaust LE fires + skip reasons (context / loop / no embeddings).
+- `[CardTap]` — every section-tap entry with section label + context.
+- `[DiscoverLE]` — both Discover LEs (fire + done + key state).
+
+**Files affected**
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — `QueueContext` enum, `PlaybackState` extended with `queueContext` + `playNextFilenames`, `playQueue` signature, Play Next preservation in playQueue, auto-clear on transition, `replaceUpcoming(newUpcoming, newContext)`, `removeFromQueue` removes from Play Next set, logging across the board.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — `playFromTap` LIBRARY context, `playFromSection` reworked with context+label, queue-exhaust LE context check, Discover LE split (For You/BYP + separate Unexplored), pull-to-refresh increments Unexplored counter, Refresh button + AI/Shuffle toggle preserve Play Next, all section-tap callsites updated (Albums, ViewAll, Favorites, Playlist detail, Search, Taste row, Songs "Play in order"), album long-press dialog Play/Shuffle pass ALBUM context.
+
+BUILD SUCCESSFUL in 9s. APK 328.9 MB at `2026-05-14 00:09`.
+
+**Verification (10-point smoke test)**
+
+1. **Songs-tab tap = single song + AI tail.** Tap any song from Songs tab. Up Next shows 1 song followed by AI recs (after ~200-500 ms phase-2 build). Logcat: `[CardTap] playFromTap song=X → LIBRARY single-song + AI tail` then `[QueueOp] playQueue ctx=LIBRARY src=manual_tap input=1`.
+
+2. **Album tap = album only, NO AI at end.** Tap an album → tap a track. Up Next shows only album tracks. Let it play through; at album end, playback stops (LOOP=OFF) or loops (LOOP=ALL). Logcat: `[CardTap] playFromSection label=Album ctx=ALBUM`, then at end `[QueueExhaust] skip AI append: section context ALBUM (no AI ever)`.
+
+3. **Browse "Most Played" tap = section only, NO AI.** Open Browse → tap "Most Played" → tap any song. Up Next shows section tracks only. Logcat: `[CardTap] playFromSection label="Most Played" ctx=BROWSE_SECTION`, then `[QueueExhaust] skip AI append: section context BROWSE_SECTION`.
+
+4. **Discover card tap = section + AI tail.** Open Discover → tap a "For You" or BYP or Unexplored card. Queue = section from tapped index. At section end, AI tail appends. Logcat: `[CardTap] playFromSection label=ForYou ctx=DISCOVER_SECTION`, then `[QueueExhaust] appending AI tail: ctx=DISCOVER_SECTION`.
+
+5. **Refresh button preserves Play Next.** Long-press a song → Play Next. Verify it appears at queue position 1. Tap Refresh on Up Next. Queue should still have the Play Next song at position 1, then AI tail behind it. Logcat: `[QueueOp] Refresh button: preserved 1 Play Next + 50 AI`.
+
+6. **Play Next survives Songs-tab tap.** Add a song via Play Next. Tap a different song in Songs tab. Queue should be `[Songs-tab song] + [Play Next song] + [AI tail]`. Logcat: `[QueueOp] playQueue ... playNextPreserved=1`.
+
+7. **Play Next clears on play.** Wait for the Play Next song to actually start playing. Logcat: `[QueueOp] playNext cleared on transition: <filename>`.
+
+8. **Loop modes respected.** Cycle Loop OFF → ALL → ONE → OFF on mini-player. With LOOP=ALL on a Discover section, queue cycles without AI. With LOOP=ONE, current song repeats. With LOOP=OFF, AI tail appends after Discover section ends. Logcat: `[QueueOp] cycleRepeat 0 → 2`, `[QueueExhaust] skip AI append: repeat=2`.
+
+9. **Discover refresh frequency.** Play 4-5 songs in a row, then check `DiscoverLE` logs. The `Unexplored fire` line should ONLY appear on cold-start, embedding-count-change, or pull-to-refresh — NOT on every transition. The `ForYou+BYP fire` line fires every 5 qualified listens + on history additions + on favorite/dislike toggles.
+
+10. **BYP empty diagnostic.** If BYP is empty, logcat shows `[DiscoverLE] BYP empty: qualifyingHistoryEvents=N — need more listened songs at >=30%`. If N is small (< 3), this is genuinely "not enough data" rather than a bug.
+
+Filter logcat by tag prefix to isolate: `[QueueOp]`, `[QueueExhaust]`, `[CardTap]`, `[DiscoverLE]`.
+
+### 2026-05-13 #66-#69 — Capacitor-parity recommendation pipeline (4 coordinated pushes)
+
+User said "I really liked the working of the capacitor app wrt recommendation" and asked for everything from the gap audit. Four pushes shipped together. Push #65's pending-evidence approach was reworked because it had duplicate-event and mid-session-flush problems — Push #66 supersedes the relevant parts of #65.
+
+**Push #66 — Pending-snapshot pipeline (Capacitor-parity flush behavior).**
+
+The core change: `onPause` and `onDestroy` no longer fire SignalTimeline events directly. Instead they save a *tentative* listen snapshot to DataStore (`{filename, playedMs, durationMs, playbackInstanceId}`). The service keeps accumulating across background — the accumulator is never zeroed mid-session. When a real native transition fires later, that transition is authoritative and the matching snapshot is cleared. If the process dies before a transition, cold-start reconciliation replays the snapshot.
+
+Three-path cold-start reconciliation (`reconcilePending` in `MainActivity.kt`):
+1. **Case A — transition match:** The service's transitions buffer has an entry with `prevPlaybackInstanceId == snapshot.playbackInstanceId`. Use NATIVE values (more accurate than our pre-transition guess). Clear snapshot.
+2. **Case B — same instance still live:** The service is still playing this same playback session. Defer — let the eventual transition record it.
+3. **Case C — no transition, no live session:** Use the snapshot as-is.
+
+`isManual` whitelist FLIPPED to `isUserSkip` whitelist per Capacitor's `_shouldAccumulateUserSkipNegative`. ONLY `next_button` and `prev_button` count as real skips that bump xScore. Everything else (`manual_tap`, `song_tap`, `queue_tap`, `neutral_skip`, `auto_advance`, `app_background`, `background_recovery`, `cold_start_*`) records the encounter (plays/avgFraction update) but does NOT penalize. Mid-song app close no longer turns the listen into a skip.
+
+`useCurrentPlaybackDedupe` guard added to `TasteEngine.recordPlaybackEvent` — tracks `lastCapturedPlaybackInstanceId` and skips duplicate recordings.
+
+Service-side: new `rememberTransitionToPrefs` rolling buffer of last 24 transitions in dedicated SharedPreferences (`playback_transitions_history`). Each entry: `{prevPlaybackInstanceId, prevPlayedMs, prevDurationMs, prevFraction, action}`. Exposed via static `readRecentTransitionsStatic(ctx)` so cold-start can read without an INSTANCE handle.
+
+**Push #67 — Dynamic session-vector blend + soft-refresh + immediate rebuild.**
+
+This is the "recommender doesn't know me" fix. Up Next now reflects three time scales blended together, like Capacitor.
+
+`SessionEngine.listened` — new rolling window of last 60 listened entries (`{filename, fraction, source, timestamp}`). Resets on app start. Fed by `recordEvent(filename, source, ...)` when fraction ≥ 0.10.
+
+`Recommender.blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)` — Capacitor parity (`_blendWeights` in engine.js:653). Mode `"play"`: wCurrent ramps from 0.5 down to 0.38 as session grows; wSession ramps 0→0.52; wProfile fades 0.5→0.10. Mode `"refresh"`: flatter 0.30/0.40/0.30. Plus `_applySessionBias` so the user's session-bias slider biases session-vs-profile inside the residual.
+
+`Recommender.buildBlendedVec` — assembles the blended query vector by weighted-averaging (currentSong embedding × wCurrent) + (session-listened avg × wSession) + (profileVec × wProfile), then L2-normalizing.
+
+`Recommender.recommendUpcoming` now accepts an optional `blendedQueryVec` parameter. When non-null, candidate ranking goes through `nearestNeighborsForVector` (brute-force cosine over the library with NEON SIMD batch dot products) instead of `nearestNeighborsForFilename`. The recommender sees session evidence in its query, not just the current song's neighbors.
+
+`Recommender.softRefreshUpcomingTail` — restores Capacitor's `_softRefreshQueue` with three zones:
+- **Frozen [0..4]:** untouched, no surprise reshuffles for immediate-next picks.
+- **Stable [5..14]:** same songs, re-sorted by NEW blended similarity (updated taste).
+- **Fluid [15+]:** replaced with fresh recommendations against the new blend.
+
+New MainActivity LE keyed on `(sessionListened.size, currentMediaId)` fires soft-refresh after each new listen (750ms debounce).
+
+`AppContainer.rebuildSignal` SharedFlow — emits `"favorite_toggle"` or `"dislike_toggle"` after the manual prior change. MainActivity collects and increments `rebuildPulse` which is in the Discover LE's keys, triggering an immediate rebuild. Capacitor parity for "you favorited a song → Discover and Up Next reflect it immediately".
+
+**Push #68 — profileVec cache + recommendation fingerprint.**
+
+`AppPreferences.saveProfileVec(vec, fingerprint)` / `loadProfileVec()` — persistent profile centroid. Fingerprint = hashCode of sorted top-30 anchor filenames. New `MainActivity` LE recomputes the centroid when (history changes OR embedding count changes OR rebuildPulse fires) AND the fingerprint differs from the cached one. Saved to disk; loaded on cold start for instant blended-query availability.
+
+`TasteEngine.recommendationFingerprint()` — hashCode of "topPositive10 :: topNegative10 :: hardBlockedFilenames-sorted". Used by `DiscoverCacheEngine.save` to stamp each cached snapshot.
+
+`DiscoverCacheEngine.Snapshot.recommendationFingerprint` — new field. On cold-start hydration, MainActivity compares the cached fingerprint to the live fingerprint. If they differ, hydration is skipped — fresh build is preferred. Prevents serving stale Discover content after the recommender policy has materially shifted.
+
+**Push #69 — Activity log + Taste Review + queue-replace signal.**
+
+New `engine/ActivityLogEngine.kt` — rolling buffer of last 200 non-playback events (favorites/dislikes/tuning/reset/etc), persisted to DataStore. Capacitor parity: `engine.activity` separate from playback SignalTimeline. Categories: `taste`, `queue`, `playback`, `engine`, `ui`. Levels: INFO, WARN, ERROR. `data` is free-form JSON.
+
+`AppContainer` wires the activity log into favorite/dislike toggle hooks. Reset Engine logs the event before clearing.
+
+`PlaybackEngine.playQueue` — when the queue is being REPLACED while another song is currently playing, the displaced song's accumulator is now flushed as a pending snapshot before the new queue takes over. The listen evidence isn't lost when the user taps a song from Songs/Albums.
+
+`TasteEngine.DecoratedRow.isSuspicious` + `suspiciousReason` — Capacitor parity (`_buildSuspiciousRecommendationData`). Flags songs with conflicting signals:
+- Favorited but frequently skipped (`isFavorite && skips ≥ 3 && skips > plays`)
+- Disliked but high avgFraction (`isDisliked && plays ≥ 2 && avgFraction ≥ 0.70`)
+- High xScore + high avgFraction (conflicting evidence)
+- Single 95%+ or 5%- listen (need more data)
+
+New amber "Review" chip on the Taste page row when `isSuspicious` is true.
+
+---
+
+**Files affected across all four pushes**
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java` — `rememberTransitionToPrefs`, `readRecentTransitionsStatic`, `clearRecentTransitionsStatic`, `getCurrentPlaybackInstanceId`, `onTaskRemoved` now includes instId.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/TasteEngine.kt` — `isUserSkip` whitelist flip, `useCurrentPlaybackDedupe`, `recommendationFingerprint`, `isSuspicious` + `suspiciousReason`, `detectSuspicious` helper.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/SessionEngine.kt` — `listened: StateFlow<List<ListenedEntry>>` rolling list (cap 60).
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/Recommender.kt` — `BlendWeights`, `blendWeights`, `buildBlendedVec`, `nearestNeighborsForVector`, `softRefreshUpcomingTail`, blendedQueryVec param on `recommendUpcoming`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — playbackInstanceId plumbed to `recordPlaybackEvent`, clear matching pending snapshot after transition, playQueue-replace evidence flush.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppPreferences.kt` — pending evidence schema gains instId, profileVec disk cache, clear() updated.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt` — rebuildSignal SharedFlow, activity-log integration in fav/dislike hooks, resetEngine clears transitions buffer + pending evidence + activity log.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/DiscoverCacheEngine.kt` — `recommendationFingerprint` field on Snapshot, save/parse updated.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/ActivityLogEngine.kt` — **new file**.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — `flushCurrentPlayback` rewritten (tentative snapshot only), 3-path reconciliation, blended-query plumbing into queue-exhaust LE + new soft-refresh LE, profileVec compute LE, rebuildPulse on toggle.
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/TasteScreen.kt` — "Review" chip for suspicious rows.
+
+BUILD SUCCESSFUL in 23s. APK 328.9 MB at `2026-05-13 23:20`.
+
+**Verification (10-point Capacitor-parity smoke test)**
+
+1. **Mid-session listen no longer split into two SKIPs.** Play a song to ~30%, press home, come back, let it play to 80%, then tap next. Open Taste page → "Last 30". You should see ONE event (LISTEN ~80%, source `auto_advance` or `next_button`), NOT two SKIPs at 30% and 50%.
+
+2. **xScore doesn't bump on app close.** Play song to ~30%, swipe app off recents. Re-open. Open Taste → song's row. xScore should be 0.0 (or unchanged). Only Next/Prev button skips bump xScore.
+
+3. **Up Next reflects session blend.** Play 3 songs from one genre. Open Taste → "Engine Snapshot". Then check Up Next — songs should be neighbors of all 3 listened songs blended, not just neighbors of the current song.
+
+4. **Soft-refresh after qualified listen.** Note positions 5-14 in Up Next BEFORE listening to a new song. Listen to one full song. Check Up Next AGAIN — positions 0-4 unchanged, 5-14 might be re-sorted, 15+ are different songs.
+
+5. **Immediate rebuild on favorite.** Favorite a song. Discover page → For You should refresh within 1-2 seconds (different songs than before).
+
+6. **profileVec cold-start cache.** Kill the app, re-open. Logcat should show `loaded profileVec from disk dim=512 fp=...` followed shortly by `profileVec rebuilt` if anchors changed, or no rebuild log if cache is current.
+
+7. **Cold-start reconciliation case A.** Play song to ~50%, let it auto-advance to next song. Close app. Re-open. Logcat: `reconcilePending case=A (transition match)` — the listen was already finalized; no duplicate event in timeline.
+
+8. **Cold-start reconciliation case C.** Play song to ~30%, force-kill app (swipe recents). Re-open. Logcat: `reconcilePending case=C (use snapshot)` — listen ingested from snapshot, timeline shows LISTEN 30% with source `background_recovery_task_removed`.
+
+9. **Queue-replace flush.** Play song to ~30%. Tap a different song from Albums (replaces queue). Timeline should now show the partial-listen event for the displaced song.
+
+10. **Review chip on suspicious rows.** Favorite a song you frequently skip, then skip it 4 more times. Its Taste row should show an amber "Review" chip.
+
+Share `logs.txt` filtered by `reconcilePending|flushCurrentPlayback|softRefresh|profileVec rebuilt|rebuildSignal` after running through the checklist.
+
+### 2026-05-13 #65 — Cross-session signal capture: flush on background/destroy + onTaskRemoved + cold-start replay + remove <10% noise filter
+
+User reported "Last 30 Playback Signal Updates is 0" after Reset Engine + playing songs to 30-50%. Initial analysis pointed at the `<10% skip` noise filter dropping events. User pushed back: their actual behavior was *playing one song to 30-50% then closing the app*, not rapid tap-skipping. Re-investigation found a much deeper bug.
+
+**Bug found:** The played-ms accumulator lives in `Media3PlaybackService` (in-process). `SignalTimelineEngine.append` is only ever called from `PlaybackEngine.onMediaItemTransition`. When the user listens to a song to 30-50% and then closes the app / installs an update, NO transition occurs — the process is killed, the accumulator's value evaporates from RAM, and the listen is never recorded. No `plays` bump, no `avgFraction` update, no `xScore` decay, no SignalTimeline entry, no similarity-boost propagation. The entire listen disappears.
+
+This isn't a Push #63/#64 regression — it's been a gap since the Kotlin rewrite. The Capacitor README mentioned the pattern explicitly ("JS only saves evidence snapshots on background / close; cold-start recovery reconciles the two") but the mechanism was never ported.
+
+**Tier 1 — service-side helpers (`Media3PlaybackService.java`).**
+- `getCurrentMediaIdSnapshot()` — returns the filename of the currently-loaded MediaItem (or empty).
+- `markEvidenceFlushed()` — zeroes `accumulatedPlayedMs` and sets `lastProgressSampleMs` to `currentPositionMs()` so playback continues forward from "now" without re-counting the flushed milliseconds.
+- `onTaskRemoved()` override — when the user swipes the app off recents (force-kill path that bypasses `MainActivity.onPause`), writes `{mediaId, playedMs, durationMs, capturedAtMs}` to a dedicated SharedPreferences file `playback_pending_evidence`. Synchronous-enough write via `.apply()` since the OS gives the service ~5 s before reaping.
+
+**Tier 2 — pending-evidence persistence (`AppPreferences.kt`).**
+- 3 new keys: `pending_evidence_media_id`, `pending_evidence_played_ms`, `pending_evidence_duration_ms`.
+- `savePendingEvidence(mediaId, playedMs, durationMs)`, `loadPendingEvidence(): PendingEvidence?`, `clearPendingEvidence()`.
+- Included in `preferences.clear()` so Reset Engine wipes the backup too.
+
+**Tier 3 — `flushCurrentPlayback()` on background/destroy (`MainActivity.kt`).**
+- New `flushCurrentPlayback(reason: String)` reads the service's `accumulatedPlayedMs` + `currentDurationMs` + `currentMediaId`. If `played >= 1000 ms` and `duration > 0`:
+  - Synthesizes a Capacitor-equivalent transition: `taste.recordPlaybackEvent(mediaId, frac, reason)` so plays/avgFraction/xScore update.
+  - Builds a full `SignalTimelineEngine.Event` (with proper session counters, library avg, xScore before/after) and appends it.
+  - Fires `propagateSimilarityBoost` for the resulting score delta.
+  - Writes a backup pending-evidence record to DataStore (belt-and-suspenders for the case where the SignalTimeline persist coroutine doesn't complete before process death).
+  - Calls `svc.markEvidenceFlushed()` so the next resume doesn't double-count the same ms.
+- Called from `onPause` (common background case) and `onDestroy` (activity recreation / system teardown). Reason strings: `"app_background"` / `"app_destroy"`.
+
+**Tier 4 — cold-start ingest.**
+- The existing `LaunchedEffect(songs)` that fires `prepareForResume` now ALSO drains pending-evidence records from two sources before resume kicks in:
+  - **DataStore** (`AppPreferences.loadPendingEvidence`) — written by `onPause` flush.
+  - **SharedPreferences** (`playback_pending_evidence` file) — written by `Media3PlaybackService.onTaskRemoved`.
+- Each non-null record is passed to a new top-level `ingestPendingEvidence(container, songs, mediaId, playedMs, durationMs, origin)` helper that runs the same recordPlaybackEvent → SignalTimeline.append → propagate chain, then the source record is cleared. Origin strings: `"cold_start_datastore"` / `"cold_start_task_removed"`.
+
+**Tier 5 — removed the `<10% skip` filter (`SignalTimelineEngine.append`).**
+- The Capacitor-inherited "drop skips under 10% as noise" filter was actively misleading users — every tap-through was silently dropped, making the timeline look broken when it was actually being thrashed by intentional filtering. Removed. Now every valid event (non-blank filename, fraction ≥ 0) shows up. Users can mentally filter short-fraction events on the Taste page.
+
+**Tier 6 — diagnostic log (`PlaybackEngine.prepareForResume`).**
+- Added `Log.i("PlaybackEngine", "prepareForResume ... seekToMs=$seekToMs first=$filename")` so we can confirm whether cross-session position-resume is honoring the saved position. If logs show `seekToMs=85000` but the user reports playback starts at 0, the issue is downstream (Media3 not honoring the seek), not upstream.
+
+**Files affected**
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java` — `getCurrentMediaIdSnapshot`, `markEvidenceFlushed`, `onTaskRemoved`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppPreferences.kt` — pending-evidence keys + getters/setters + included in `clear()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/SignalTimelineEngine.kt` — removed the `<10% skip` filter.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — `prepareForResume` log line.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — `flushCurrentPlayback` helper, `snapshotFor` helper, cold-start pending-evidence ingest in the existing LE, top-level `ingestPendingEvidence` function.
+
+BUILD SUCCESSFUL in 15s. APK 328.9 MB at `2026-05-13 22:29`.
+
+**Verification (the canonical 4-step test)**
+1. **Mid-session listen captured on background.** Open app. Play any song to ~30% (~1 min into a 3-min track — watch the seekbar). Press home button (don't tap next). Re-open app. Open Taste page → "Last 30 Playback Signal Updates" → should show one new event for that song with `LISTEN · 30% · app_background`. Logcat: `MainActivity: flushCurrentPlayback reason=app_background ... frac=0.3xx`.
+2. **Mid-session listen captured on force-kill.** Same setup — play to 30%, but this time swipe the app off recents. Re-open. Same timeline entry should appear with source = `cold_start_task_removed`. Logcat at re-open: `MainActivity: ingestPendingEvidence origin=task_removed ... frac=0.3xx`.
+3. **Tap-through events visible (filter removal).** Open app, tap-tap-tap through 3 songs quickly. Open Taste page → should now show 3 events with `SKIP · 1-5% · manual_tap` (pre-fix all three were dropped). The 30% LISTEN from test 1/2 should still be visible.
+4. **Cross-session resume position.** Play song to 30%, press home, kill app via task manager, re-open. Logcat: `PlaybackEngine: prepareForResume ... seekToMs=NNNNN` — if NNNNN ≈ 90000ms (~30% of a 3min track), resume IS working. If NNNNN=0, the saved-position pipeline has a separate bug we'll need to investigate next.
+
+**What this does NOT fix**
+- If you Reset Engine THEN play songs, the songs you played after the reset will be captured correctly going forward. But songs played BEFORE the reset that lost evidence (because of this bug) can't be recovered — that data is gone. Run the canonical test above to confirm the fix works on fresh listening.
+
+### 2026-05-13 #64 — Discover remediation: k-means Unexplored + profile-vector For You + diversity-aware BYP + persistent cache + auto-refresh + insights strip
+
+User pulled the same audit-first pattern that powered push #63 into Discover. Two parallel Explore agents mapped the Capacitor (legacy) Discover implementation against the Kotlin one. Surprising gaps surfaced — most notably that "Unexplored Sounds" on Kotlin wasn't clustering by audio at all (`filename.hashCode() % 3`), and For You was using a different algorithm than Capacitor (anchor-based vs profile-vector centroid). The user reviewed worked examples for each, made 7 binding design decisions (all Capacitor-parity except one "skip"), and approved the plan.
+
+**Locked design decisions:**
+1. Unexplored Sounds: real k-means clustering, K=15 seeded RNG (seed=42), pick lowest-engagement 3 by `Σ(plays × avgFraction) / size`.
+2. For You: profile-vector centroid (weighted average of top-30 plays' embeddings), nearest-neighbor query.
+3. Because You Played: diversity-aware anchor picker (greedy max-min cosine distance).
+4. Discover snapshot cache: persisted to DataStore, hydrated on cold start, fresh data overlays.
+5. Auto-refresh: For You re-shuffles after every 5 qualified non-skip listens (Capacitor `tickForYouListenWindow`).
+6. Insights strip: compact one-liner at top of Discover; tap → opens Taste page.
+7. Skipped: Most Played / Recently Played / Never Played / Last Added tiles on Discover (kept Browse-only).
+
+**Tier 1 — Recommender algorithm fixes (`Recommender.kt`).**
+
+New `unexploredClustersKMeans()` runs Lloyd's k-means over L2-normalized embedding vectors in a row-major flat float array. Per iteration: NEON SIMD batch dot product (via `NativeAccelerator.dotProductBatch`) from each centroid against the full pool — O(K × N × dim) per iteration. Early-exit when assignments stabilize. Max 20 iterations. Then clusters are scored by mean `plays × avgFraction`, sorted ascending, and the lowest 3 are returned with their unplayed songs shuffled (seeded RNG) and capped at `kPerCluster`. Falls back to the old hash-bucket `unexploredClusters` when fewer than `2 × K` embedded songs exist.
+
+New `forYouByProfileVector()` builds the centroid: top-30 songs by `plays × avgFraction` desc, fetch their embeddings (`getVecsByHashes`), weighted average + L2 normalize. Then computes cosine similarity from profileVec to every other embedded song (dedup by contentHash), sorts desc, takes top `k × 6` as pool, optionally shuffles, returns top `k`. Falls back to the old anchor-based `forYou()` when there's no profile (empty stats).
+
+New `pickDiverseAnchors()` is a greedy max-min selector used by `becauseYouPlayed`. Loads pool vectors once via `getVecsByHashes`, L2-normalizes, then picks anchor 0 = pool[0]; for each subsequent anchor picks the candidate whose maximum dot product to already-picked anchors is smallest (= farthest in cosine distance). Songs without a loadable vector are kept on the candidate list and picked last. The `randomize=true` flag shuffles the pool before the first pick so pull-to-refresh produces variations.
+
+`becauseYouPlayed` pool size bumped from `effSourceCount × 3` to `effSourceCount × 4` to give the diversity picker more candidates to choose from.
+
+**Tier 2 — DiscoverCacheEngine + auto-refresh.**
+
+New `engine/DiscoverCacheEngine.kt`: persists `(mostSimilarFilenames, forYouFilenames, byp: List<{anchor, recs}>, unexploredFilenamesByCluster, computedAt, currentMediaId)` to DataStore JSON. `loaded: StateFlow<Boolean>` flips true once the initial read completes. `save()` is no-op when every section is empty (avoids overwriting useful cache with a mid-load blank). `clear()` wired into `AppContainer.resetEngine`.
+
+`SessionEngine` gained `forYouTick: StateFlow<Int>` — increments inside `recordEvent` only on non-skip, non-manual, `fraction >= 0.5` events. `resetForYouTick()` is called by the Discover LaunchedEffect after firing an auto-refresh, and by pull-to-refresh.
+
+`MainActivity` Discover LaunchedEffect now keys on `forYouTick / 5` (integer division) — every time the user crosses a 5-listen boundary, the LE re-fires with `randomize = (forYouTick >= 5)`. After the recomputation, `session.resetForYouTick()` starts the next window. A new LaunchedEffect keyed on `(discoverCacheLoaded, songs.isNotEmpty())` hydrates the Discover state vars from the persisted snapshot on cold start, but only if the current state is still empty — so the user sees populated sections within milliseconds of opening Discover, even before the recommender has run.
+
+**Tier 3 — DiscoverInsightsStrip.**
+
+New `DiscoverInsightsStrip` composable in `DiscoverScreen.kt` — one-line surfaceVariant pill at the top showing `Blend X/Y/Z · <mode> · Up Next: N AI/Shuffle`. Tappable → `onOpenTaste()` callback wired in MainActivity to `overlay = Overlay.Taste`. The strip consumes the same `EngineSnapshot` data class that already powers TasteScreen's Engine Snapshot grid; no new data plumbing required.
+
+**Files affected**
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/Recommender.kt` — three new methods (`forYouByProfileVector`, `unexploredClustersKMeans`, `pickDiverseAnchors`) + a normalize helper + diversity-aware `becauseYouPlayed` pool expansion.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/SessionEngine.kt` — `forYouTick` StateFlow + `resetForYouTick()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/DiscoverCacheEngine.kt` — **new file**.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt` — wire `discoverCache`, include in `resetEngine`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/DiscoverScreen.kt` — `engineSnapshot` + `onOpenTaste` parameters; new `DiscoverInsightsStrip` composable.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — wire `forYouTick`, hydrate from `discoverCache`, switch Discover LE to `forYouByProfileVector` + `unexploredClustersKMeans`, save snapshot after each compute, pass `engineSnapshot` + `onOpenTaste` to DiscoverScreen.
+
+**Performance notes**
+- k-means: K=15 × N=2.5k × dim=512 × ≤20 iterations ≈ 380M ops. With NEON SIMD via `NativeAccelerator.dotProductBatch` the entire clustering completes well under 500 ms on-device. Runs once when library or embeddings change; cached afterward.
+- Profile-vector compute: ~30 dot products for centroid + N cosine sims for the candidate scan ≈ 2.5k dot products per scan. ~50ms.
+- Cache hydration: pure filename lookup against `songs.associateBy { it.filename }` — sub-millisecond.
+
+BUILD SUCCESSFUL in 18s. APK 328.9 MB at `2026-05-13 21:58`.
+
+**Verification (8-point checklist)**
+1. **Unexplored coherence** — open Discover. Each of "Sound you rarely visit" / "Another pocket of your library" / "Off the beaten path" should contain songs that actually sound similar to each other (e.g., all instrumental, or all film songs from the same era). Pre-push the 3 clusters were random hash buckets.
+2. **For You centroid** — if your library spans 2+ genres you regularly play, For You should mix recommendations from the *blend* — not 3 of one genre then 3 of the other. Log line: `Recommender: kmeans: n=X dim=Y kClusters=15 → displayed=3/M (scores=[…])`.
+3. **BYP diversity** — play 3 songs from the same composer/album back-to-back. The 3 "Because you played" sections should each cover different moods (verify by inspecting the listed songs — no two anchor sections should be nearly identical).
+4. **Auto-refresh after 5 listens** — play 5 songs to ≥50% each. Discover's For You should refresh between the 5th and 6th transition (different songs than before).
+5. **Cold-start cache** — kill the app via swipe, restart. Discover should render instantly with the previously-cached sections (not blank for 1-2s).
+6. **Insights strip visible** — at the top of Discover, see one line: `Blend X/Y/Z · <mode> · Up Next: N AI/Shuffle`. Tap → opens Taste page.
+7. **Pull-to-refresh** — drag down. All 3 AI sections re-shuffle. Auto-refresh counter resets to 0.
+8. **No regressions** — Push #62 album long-press, push #63 chip rows on Taste, push #59 filepath-based red dots should all still work.
+
+Share `logs.txt` if any check looks off — search for `Recommender: kmeans` to see what the clusterer landed on.
+
 ### 2026-05-13 #63 — Signal engine remediation: full Capacitor parity for scoring + similarity-boost propagation + hard-block + chip-aware Taste page
 
 User pulled scope back from "Taste page UI parity" to the entire signal-capture and scoring pipeline. After spawning three Explore agents for a side-by-side audit (Capacitor at `backups/pre_kotlin_rewrite_20260511_234500/src/engine-*.js` vs Kotlin at `native/app/src/main/kotlin/com/isaivazhi/app/engine/`), 12 divergences surfaced; user reviewed worked examples for each and made 8 binding design decisions. Every decision adopted Capacitor semantics — Capacitor's recommender was tuned over a year of real listening; the Kotlin rewrite silently drifted from those formulas. This push aligns them.

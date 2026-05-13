@@ -91,6 +91,14 @@ class TasteEngine(private val appContext: Context) {
         val isShortListened: Boolean,
         val isMixed: Boolean,
         val isHardRecommendationBlock: Boolean,
+        // Push #69 — Capacitor parity (`_buildSuspiciousRecommendationData`):
+        // true when the song shows conflicting signals that warrant a
+        // user review. Patterns:
+        //  • Favorite + repeated skips: user said "love" but keeps skipping
+        //  • High avgFraction (≥ 0.7) + very few plays + high xScore: noisy data
+        //  • Disliked + repeated complete listens: user said "no" but keeps playing
+        val isSuspicious: Boolean,
+        val suspiciousReason: String,
     )
 
     data class DecoratedSignals(
@@ -159,6 +167,15 @@ class TasteEngine(private val appContext: Context) {
 
     private val _signals = MutableStateFlow<Map<String, TasteSignal>>(emptyMap())
     val signals: StateFlow<Map<String, TasteSignal>> = _signals.asStateFlow()
+
+    /**
+     * Push #66: last recorded playback instance ID. Used by
+     * [recordPlaybackEvent] to skip double-counting the same native
+     * transition when an event fires twice (e.g. delayed retry from a
+     * controller-side reconnect). Capacitor parity:
+     * `useCurrentPlaybackDedupe` in engine.js:406.
+     */
+    @Volatile private var lastCapturedPlaybackInstanceId: Long = 0L
 
     private val _decorated = MutableStateFlow(
         DecoratedSignals(
@@ -245,18 +262,35 @@ class TasteEngine(private val appContext: Context) {
         filename: String,
         fraction: Float,
         source: String,
+        playbackInstanceId: Long = 0L,
     ): Pair<TasteSignal, TasteSignal> {
         val before = signalFor(filename)
+        // Push #66 dedupe: if this is the same playbackInstanceId we just
+        // recorded, the caller is re-firing for a transition we already
+        // captured. No-op.
+        if (playbackInstanceId > 0L && playbackInstanceId == lastCapturedPlaybackInstanceId) {
+            android.util.Log.i(
+                "TasteEngine",
+                "recordPlaybackEvent skipped fn=$filename src=$source: duplicate instanceId=$playbackInstanceId"
+            )
+            return before to before
+        }
         val frac = fraction.coerceIn(0f, 1f)
-        val isManual = source.startsWith("manual_") || source == "song_tap" ||
-            source == "queue_tap" || source == "neutral_skip"
+        // Push #66 — Capacitor parity (engine.js `_shouldAccumulateUserSkipNegative`):
+        // ONLY `next_button` / `prev_button` count as explicit user skips
+        // that bump xScore. Everything else (manual_tap, song_tap,
+        // queue_tap, neutral_skip, auto_advance, app_background,
+        // background_recovery, cold_start_*) is an encounter only — the
+        // listen evidence still updates plays/avgFraction but the song
+        // doesn't get a skip-penalty.
+        val isUserSkip = source == "next_button" || source == "prev_button"
         val isSkip = frac < SKIP_THRESHOLD
         val isFullListen = frac >= FULL_LISTEN_THRESHOLD
         val now = System.currentTimeMillis()
 
         // Plays counter: only increments on non-skip (fraction >= 0.50).
         val newPlays = if (isSkip) before.plays else before.plays + 1
-        val newSkips = if (isSkip && !isManual) before.skips + 1 else before.skips
+        val newSkips = if (isSkip && isUserSkip) before.skips + 1 else before.skips
         // avgFraction tracks only non-skip listens. When the event is a
         // skip, the existing avgFraction is preserved.
         val newAvgFrac = when {
@@ -265,7 +299,10 @@ class TasteEngine(private val appContext: Context) {
             else -> ((before.avgFraction * before.plays) + frac) / newPlays
         }
         val newX = when {
-            isSkip && !isManual ->
+            // Push #66: only explicit Next/Prev button bumps xScore.
+            // Manual taps / background flushes / cold-start replays just
+            // record encounters without penalty.
+            isSkip && isUserSkip ->
                 (before.xScore + USER_SKIP_NEGATIVE_STEP).coerceAtMost(NEG_SCORE_MAX)
             isFullListen ->
                 (before.xScore - NEG_LISTEN_DECAY).coerceAtLeast(0f)
@@ -300,12 +337,13 @@ class TasteEngine(private val appContext: Context) {
         )
         android.util.Log.i(
             "TasteEngine",
-            "recordPlaybackEvent fn=$filename frac=$frac src=$source isSkip=$isSkip isFull=$isFullListen " +
+            "recordPlaybackEvent fn=$filename frac=$frac src=$source isUserSkip=$isUserSkip isFull=$isFullListen " +
                 "plays=${before.plays}→$newPlays skips=${before.skips}→$newSkips avg=${"%.2f".format(before.avgFraction)}→${"%.2f".format(newAvgFrac)} " +
-                "x=${"%.2f".format(before.xScore)}→${"%.2f".format(newX)} direct=${"%.2f".format(before.directScore)}→${"%.2f".format(newBreakdown.directScore)} recencyMult=${"%.2f".format(newBreakdown.recencyMult)}"
+                "x=${"%.2f".format(before.xScore)}→${"%.2f".format(newX)} direct=${"%.2f".format(before.directScore)}→${"%.2f".format(newBreakdown.directScore)} recencyMult=${"%.2f".format(newBreakdown.recencyMult)} instId=$playbackInstanceId"
         )
 
         _signals.value = _signals.value + (filename to after)
+        if (playbackInstanceId > 0L) lastCapturedPlaybackInstanceId = playbackInstanceId
         scope.launch { persistSignals() }
         refreshDecorated()
         return before to after
@@ -460,6 +498,29 @@ class TasteEngine(private val appContext: Context) {
     }
 
     /**
+     * Push #68: stable hash of the current recommendation policy.
+     * Capacitor parity (`_buildRecommendationFingerprint`). Incorporates
+     * top-10 positive + top-10 negative + hard-block set so a
+     * Discover/UpNext cache built with one policy can be detected as
+     * stale when the policy meaningfully shifts.
+     */
+    fun recommendationFingerprint(): String {
+        val dec = _decorated.value
+        val topPos = dec.rows.values
+            .filter { it.breakdown.directScore > 0f }
+            .sortedByDescending { it.breakdown.score }
+            .take(10)
+            .joinToString("|") { "${it.filename}:${"%.2f".format(it.breakdown.score)}" }
+        val topNeg = dec.rows.values
+            .filter { it.breakdown.directScore < 0f }
+            .sortedBy { it.breakdown.score }
+            .take(10)
+            .joinToString("|") { "${it.filename}:${"%.2f".format(it.breakdown.score)}" }
+        val blocked = dec.hardBlockedFilenames.toSortedSet().joinToString(",")
+        return "$topPos::$topNeg::$blocked".hashCode().toString()
+    }
+
+    /**
      * Per-song reset on the Taste page. Push #63: full clear.
      * isFavorite/isDisliked are held by FavoritesEngine/DislikedEngine
      * (separate stores) and therefore survive automatically.
@@ -477,6 +538,31 @@ class TasteEngine(private val appContext: Context) {
         _signals.value = emptyMap()
         scope.launch { persistSignals() }
         refreshDecorated()
+    }
+
+    /**
+     * Push #69 — Capacitor parity (`_buildSuspiciousRecommendationData`):
+     * detect songs with conflicting signals that warrant a user review.
+     * Returns (isSuspicious, reason). Reason is empty when not suspicious.
+     */
+    private fun detectSuspicious(s: TasteSignal): Pair<Boolean, String> {
+        // Pattern 1: Favorite + repeated skips
+        if (s.isFavorite && s.skips >= 3 && s.skips > s.plays) {
+            return true to "Favorited but frequently skipped (${s.skips} skips / ${s.plays} plays)"
+        }
+        // Pattern 2: Disliked + high avgFraction
+        if (s.isDisliked && s.plays >= 2 && s.avgFraction >= 0.70f) {
+            return true to "Disliked but listened ${(s.avgFraction * 100).toInt()}% on avg (${s.plays} plays)"
+        }
+        // Pattern 3: High xScore + high avgFraction — conflicting evidence.
+        if (s.xScore >= 2f && s.plays > 0 && s.avgFraction >= 0.70f) {
+            return true to "High X (${"%.1f".format(s.xScore)}) but avg listen ${(s.avgFraction * 100).toInt()}%"
+        }
+        // Pattern 4: Very few plays + extreme avgFraction (noisy data).
+        if (s.plays == 1 && (s.avgFraction >= 0.95f || s.avgFraction <= 0.05f)) {
+            return true to "Single ${(s.avgFraction * 100).toInt()}% listen — need more evidence"
+        }
+        return false to ""
     }
 
     private fun computeFavoritePrior(plays: Int): Float {
@@ -561,6 +647,8 @@ class TasteEngine(private val appContext: Context) {
             val isMixed = r.bd.positiveWeight > 0f && r.bd.negativeWeight > 0f
             if (r.bd.directScore > 0f) posCount++
             else if (r.bd.directScore < 0f) negCount++
+            // Push #69: suspicious-pattern detector.
+            val (suspicious, reason) = detectSuspicious(r.sig)
             out[r.fn] = DecoratedRow(
                 filename = r.fn,
                 signal = r.sig,
@@ -572,6 +660,8 @@ class TasteEngine(private val appContext: Context) {
                 isShortListened = isShortListened,
                 isMixed = isMixed,
                 isHardRecommendationBlock = r.fn in hardBlocked,
+                isSuspicious = suspicious,
+                suspiciousReason = reason,
             )
         }
         _decorated.value = DecoratedSignals(

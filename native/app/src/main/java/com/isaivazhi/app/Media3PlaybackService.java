@@ -344,6 +344,12 @@ public class Media3PlaybackService extends MediaSessionService {
             lastTransitionPrevPlayedMs = snapshot.prevPlayedMs;
             lastTransitionPrevDurationMs = snapshot.prevDurationMs;
             lastTransitionAtMs = System.currentTimeMillis();
+            // Push #66: record the transition into a rolling buffer so
+            // cold-start reconciliation can correlate a pending listen
+            // snapshot against an authoritative native transition. The
+            // buffer carries `prevPlaybackInstanceId` which uniquely
+            // identifies the just-ended playback session.
+            rememberTransitionToPrefs(snapshot);
             currentIndex = newIndex;
             currentPlaybackInstanceId = nextPlaybackInstanceId();
             resetPlayedProgress(0L);
@@ -856,6 +862,149 @@ public class Media3PlaybackService extends MediaSessionService {
     /** Public so Kotlin can read duration without going through the
      *  MediaController for every fraction calculation. */
     public long getCurrentDurationMsSnapshot() { return currentDurationMs(); }
+
+    /** Push #66: current playback session id. Incremented on every
+     *  transition / queue rebuild / user-jump. Cold-start reconciliation
+     *  uses this to detect "the same playback session is still active"
+     *  vs "a new session started" cases. Returns 0L when no session is
+     *  loaded. */
+    public long getCurrentPlaybackInstanceId() { return currentPlaybackInstanceId; }
+
+    /** Push #71: current playback position (ms) of whatever the service
+     *  is playing. Used by cold-start to log the divergence between
+     *  service state and DataStore state when deciding whether to skip
+     *  prepareForResume. */
+    public long getCurrentPositionMsSnapshot() {
+        if (player == null) return lastKnownPositionMs;
+        try {
+            return Math.max(0L, player.getCurrentPosition());
+        } catch (Throwable t) {
+            return lastKnownPositionMs;
+        }
+    }
+
+    /** Push #65: filename (mediaId) of the currently-playing item, or
+     *  empty string if no item is loaded. Used by MainActivity.onPause to
+     *  identify which song the to-be-flushed accumulator belongs to. */
+    public String getCurrentMediaIdSnapshot() {
+        if (player == null) return "";
+        try {
+            androidx.media3.common.MediaItem mi = player.getCurrentMediaItem();
+            if (mi == null) return "";
+            String id = mi.mediaId;
+            return id == null ? "" : id;
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** Push #65: zero the played-ms accumulator without touching the
+     *  player. Called by Kotlin's flushCurrentPlayback() after it has
+     *  synthesized a SignalTimeline event from the current accumulator
+     *  value, so the next session doesn't double-count the same ms. */
+    public void markEvidenceFlushed() {
+        accumulatedPlayedMs = 0L;
+        // Keep lastProgressSampleMs at the current position so the next
+        // tick continues to accumulate forward from "now" rather than
+        // re-counting playback that happened before the flush.
+        lastProgressSampleMs = currentPositionMs();
+    }
+
+    /** Push #66: rolling buffer of the last N transitions, persisted to
+     *  SharedPreferences so cold-start reconciliation can match a pending
+     *  listen snapshot against an authoritative native transition.
+     *  Capacitor parity (`rememberTransition` in MusicPlaybackService.java). */
+    private static final String TRANSITIONS_PREFS_NAME = "playback_transitions_history";
+    private static final String TRANSITIONS_KEY = "history_json";
+    private static final int MAX_REMEMBERED_TRANSITIONS = 24;
+
+    private void rememberTransitionToPrefs(TransitionSnapshot snap) {
+        if (snap == null || snap.prevPlaybackInstanceId <= 0L) return;
+        try {
+            android.content.SharedPreferences prefs = getSharedPreferences(
+                    TRANSITIONS_PREFS_NAME, android.content.Context.MODE_PRIVATE);
+            String raw = prefs.getString(TRANSITIONS_KEY, null);
+            org.json.JSONArray arr = (raw != null && !raw.isEmpty())
+                    ? new org.json.JSONArray(raw) : new org.json.JSONArray();
+            org.json.JSONObject ev = new org.json.JSONObject();
+            ev.put("timestamp", System.currentTimeMillis());
+            ev.put("action", snap.action != null ? snap.action : "");
+            ev.put("prevPlaybackInstanceId", snap.prevPlaybackInstanceId);
+            ev.put("prevPlayedMs", snap.prevPlayedMs);
+            ev.put("prevDurationMs", snap.prevDurationMs);
+            ev.put("prevFraction", snap.prevFraction);
+            if (snap.prevItem != null) {
+                ev.put("prevFilename", summarizePath(snap.prevItem.filePath));
+                ev.put("prevTitle", snap.prevItem.title);
+            }
+            arr.put(ev);
+            org.json.JSONArray trimmed = new org.json.JSONArray();
+            int start = Math.max(0, arr.length() - MAX_REMEMBERED_TRANSITIONS);
+            for (int i = start; i < arr.length(); i++) {
+                trimmed.put(arr.getJSONObject(i));
+            }
+            prefs.edit().putString(TRANSITIONS_KEY, trimmed.toString()).apply();
+        } catch (Throwable t) {
+            android.util.Log.w(TAG, "rememberTransitionToPrefs failed: " + t.getMessage());
+        }
+    }
+
+    /** Push #66: read the recent transitions history. Used by Kotlin
+     *  cold-start reconciliation. */
+    public static org.json.JSONArray readRecentTransitionsStatic(android.content.Context ctx) {
+        try {
+            android.content.SharedPreferences prefs = ctx.getSharedPreferences(
+                    TRANSITIONS_PREFS_NAME, android.content.Context.MODE_PRIVATE);
+            String raw = prefs.getString(TRANSITIONS_KEY, null);
+            if (raw == null || raw.isEmpty()) return new org.json.JSONArray();
+            return new org.json.JSONArray(raw);
+        } catch (Throwable t) {
+            return new org.json.JSONArray();
+        }
+    }
+
+    /** Push #66: clear transitions buffer (Reset Engine path). */
+    public static void clearRecentTransitionsStatic(android.content.Context ctx) {
+        try {
+            ctx.getSharedPreferences(TRANSITIONS_PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                    .edit().clear().apply();
+        } catch (Throwable ignore) { }
+    }
+
+    /** Push #65: belt-and-suspenders for force-kill cases where
+     *  onPause/onDestroy may not complete. The OS calls this when the
+     *  user swipes the app off recents. We snapshot the accumulator +
+     *  currentMediaId to SharedPreferences so the next cold start can
+     *  ingest the leftover listening evidence via Kotlin's pending-
+     *  evidence path. */
+    @Override
+    public void onTaskRemoved(android.content.Intent rootIntent) {
+        try {
+            long played = getAccumulatedPlayedMsSnapshot();
+            long dur = getCurrentDurationMsSnapshot();
+            String mediaId = getCurrentMediaIdSnapshot();
+            if (played >= 1000L && dur > 0L && !mediaId.isEmpty()) {
+                android.content.SharedPreferences sp = getSharedPreferences(
+                        "playback_pending_evidence", android.content.Context.MODE_PRIVATE);
+                sp.edit()
+                        .putString("mediaId", mediaId)
+                        .putLong("playedMs", played)
+                        .putLong("durationMs", dur)
+                        .putLong("playbackInstanceId", currentPlaybackInstanceId)
+                        .putLong("capturedAtMs", System.currentTimeMillis())
+                        .apply();
+                android.util.Log.i(TAG,
+                        "onTaskRemoved: persisted pending evidence mediaId=" + summarizePath(mediaId)
+                                + " played=" + played + "ms dur=" + dur + "ms");
+            } else {
+                android.util.Log.i(TAG,
+                        "onTaskRemoved: nothing to persist (played=" + played + " dur=" + dur + " id=" + summarizePath(mediaId) + ")");
+            }
+        } catch (Throwable t) {
+            android.util.Log.w(TAG, "onTaskRemoved flush failed: " + t.getMessage());
+        }
+        super.onTaskRemoved(rootIntent);
+    }
 
     private float computePrevFraction() {
         long dur = currentDurationMs();
