@@ -58,6 +58,17 @@ class TasteEngine(private val appContext: Context) {
         val isDisliked: Boolean = false,
         val lastPlayedAt: Long = 0L,  // Push #63: feeds recencyMult.
         val lastUpdatedAt: Long = 0L,
+        // Push #73: full-listens (frac >= 0.70) — used to decay
+        // dislikePrior asymmetrically. plays still increments at
+        // frac >= 0.50 for everything else.
+        val fullListens: Int = 0,
+        // Push #73: per-field freshness timestamps so xScore and
+        // similarityBoost can each decay independently with the same
+        // 30-day halflife as listens. Stamped only when the
+        // corresponding field actually changes — not on every signal
+        // touch, so unrelated activity doesn't reset their freshness.
+        val xScoreUpdatedAt: Long = 0L,
+        val similarityBoostUpdatedAt: Long = 0L,
     )
 
     /**
@@ -128,8 +139,16 @@ class TasteEngine(private val appContext: Context) {
         private const val NEG_SCORE_MAX = 10f
 
         // Prior coefficients from engine-favorites.js / engine-disliked.js.
-        private const val FAVORITE_PRIOR_BASE = 2.0f
-        private const val DISLIKE_PRIOR_BASE = 3.0f
+        // Push #73: user-tuned, intentionally asymmetric. Originally
+        // +2.0 / -3.0 (Capacitor parity). Now +1.5 / -2.5: favorites
+        // should fade quickly as the user's listens prove they like it,
+        // but dislikes need to stay sticky enough to survive 1-2
+        // accidental full plays AND comfortably above the
+        // HARD_EXCLUDE_FLOOR (1.5) so a fresh dislike is reliably
+        // blocked from recommendations. Halflife decay (every 2 plays)
+        // still applies on top.
+        private const val FAVORITE_PRIOR_BASE = 1.5f
+        private const val DISLIKE_PRIOR_BASE = 2.5f
         private const val MANUAL_PRIOR_HALF_LIFE_PLAYS = 2f
         private const val MANUAL_PRIOR_MIN = 0.05f
 
@@ -291,6 +310,9 @@ class TasteEngine(private val appContext: Context) {
         // Plays counter: only increments on non-skip (fraction >= 0.50).
         val newPlays = if (isSkip) before.plays else before.plays + 1
         val newSkips = if (isSkip && isUserSkip) before.skips + 1 else before.skips
+        // Push #73: fullListens only increments on >=0.70 non-skip.
+        // Used to decay the dislike prior asymmetrically.
+        val newFullListens = if (!isSkip && isFullListen) before.fullListens + 1 else before.fullListens
         // avgFraction tracks only non-skip listens. When the event is a
         // skip, the existing avgFraction is preserved.
         val newAvgFrac = when {
@@ -298,6 +320,7 @@ class TasteEngine(private val appContext: Context) {
             before.plays == 0 -> frac
             else -> ((before.avgFraction * before.plays) + frac) / newPlays
         }
+        val xScoreChanged = (isSkip && isUserSkip) || isFullListen
         val newX = when {
             // Push #66: only explicit Next/Prev button bumps xScore.
             // Manual taps / background flushes / cold-start replays just
@@ -308,9 +331,14 @@ class TasteEngine(private val appContext: Context) {
                 (before.xScore - NEG_LISTEN_DECAY).coerceAtLeast(0f)
             else -> before.xScore
         }
-        // Recompute manual priors against the new plays count.
+        // Push #73: stamp xScoreUpdatedAt only when xScore actually
+        // changed. Stale timestamps would defeat the recency decay.
+        val newXScoreUpdatedAt = if (xScoreChanged) now else before.xScoreUpdatedAt
+        // Recompute manual priors against the new counters. Favorite
+        // decays on plays (all engagement); dislike decays on
+        // fullListens (only genuine listen-throughs).
         val newFavPrior = if (before.isFavorite) computeFavoritePrior(newPlays) else 0f
-        val newDisPrior = if (before.isDisliked) computeDislikePrior(newPlays) else 0f
+        val newDisPrior = if (before.isDisliked) computeDislikePrior(newFullListens) else 0f
         // lastPlayedAt — only stamp on real listens, not skips. A skip
         // doesn't mean "I played this," it means "I rejected this."
         val newLastPlayedAt = if (isSkip) before.lastPlayedAt else now
@@ -322,6 +350,9 @@ class TasteEngine(private val appContext: Context) {
             dislikePrior = newDisPrior,
             similarityBoost = before.similarityBoost,
             lastPlayedAt = newLastPlayedAt,
+            xScoreUpdatedAt = newXScoreUpdatedAt,
+            similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
+            lastUpdatedAt = now,
             now = now,
         )
         val after = before.copy(
@@ -334,6 +365,8 @@ class TasteEngine(private val appContext: Context) {
             dislikePrior = newDisPrior,
             lastPlayedAt = newLastPlayedAt,
             lastUpdatedAt = now,
+            fullListens = newFullListens,
+            xScoreUpdatedAt = newXScoreUpdatedAt,
         )
         android.util.Log.i(
             "TasteEngine",
@@ -361,7 +394,7 @@ class TasteEngine(private val appContext: Context) {
         if (filename.isBlank()) return TasteSignal() to TasteSignal()
         val before = signalFor(filename)
         val newFavPrior = if (isFavorite) computeFavoritePrior(before.plays) else 0f
-        val newDisPrior = if (isDisliked) computeDislikePrior(before.plays) else 0f
+        val newDisPrior = if (isDisliked) computeDislikePrior(before.fullListens) else 0f
         val now = System.currentTimeMillis()
         val newBreakdown = computeDirectScore(
             plays = before.plays,
@@ -371,6 +404,9 @@ class TasteEngine(private val appContext: Context) {
             dislikePrior = newDisPrior,
             similarityBoost = before.similarityBoost,
             lastPlayedAt = before.lastPlayedAt,
+            xScoreUpdatedAt = before.xScoreUpdatedAt,
+            similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
+            lastUpdatedAt = now,
             now = now,
         )
         val after = before.copy(
@@ -410,12 +446,16 @@ class TasteEngine(private val appContext: Context) {
             dislikePrior = before.dislikePrior,
             similarityBoost = before.similarityBoost,
             lastPlayedAt = before.lastPlayedAt,
+            xScoreUpdatedAt = now,
+            similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
+            lastUpdatedAt = now,
             now = now,
         )
         val after = before.copy(
             xScore = newX,
             directScore = newBreakdown.directScore,
             lastUpdatedAt = now,
+            xScoreUpdatedAt = now,
         )
         _signals.value = _signals.value + (filename to after)
         android.util.Log.i(
@@ -477,12 +517,16 @@ class TasteEngine(private val appContext: Context) {
                 dislikePrior = cur.dislikePrior,
                 similarityBoost = newBoost,
                 lastPlayedAt = cur.lastPlayedAt,
+                xScoreUpdatedAt = cur.xScoreUpdatedAt,
+                similarityBoostUpdatedAt = now,
+                lastUpdatedAt = now,
                 now = now,
             )
             next = next + (nfn to cur.copy(
                 similarityBoost = newBoost,
                 directScore = nb.directScore,
                 lastUpdatedAt = now,
+                similarityBoostUpdatedAt = now,
             ))
             changedCount++
         }
@@ -570,8 +614,14 @@ class TasteEngine(private val appContext: Context) {
         return if (w >= MANUAL_PRIOR_MIN) w else 0f
     }
 
-    private fun computeDislikePrior(plays: Int): Float {
-        val w = DISLIKE_PRIOR_BASE * 0.5f.pow(plays / MANUAL_PRIOR_HALF_LIFE_PLAYS)
+    /**
+     * Push #73: dislike prior decays on fullListens (frac >= 0.70), not
+     * total plays. A user who keeps half-skipping a disliked song
+     * shouldn't be erasing the dislike — only genuine listen-throughs
+     * count as evidence that the dislike was wrong.
+     */
+    private fun computeDislikePrior(fullListens: Int): Float {
+        val w = DISLIKE_PRIOR_BASE * 0.5f.pow(fullListens / MANUAL_PRIOR_HALF_LIFE_PLAYS)
         return if (w >= MANUAL_PRIOR_MIN) w else 0f
     }
 
@@ -602,6 +652,9 @@ class TasteEngine(private val appContext: Context) {
                     dislikePrior = sig.dislikePrior,
                     similarityBoost = sig.similarityBoost,
                     lastPlayedAt = sig.lastPlayedAt,
+                    xScoreUpdatedAt = sig.xScoreUpdatedAt,
+                    similarityBoostUpdatedAt = sig.similarityBoostUpdatedAt,
+                    lastUpdatedAt = sig.lastUpdatedAt,
                     now = now,
                 )
             )
@@ -704,6 +757,9 @@ class TasteEngine(private val appContext: Context) {
                     put("isDisliked", s.isDisliked)
                     put("lastPlayedAt", s.lastPlayedAt)
                     put("lastUpdatedAt", s.lastUpdatedAt)
+                    put("fullListens", s.fullListens)
+                    put("xScoreUpdatedAt", s.xScoreUpdatedAt)
+                    put("similarityBoostUpdatedAt", s.similarityBoostUpdatedAt)
                 })
             }
             appContext.dataStoreLocal.edit { it[KEY_SIGNALS] = root.toString() }
@@ -733,6 +789,9 @@ class TasteEngine(private val appContext: Context) {
                     isDisliked = v.optBoolean("isDisliked", false),
                     lastPlayedAt = v.optLong("lastPlayedAt", 0L),
                     lastUpdatedAt = v.optLong("lastUpdatedAt", 0L),
+                    fullListens = v.optInt("fullListens", 0),
+                    xScoreUpdatedAt = v.optLong("xScoreUpdatedAt", 0L),
+                    similarityBoostUpdatedAt = v.optLong("similarityBoostUpdatedAt", 0L),
                 )
             }
             out
@@ -744,25 +803,45 @@ class TasteEngine(private val appContext: Context) {
 }
 
 /**
- * Capacitor parity directScore (engine-taste.js:391-487).
+ * Capacitor parity directScore (engine-taste.js:391-487), extended by
+ * Push #73 with recency decay for xScore + similarityBoost and a
+ * single-encounter rejection branch.
  *
  *   recencyMult        = 0.5^(daysSince / PROFILE_HALF_LIFE_DAYS)
+ *                        (driven by lastPlayedAt — real listens only)
+ *   xRecencyMult       = 0.5^(daysSinceXScore / PROFILE_HALF_LIFE_DAYS)
+ *                        (driven by xScoreUpdatedAt — last skip/full-listen
+ *                         event; falls back to lastUpdatedAt for legacy data)
+ *   simRecencyMult     = 0.5^(daysSinceSim / PROFILE_HALF_LIFE_DAYS)
+ *                        (driven by similarityBoostUpdatedAt)
+ *
  *   positiveListen     = plays × avgFraction × recencyMult  (plays > 0)
  *   negativeListen     = plays × (1 − avgFraction) × recencyMult
  *                          when plays ≥ NEGATIVE_PLAY_THRESHOLD (2) AND
  *                               avgFraction < NEGATIVE_FRAC_THRESHOLD (0.5)
  *                        plays × (1 − avgFraction) × recencyMult × 0.5
  *                          when xScore > 0 (already-penalized song)
+ *                        (1 − avgFraction) × recencyMult × 0.5
+ *                          when plays = 1 AND avgFraction < 0.2
+ *                          (Push #73: single-encounter rejection. One
+ *                           horrible partial listen of an otherwise
+ *                           unknown song still emits a signal.)
  *                        0 otherwise
+ *
+ *   effectiveX         = xScore × xRecencyMult
+ *   effectiveBoost     = similarityBoost × simRecencyMult
+ *
  *   positiveWeight     = positiveListen + favoritePrior
- *   negativeWeight     = max(0, xScore) + negativeListen + dislikePrior
+ *   negativeWeight     = max(0, effectiveX) + negativeListen + dislikePrior
  *   directScore        = positiveWeight − negativeWeight
- *   effectivePositive  = positiveWeight + max(0,  similarityBoost)
- *   effectiveNegative  = negativeWeight + max(0, -similarityBoost)
- *   score              = directScore + similarityBoost
+ *   effectivePositive  = positiveWeight + max(0,  effectiveBoost)
+ *   effectiveNegative  = negativeWeight + max(0, -effectiveBoost)
+ *   score              = directScore + effectiveBoost
  *
  * Manual priors (favoritePrior, dislikePrior) are NOT recency-decayed —
- * they reflect explicit, ongoing user intent.
+ * they reflect explicit, ongoing user intent. dislikePrior decays on
+ * fullListens (handled by computeDislikePrior); favoritePrior decays on
+ * plays (handled by computeFavoritePrior).
  */
 fun computeDirectScore(
     plays: Int,
@@ -772,29 +851,63 @@ fun computeDirectScore(
     dislikePrior: Float,
     similarityBoost: Float,
     lastPlayedAt: Long,
+    xScoreUpdatedAt: Long = 0L,
+    similarityBoostUpdatedAt: Long = 0L,
+    lastUpdatedAt: Long = 0L,
     now: Long = System.currentTimeMillis(),
 ): TasteEngine.DirectScoreBreakdown {
-    val daysSince = if (lastPlayedAt > 0L)
+    val daysSinceListen = if (lastPlayedAt > 0L)
         (now - lastPlayedAt).toFloat() / TasteEngine.PROFILE_DAY_MS
     else 0f
-    val recencyMult = 0.5f.pow(daysSince / TasteEngine.PROFILE_HALF_LIFE_DAYS)
+    val recencyMult = 0.5f.pow(daysSinceListen / TasteEngine.PROFILE_HALF_LIFE_DAYS)
         .coerceIn(0f, 1f)
+
+    // Legacy data may have xScoreUpdatedAt == 0; fall back to
+    // lastUpdatedAt so old persisted skips fade reasonably instead of
+    // being treated as "today."
+    val xRefTs = when {
+        xScoreUpdatedAt > 0L -> xScoreUpdatedAt
+        lastUpdatedAt > 0L -> lastUpdatedAt
+        else -> 0L
+    }
+    val xRecencyMult = if (xRefTs > 0L) {
+        val days = (now - xRefTs).toFloat() / TasteEngine.PROFILE_DAY_MS
+        0.5f.pow(days / TasteEngine.PROFILE_HALF_LIFE_DAYS).coerceIn(0f, 1f)
+    } else 1f
+
+    val simRefTs = when {
+        similarityBoostUpdatedAt > 0L -> similarityBoostUpdatedAt
+        lastUpdatedAt > 0L -> lastUpdatedAt
+        else -> 0L
+    }
+    val simRecencyMult = if (simRefTs > 0L) {
+        val days = (now - simRefTs).toFloat() / TasteEngine.PROFILE_DAY_MS
+        0.5f.pow(days / TasteEngine.PROFILE_HALF_LIFE_DAYS).coerceIn(0f, 1f)
+    } else 1f
+
+    val effectiveX = xScore * xRecencyMult
+    val effectiveBoost = similarityBoost * simRecencyMult
+
     val positiveListen = if (plays > 0) plays * avgFraction * recencyMult else 0f
     val negativeListen = when {
         plays >= 2 && avgFraction < 0.5f -> plays * (1f - avgFraction) * recencyMult
-        xScore > 0f && plays > 0 -> plays * (1f - avgFraction) * recencyMult * 0.5f
+        effectiveX > 0f && plays > 0 -> plays * (1f - avgFraction) * recencyMult * 0.5f
+        // Push #73: single-encounter rejection. plays=1 with very low
+        // avg means the user bailed almost immediately — surface it as
+        // a half-weight negative signal even without a 2nd play.
+        plays == 1 && avgFraction < 0.2f -> (1f - avgFraction) * recencyMult * 0.5f
         else -> 0f
     }
     val positiveWeight = positiveListen + favoritePrior
-    val negativeWeight = maxOf(0f, xScore) + negativeListen + dislikePrior
+    val negativeWeight = maxOf(0f, effectiveX) + negativeListen + dislikePrior
     val direct = positiveWeight - negativeWeight
     return TasteEngine.DirectScoreBreakdown(
         positiveWeight = positiveWeight,
         negativeWeight = negativeWeight,
-        effectivePositive = positiveWeight + maxOf(0f, similarityBoost),
-        effectiveNegative = negativeWeight + maxOf(0f, -similarityBoost),
+        effectivePositive = positiveWeight + maxOf(0f, effectiveBoost),
+        effectiveNegative = negativeWeight + maxOf(0f, -effectiveBoost),
         directScore = direct,
-        score = direct + similarityBoost,
+        score = direct + effectiveBoost,
         recencyMult = recencyMult,
     )
 }

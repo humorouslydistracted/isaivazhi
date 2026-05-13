@@ -6,6 +6,61 @@ Pre-Kotlin history (Capacitor + WebView build, pushes #1–#21 plus all earlier 
 
 Each entry below is dated and numbered. Most recent first.
 
+### 2026-05-14 #73 — Asymmetric priors + recency decay for xScore/similarityBoost + single-encounter rejection
+
+User-driven taste-engine remediation following a critical-thinking pass on the recommendation pipeline. Two parts:
+
+**Part A — Prior magnitudes (the question that kicked this off).** Originally `FAVORITE_PRIOR_BASE = 2.0` / `DISLIKE_PRIOR_BASE = 3.0` (Capacitor parity). User wanted +1.5 / -1.5 (symmetric). After investigation showed the math problem — a fresh dislike with base 1.5 sits *exactly* at `HARD_EXCLUDE_FLOOR = 1.5`, so any partial play knocks it off the hard-block list, and 2 full plays flip a disliked song positive — we landed on asymmetric values: **+1.5 / -2.5**. Favorite stays gentle (user listens prove it). Dislike stays sticky (1 accidental play → still negative; needs 2+ deliberate full plays to flip).
+
+**Part B — Four engine-level fixes** (after critical-thinking pass on the whole recommendation config):
+
+1. **xScore decays with recency.** Previously `xScore` was a non-decaying counter — a skip from 6 months ago counted the same as today's. Now `computeDirectScore` applies the same `0.5^(daysSince/30)` halflife to xScore as it does to listens, keyed off a new `xScoreUpdatedAt` timestamp (stamped only when xScore actually changes — skip via Next/Prev, full-listen reward, queue-remove penalty).
+
+2. **similarityBoost decays with recency.** Same problem, same fix: propagated boosts now fade after 30 days unless re-touched. New `similarityBoostUpdatedAt` stamped on every propagation event. Prevents stale neighborhood opinions from permanently influencing ranking.
+
+3. **Asymmetric prior decay.** `computeFavoritePrior(plays)` unchanged — a heart's job is done once you've actually listened enough. `computeDislikePrior(fullListens)` — new — only decays on `frac >= 0.70` non-skip listens. A user who keeps half-skipping a disliked song was previously erasing the dislike at the same rate as a user who listened through; now only genuine listen-throughs count as evidence the dislike was wrong. New `fullListens` counter on `TasteSignal`.
+
+4. **Single-encounter rejection.** Previously `negativeListen` activated only at `plays >= 2 AND avg < 0.5`. A song with `plays=1, avg=0.1` (user bailed almost immediately) contributed *zero* to the negative side. Added a new branch: `plays == 1 AND avgFraction < 0.2` → half-weight negative contribution. Single horrible partial listens are now visible.
+
+**Files modified:**
+
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/TasteEngine.kt`
+  - `FAVORITE_PRIOR_BASE = 1.5f`, `DISLIKE_PRIOR_BASE = 2.5f`
+  - `TasteSignal` gains `fullListens: Int`, `xScoreUpdatedAt: Long`, `similarityBoostUpdatedAt: Long`
+  - `computeDislikePrior(fullListens)` instead of `(plays)`
+  - `computeDirectScore` signature extended with the two new timestamps + `lastUpdatedAt` (fallback for legacy data with timestamp=0)
+  - `computeDirectScore` applies `xRecencyMult` to xScore and `simRecencyMult` to similarityBoost; adds the `plays==1 && avg<0.2` branch
+  - `recordPlaybackEvent` increments `fullListens` on `!isSkip && isFullListen`, stamps `xScoreUpdatedAt` when xScore actually changed
+  - `bumpXScoreForQueueRemove` stamps `xScoreUpdatedAt`
+  - `propagateSimilarityBoost` stamps `similarityBoostUpdatedAt` on each neighbor it touches
+  - `refreshDecorated` passes the new timestamps through
+  - `persistSignals` / `parseSignals` read/write the three new fields with `optInt`/`optLong` defaults (legacy data reads cleanly)
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt` — comment updated to reflect new +1.5/-2.5 values
+
+**Critical-thinking checks performed before editing:**
+
+- Stored `TasteSignal.directScore` is a snapshot for delta computation, never read for recommendation filtering — hard-block filtering goes through `decoratedSignals.hardBlockedFilenames` which always recomputes via `computeDirectScore`. ✓
+- Profile vec (`Recommender.forYouByProfileVector`) uses `plays × avgFraction` only — pure positive listening evidence. My xScore/boost decay changes don't pollute it. ✓
+- Delta callers (`AppContainer.favorites.onChangeHook`, `PlaybackEngine.onTransition`, etc.) compute `after.directScore - before.directScore` with both values produced at the same `now` — deltas stay correct. ✓
+- Separate per-field timestamps are necessary — reusing `lastUpdatedAt` would let unrelated activity (a neighbor toggle propagating a boost) reset xScore freshness incorrectly. ✓
+- Legacy data with `xScoreUpdatedAt = 0` / `similarityBoostUpdatedAt = 0` falls back to `lastUpdatedAt`; if that's 0 too, no decay. Prevents legacy signals from being unfairly penalized on first read after upgrade. ✓
+- `SignalTimelineEngine` only stores `xScoreBefore`/`xScoreAfter` as display snapshots — no logic depends on xScore freshness. ✓
+
+**Worked example — fresh dislike (plays=0, fullListens=0):**
+
+| event                          | plays | fullListens | avg   | dislikePrior | directScore |
+|--------------------------------|-------|-------------|-------|--------------|-------------|
+| dislike tapped                 | 0     | 0           | 0.00  | 2.50         | **-2.50**   |
+| accidental 60% play            | 1     | 0           | 0.60  | 2.50         | **-1.90**   |
+| genuine 100% play              | 2     | 1           | 0.80  | 1.77         | **-0.17**   |
+| second 100% play               | 3     | 2           | 0.87  | 1.25         | **+1.35**   |
+
+A clean two-full-listen sequence flips it positive at the second full play. Partial plays do NOT flip it — even 60% engagement leaves the dislike comfortably negative. Initial sticky -2.5 sits well above the 1.5 hard-block floor, so a fresh dislike is reliably blocked from recommendations.
+
+**Build:** BUILD SUCCESSFUL in 9s. One pre-existing icon-deprecation warning (Icons.Filled.QueueMusic), unrelated.
+
+---
+
 ### 2026-05-14 #72 — Timeline pagination + favorites preserved on reset + Refresh uses blended query
 
 Three independent fixes the user requested:

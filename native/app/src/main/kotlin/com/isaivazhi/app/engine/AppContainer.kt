@@ -172,10 +172,10 @@ class AppContainer(private val appContext: Context) {
         // represent the user's intentional taste signal — not playback
         // history. Re-apply each manual prior so the taste signal map
         // gets fresh entries with directScore from the priors (favorite
-        // → +2.0, dislike → -3.0). Without this re-apply, favorites
-        // would have isFavorite=true in FavoritesEngine but no
-        // TasteSignal entry, so they'd show as 0 in the Taste page's
-        // positive list.
+        // → +1.5, dislike → -2.5; see Push #73 in TasteEngine for
+        // tuning). Without this re-apply, favorites would have
+        // isFavorite=true in FavoritesEngine but no TasteSignal entry,
+        // so they'd show as 0 in the Taste page's positive list.
         val favSet = favorites.favorites.value.toSet()
         val disSet = disliked.disliked.value.toSet()
         val toReapply = (favSet + disSet)
