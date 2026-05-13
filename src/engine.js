@@ -8,6 +8,7 @@ import { Preferences } from '@capacitor/preferences';
 import { Recommender, vecAdd, vecScale, vecNormalize, weightedAverage } from './recommender.js';
 import { SessionLogger } from './logger.js';
 import { MusicBridge } from './music-bridge.js';
+import * as EmbeddingDb from './embedding-db.js';
 import * as EmbeddingCache from './embedding-cache.js';
 import { initActivityLog, logActivity, getRecentActivityEvents, getActivityLogStatus, flushActivityLog } from './activity-log.js';
 
@@ -1787,6 +1788,72 @@ initPlaybackCallbacks({
   currentSongInfo: _currentSongInfo,
 });
 
+/**
+ * Native-backed nearest-neighbor search for the supplied song id.
+ *
+ * Routes through MusicBridge.embDbNearestNeighbors which runs on the
+ * EmbeddingDb worker thread. Uses sqlite-vec's vec_distance_cosine when
+ * the extension is loaded; falls back to NativeAccelerator (NEON SIMD)
+ * over an in-memory snapshot otherwise. JS thread is not blocked on the
+ * scan — Phase 2 deliverable.
+ *
+ * Returns an array of { id, title, artist, similarity, artPath, contentHash }
+ * (mapped from native result rows back to JS song ids) plus a
+ * `_usedExtension` flag at the array level for diagnostics.
+ */
+async function getTopSimilarNative(songId, k = 8, extraExcludeIds = []) {
+  const s = songs[songId];
+  if (!s || !s.hasEmbedding) {
+    const out = [];
+    out._usedExtension = false;
+    out._latencyMs = 0;
+    return out;
+  }
+  const embIdx = s.embeddingIndex;
+  if (embIdx == null || !embeddings[embIdx]) {
+    const out = [];
+    out._usedExtension = false;
+    out._latencyMs = 0;
+    return out;
+  }
+  const queryVec = embeddings[embIdx];
+  const excludeHashes = [];
+  if (s.contentHash) excludeHashes.push(s.contentHash);
+  for (const id of (extraExcludeIds || [])) {
+    const ex = songs[id];
+    if (ex && ex.contentHash && !excludeHashes.includes(ex.contentHash)) {
+      excludeHashes.push(ex.contentHash);
+    }
+  }
+  const t0 = performance.now();
+  const res = await EmbeddingDb.nearestNeighbors(queryVec, k, excludeHashes);
+  const latencyMs = Math.round(performance.now() - t0);
+  const rows = (res && res.results) || [];
+  // Map content hashes back to song ids using the existing path index in
+  // engine-embeddings. Use filename as a fallback for entries that share
+  // the same content hash across different files on the device.
+  const out = [];
+  for (const r of rows) {
+    let target = null;
+    if (r.contentHash) target = songs.find(x => x && x.contentHash === r.contentHash);
+    if (!target && r.filepath) target = songs.find(x => x && x.filePath === r.filepath);
+    if (!target && r.filename) target = songs.find(x => x && x.filename === r.filename);
+    if (!target || !target.filePath) continue;
+    out.push({
+      id: target.id,
+      title: target.title,
+      artist: target.artist,
+      similarity: r.similarity,
+      artPath: target.artPath,
+      contentHash: r.contentHash,
+    });
+  }
+  out._usedExtension = !!(res && res.usedExtension);
+  out._latencyMs = latencyMs;
+  console.log(`[NN] native KNN: extension=${out._usedExtension} count=${out.length} latency=${latencyMs}ms`);
+  return out;
+}
+
 export {
   loadData,
   getSongs,
@@ -1900,4 +1967,5 @@ export {
   getRecentActivityEvents,
   getActivityLogStatus,
   flushActivityLog,
+  getTopSimilarNative,
 };

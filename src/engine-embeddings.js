@@ -8,6 +8,7 @@ import { Recommender } from './recommender.js';
 import { attachGpuToRec } from './gpu-recommender.js';
 import { MusicBridge } from './music-bridge.js';
 import * as EmbeddingCache from './embedding-cache.js';
+import * as EmbeddingDb from './embedding-db.js';
 import {
   TOP_N,
   songs, setSongs, embeddings, embeddingMap, setEmbeddingMap,
@@ -492,14 +493,19 @@ export function removeOrphanedEmbeddings() {
       .filter(id => id != null);
   }
 
-  // Remove orphaned entries from local_embeddings
+  // Remove orphaned entries from local_embeddings. Collect deleted hashes
+  // so we can fire one row-level native DELETE on the EmbeddingDb worker
+  // thread instead of rewriting the full store on the JS thread.
   const pathIndex = localEmbeddings._path_index || {};
+  const orphanHashesToDelete = [];
   for (const s of orphanedSongs) {
-    if (s.contentHash) {
+    if (s.contentHash && localEmbeddings[s.contentHash]) {
       delete localEmbeddings[s.contentHash];
+      orphanHashesToDelete.push(s.contentHash);
     }
     for (const [path, hash] of Object.entries(pathIndex)) {
       if (!songs.some(song => song.filePath === path)) {
+        if (localEmbeddings[hash]) orphanHashesToDelete.push(hash);
         delete localEmbeddings[hash];
         delete pathIndex[path];
       }
@@ -547,7 +553,14 @@ export function removeOrphanedEmbeddings() {
     attachGpuToRec(rec, embeddings);
   }
   buildProfileVec().then(v => { setProfileVec(v); }).catch(() => {});
-  _saveLocalEmbeddings();
+  // Row-level native DELETE — runs on the EmbeddingDb worker thread; JS
+  // thread is not blocked on encoding or disk I/O. Replaces the prior
+  // saveToDisk full-store rewrite.
+  if (orphanHashesToDelete.length > 0) {
+    EmbeddingDb.deleteByHashes(orphanHashesToDelete).catch(e => {
+      _embLog('error', `embDb orphan delete failed: ${e && e.message || e}`);
+    });
+  }
   _cbs.saveFavorites();
   _cbs.savePlaybackState();
 
@@ -688,18 +701,27 @@ function _purgeLocalEmbeddingForSong(songId) {
       .map(other => other.contentHash)
   );
 
+  // Collect the hashes we actually intend to delete so we can fire one
+  // row-level native DELETE instead of rewriting the whole store.
+  const toDelete = [];
   for (const hash of candidateHashes) {
     if (!hash || otherLiveHashes.has(hash)) continue;
     const stillReferenced = Object.values(pathIndex).some(v => v === hash);
     if (!stillReferenced && localEmbeddings[hash]) {
       delete localEmbeddings[hash];
+      toDelete.push(hash);
       changed = true;
     }
   }
 
   if (changed) {
     localEmbeddings._path_index = pathIndex;
-    _saveLocalEmbeddings();
+    // Row-level native DELETE — runs on the EmbeddingDb worker thread, the
+    // JS thread is not blocked on encoding or disk I/O. Fire-and-forget
+    // because the in-memory mutation is already complete.
+    if (toDelete.length > 0) {
+      EmbeddingDb.deleteByHashes(toDelete).catch(e => _embLog('error', `embDb delete failed: ${e && e.message || e}`));
+    }
   }
 }
 
@@ -783,6 +805,8 @@ export async function removeUnmatchedEmbeddings() {
   const unmatchedPaths = new Set(unmatchedEmbeddings.map(u => u.filepath).filter(Boolean));
   const pathIndex = localEmbeddings._path_index || {};
 
+  // Collect hashes for the row-level native DELETE.
+  const toDelete = [];
   for (const [hash, data] of Object.entries(localEmbeddings)) {
     if (hash === '_path_index' || !data || typeof data !== 'object') continue;
     const fn = (data.filename || '').toLowerCase();
@@ -790,27 +814,21 @@ export async function removeUnmatchedEmbeddings() {
     if (unmatchedKeys.has(hash) || unmatchedFilenames.has(fn) || unmatchedPaths.has(fp)) {
       delete localEmbeddings[hash];
       if (fp && pathIndex[fp]) delete pathIndex[fp];
+      toDelete.push(hash);
     }
   }
 
   localEmbeddings._path_index = pathIndex;
   unmatchedEmbeddings = [];
-  // 2026-05-11: previously awaited saveToDisk(localEmbeddings). That call does
-  // a multi-MB Float32->base64 encode + JSON.stringify of the legacy mirror on
-  // the JS thread — for a ~2500-entry store the user observed a 1-2 minute UI
-  // freeze. The user-visible removal is already done above (in-memory mutation
-  // + unmatchedEmbeddings=[]). Disk persistence happens in the background:
-  //   - saveToDisk awaits the binary store write (a few hundred ms with B's
-  //     setTimeout yields between phases)
-  //   - kicks off the 10-15MB legacy JSON mirror write as a detached promise
-  //     so it can't block subsequent UI interactions
-  // Atomic tmp+rename in _writeBinaryStore / _writeLegacyJson means a mid-write
-  // app kill cannot corrupt the files. Worst case the removed entries reappear
-  // on next startup (binary store wasn't flushed) and the user re-removes —
-  // idempotent.
-  EmbeddingCache.saveToDisk(localEmbeddings).catch(e => {
-    _embLog('error', `Failed to persist unmatched removal: ${e && e.message || e}`);
-  });
+  // Row-level native DELETE — runs on the EmbeddingDb worker thread; the
+  // JS thread is never blocked on Float32 encoding or disk I/O. Replaces
+  // the prior saveToDisk(localEmbeddings) full-store rewrite that pinned
+  // the renderer for 1-2 minutes on a 2500-entry store.
+  if (toDelete.length > 0) {
+    EmbeddingDb.deleteByHashes(toDelete).catch(e => {
+      _embLog('error', `Failed to persist unmatched removal: ${e && e.message || e}`);
+    });
+  }
   _activity('embedding', 'embedding_unmatched_removed', `Removed ${removed} unmatched embeddings`, {
     removed,
   }, { important: true, tags: ['embedding', 'cleanup'] });

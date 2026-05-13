@@ -13,6 +13,7 @@
  */
 
 import { MusicBridge } from './music-bridge.js';
+import * as EmbeddingDb from './embedding-db.js';
 
 let dataDir = '/storage/emulated/0/MusicPlayerData';
 
@@ -25,22 +26,63 @@ export function setDataDir(dir) {
   dataDir = dir;
 }
 
+/**
+ * Loads the stable embedding store. Order of preference:
+ *   1. SQLite (native, ~200ms for 2500 entries, fastest path)
+ *   2. Legacy binary store .bin + meta.json (read once, then SQLite is
+ *      seeded by EmbeddingDbManager.migrateFromLegacyIfNeeded)
+ *   3. Legacy JSON mirror (fresh install case, or external Colab import)
+ *   4. pending_embeddings.json (merged into whatever loaded above)
+ *
+ * SQLite is the source of truth after the first migration runs. The
+ * .bin/.json files are kept on disk for backward compatibility and as a
+ * disaster-recovery fallback; per-mutation writes no longer touch them.
+ */
 export async function loadFromDisk() {
+  // Tier 1: native SQLite. The on-load migration kicked off in
+  // MusicBridgePlugin.load() may not have completed yet — call it
+  // explicitly to be deterministic, then snapshot.
+  try {
+    await EmbeddingDb.migrateFromLegacy().catch(() => {});
+    const fromDb = await EmbeddingDb.loadAll();
+    if (fromDb) {
+      const pending = await _readEmbeddingsJson(PENDING_JSON);
+      const pendingCount = _countEmbeddings(pending);
+      if (pendingCount > 0) {
+        const merged = _mergeEmbeddingObjects(fromDb, pending);
+        // Pending entries land in the DB authoritatively, then the legacy
+        // pending JSON is cleared.
+        await EmbeddingDb.upsertBatch(_objectToBatch(pending)).catch(() => {});
+        await _clearPending();
+        console.log(`Recovered ${pendingCount} pending embeddings into SQLite store`);
+        return merged;
+      }
+      return fromDb;
+    }
+  } catch (e) {
+    console.log('SQLite embedding load failed, falling back to legacy files:', e.message);
+  }
+
+  // Tier 2-4 — the original file-based path. Used only on first launch after
+  // upgrade (DB not seeded yet for some reason) or full disaster recovery.
   const [stableInfo, legacyInfo, pendingInfo] = await Promise.all([
     _getStableStoreInfo(),
     _getFileInfo(LEGACY_JSON),
     _getFileInfo(PENDING_JSON),
   ]);
 
-  // Fast path for the first JSON import: avoid pulling a large file over the
-  // JS bridge when there is no binary cache yet and no pending app-side work.
   if (!stableInfo.exists && legacyInfo.exists && !pendingInfo.exists) {
     try {
       const convResult = await MusicBridge.convertEmbeddingsJsonToBinary();
       if (convResult.success) {
         console.log(`Native JSON->binary conversion: ${convResult.entries} entries, ${convResult.dim}D`);
         const migrated = await _loadBinaryStore();
-        if (migrated) return migrated;
+        if (migrated) {
+          // Seed SQLite from the freshly-converted binary so the next
+          // launch hits the fast path.
+          try { await EmbeddingDb.migrateFromLegacy(); } catch (e) { /* ignore */ }
+          return migrated;
+        }
       } else {
         console.log('No local_embeddings.json available for native conversion:', convResult.reason);
       }
@@ -73,15 +115,46 @@ export async function loadFromDisk() {
   }
 
   if (changed) {
-    await saveToDisk(merged);
-    if (pendingCount > 0) {
-      await _clearPending();
+    // Persist to SQLite (the new source of truth) — no longer touches the
+    // legacy .bin/.json files on the per-mutation hot path.
+    try {
+      await EmbeddingDb.upsertBatch(_objectToBatch(merged));
+    } catch (e) {
+      // If SQLite write fails, fall back to the legacy file writer so we
+      // do not lose data. Future loads will retry the SQLite path.
+      console.log('SQLite seed-from-legacy failed, writing legacy files:', e.message);
+      await saveToDisk(merged);
     }
+    if (pendingCount > 0) await _clearPending();
     return merged;
   }
 
   if (stable) return stable;
   return null;
+}
+
+// Helper: turn an embedding object (the in-memory shape) into the row
+// list embedding-db.upsertBatch expects.
+function _objectToBatch(embObj) {
+  const out = [];
+  if (!embObj) return out;
+  for (const [key, data] of Object.entries(embObj)) {
+    if (key === '_path_index') continue;
+    if (!data || !_isValidEmbedding(data.embedding)) continue;
+    const emb = data.embedding instanceof Float32Array
+      ? data.embedding
+      : new Float32Array(data.embedding);
+    out.push({
+      contentHash: data.contentHash || data.content_hash || key,
+      filepath: data.filepath || '',
+      filename: data.filename || '',
+      artist: data.artist || '',
+      album: data.album || '',
+      timestamp: data.timestamp || 0,
+      embedding: emb,
+    });
+  }
+  return out;
 }
 
 // In-flight tracker so concurrent saveToDisk calls don't race two tmp files
@@ -90,37 +163,59 @@ export async function loadFromDisk() {
 let _pendingSave = null;
 
 /**
- * Persist the in-memory embedding object to disk:
- *   - `local_embeddings.bin` + `local_embeddings_meta.json` (binary store —
- *     source of truth on subsequent reads)
- *   - `local_embeddings.json` (legacy JSON mirror — user-facing portable
- *     format, also the path the Colab / laptop generators write to and the
- *     fallback import when no binary store exists yet, per AGENTS_1.md +
- *     git_upload/README.md)
+ * Persists the in-memory embedding object.
  *
- * Both writes are awaited together so callers that need on-disk consistency
- * (e.g., the post-batch merge) can `await saveToDisk(...)`. Callers that
- * want UI responsiveness on user-triggered mutations (remove-unmatched,
- * remove-orphans) should NOT await — they can fire-and-forget with
- * `EmbeddingCache.saveToDisk(...).catch(...)` and the UI returns instantly
- * while the encoded payload streams out. Both writes are CPU-cheaper now
- * thanks to setTimeout yields in the inner _writeBinaryStore / _writeLegacyJson
- * (see those functions for the yield points).
+ * Phase 1: this now routes through the native SQLite store
+ * (EmbeddingDb / EmbeddingDbManager). All Float32 encoding, transaction
+ * management, and disk I/O happen on a HandlerThread inside :main — the
+ * JS thread (and the renderer) are never blocked.
  *
- * Concurrent calls are serialized to avoid the .tmp / _replaceFile race.
+ * Callers that mutate a single embedding should NOT call this — they should
+ * use EmbeddingDb.upsertOne / deleteByHashes directly so only the affected
+ * row is touched. This function still works as a bulk-replace fallback for
+ * callers that haven't been migrated yet.
+ *
+ * The legacy `local_embeddings.bin` + `local_embeddings_meta.json` pair is
+ * no longer written on the hot path. `local_embeddings.json` (the Colab /
+ * laptop interchange mirror) is written by EmbeddingDb.exportLegacyMirror,
+ * which app.js calls periodically (e.g., on app pause).
  */
 export async function saveToDisk(embObj) {
   const normalized = _normalizeEmbeddingObject(embObj);
   const prior = _pendingSave || Promise.resolve();
   const current = prior.catch(() => {}).then(async () => {
-    await _writeBinaryStore(normalized);
-    await _writeLegacyJson(normalized);
+    try {
+      await EmbeddingDb.upsertBatch(_objectToBatch(normalized));
+      return;
+    } catch (e) {
+      // SQLite path unavailable (older APK, plugin missing, etc.) — fall
+      // back to the legacy file writers so data is never lost.
+      console.log('SQLite saveToDisk failed, falling back to legacy files:', e.message);
+      await _writeBinaryStore(normalized);
+      await _writeLegacyJson(normalized);
+    }
   });
   _pendingSave = current;
   try {
     await current;
   } finally {
     if (_pendingSave === current) _pendingSave = null;
+  }
+}
+
+/**
+ * Periodic Colab/laptop interchange snapshot of the SQLite store. Runs on
+ * the native worker thread — JS thread is not blocked.
+ *
+ * Call this from app.js whenever the app pauses / backgrounds, NOT on
+ * every embedding mutation.
+ */
+export async function exportLegacyMirror() {
+  try {
+    return await EmbeddingDb.exportLegacyMirror();
+  } catch (e) {
+    console.log('exportLegacyMirror failed:', e.message);
+    return null;
   }
 }
 
@@ -134,12 +229,25 @@ export async function recoverPendingToStable() {
     return false;
   }
 
-  const stable = (await _loadBinaryStore()) || { _path_index: {} };
-  const merged = _mergeEmbeddingObjects(stable, pending);
-  await saveToDisk(merged);
-  await _clearPending();
-  console.log(`Recovered ${pendingCount} pending embeddings into stable store + local_embeddings.json mirror`);
-  return true;
+  // Route the new batch's rows directly into SQLite via a single batched
+  // upsert. The native worker thread handles the Float32 encoding, the JS
+  // thread is not blocked on a full-store rewrite. No legacy .bin/.json
+  // touch on this path anymore.
+  try {
+    const count = await EmbeddingDb.upsertBatch(_objectToBatch(pending));
+    await _clearPending();
+    console.log(`Recovered ${count} pending embeddings into SQLite store`);
+    return true;
+  } catch (e) {
+    // SQLite failed — fall back to legacy file path so we never lose data.
+    console.log('SQLite pending-merge failed, falling back to legacy files:', e.message);
+    const stable = (await _loadBinaryStore()) || { _path_index: {} };
+    const merged = _mergeEmbeddingObjects(stable, pending);
+    await saveToDisk(merged);
+    await _clearPending();
+    console.log(`Recovered ${pendingCount} pending embeddings into stable store + local_embeddings.json mirror`);
+    return true;
+  }
 }
 
 // Fix G: fetch a local file via the WebView's `file://` URL through

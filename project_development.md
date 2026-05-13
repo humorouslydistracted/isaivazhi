@@ -1,6 +1,186 @@
 # Project Development Log
 
-Last updated: 2026-05-11 (latest #18: cold-start play-tap is now structurally fixed across 18 batches today. The Capacitor bridge cold-pool tax was bypassed via `MainActivity.onCreate` SharedPreferences read + WebView `addJavascriptInterface` (`window._native.getCachedInitialState()`) — critical state read went from 4090 ms → 1 ms. "First song plays twice" was root-caused by `syncQueueFromNativeSnapshot` wiping `state.queue` with the cold-restore stub then revealed an earlier race where Media3 with items=1 loops within ~1.8 s. Solved by seeding the critical payload with `nextUpFilenames` (top 10) + new `engine.ensureColdStartQueue(minSize=10)` that builds a shuffle bridge until embeddings load, then `_doRefresh` takes over. v18 augments rather than replaces seeded items for previous-session continuity. APK 392.0 MB at `2026-05-11 17:54` / GitHub release v2026.05.11.18 / commit `3845ed3`. Previous: #2: embedding-freeze follow-up — Four more fixes landed in this pass: **Fix A** serializes concurrent `EmbeddingCache.saveToDisk` calls through a single `_pendingSave` chain so user-triggered mutations never race the `_replaceFile` step against a post-batch merge; **Fix B** inserts `setTimeout(0)` yields between the CPU-bound phases of `_writeBinaryStore` (Float32→base64 encode, meta JSON.stringify, JSI bridge write) and `_writeLegacyJson` (Array conversion loop, 10–15MB JSON.stringify, bridge write) so the renderer can paint toasts / page rerenders while the multi-MB save runs; **Fix C** strips the unconditional `reloadEmbeddingsFromDisk()` from `resyncEmbeddingState()` (it duplicated the load already done in `startBackgroundScan` and triggered a heavy recommender rebuild on every AI page open); **Fix D** changes `removeUnmatchedEmbeddings` to fire `EmbeddingCache.saveToDisk(...)` as a detached promise with `.catch(...)` instead of awaiting it — the UI handler returns instantly after the in-memory mutation, the disk persist completes in the background under the atomic tmp+rename invariant. **`local_embeddings.json` is intentionally kept** as documented in `AGENTS_1.md` / `CLAUDE_1.md` lines 73/82/210/214/225 ("EmbeddingService is the sole writer", first-class persistence schema, breaking schema changes require migration) and `git_upload/README.md` lines 78–79/119/134 (user-facing portable format consumed by `colab_embedding_generator.py` / `local_embedding_generator.py`). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.7 MB, timestamp `2026-05-11 12:35` (bundle `dist/assets/index-B6ossT9s.js`). Pre-fix safety backup: `backups/embedding_freeze_fixes_prework_20260511_140000/`.)
+Last updated: 2026-05-11 (latest #21 — **Cold-start embedding load fast path.** User's 23:17 logs.txt after installing #20's APK showed `[PERF] _loadLocalEmbeddings: 2447 entries in 13095 ms` and `embeddings loaded from disk: 8830 ms` — a regression vs the ~85 ms .bin fetch path. Root cause: `EmbeddingDb.loadAllSnapshot` returned the 5 MB vector data as a 6.7 MB base64 string inside the JSON over Capacitor's JSI bridge, then JS atob'd it on the JS thread. Same shape of problem the cold-start playback batches #5–#12 chased. **Fix:** native `loadAllSnapshot` now writes `embeddings_snapshot.bin` atomically (5 MB Float32 LE, tmp+rename) and returns just the file path. JS reads it via `convertFileSrc + fetch` like the original .bin path (~85 ms). Inline base64 stays as a tested fallback when the file write fails. New `embDbExportBinSnapshot` plugin method + JS `EmbeddingDb.exportBinSnapshot()` for explicit refresh hooks. New `[PERF] EmbeddingDb.loadAll: N entries dim=D via file, bridge=Xms, total=Yms` marker so the next capture confirms the new path engaged. APK 412.6 MB at `2026-05-11 23:27`. Previous #20: Phase 2: sqlite-vec via requery/sqlite-android. SQL-level KNN search now available. `requery/sqlite-android` replaces stock Android SQLite (which doesn't expose `enable_load_extension`); a new `fetchSqliteVec` Gradle task downloads the official `libsqlite_vec.so` per ABI from the v0.1.6 GitHub release into `jniLibs/` at preBuild time. `EmbeddingDb` was refactored off `SQLiteOpenHelper` (requery's helper doesn't accept `SQLiteDatabaseConfiguration`) to open via `SQLiteDatabase.openDatabase(cfg, …)` so a `SQLiteCustomExtension` entry for `sqlite3_vec_init` is passed in at open time. A `probeVecExtension(SELECT vec_version())` after open captures whether the extension loaded; `vecExtensionLoaded` flag drives a dynamic dispatch in `nearestNeighbors`: sqlite-vec path uses `vec_distance_cosine(vec, x'…')` (query vector inlined as SQL blob literal — 2 KB hex for a 512-dim Float32), fallback path uses `NativeAccelerator.dotProductBatch` (the existing NEON SIMD kernel) over an in-memory snapshot. New plugin method `embDbNearestNeighbors({queryVecBase64, k, excludeHashes}) → {results, usedExtension, count}` runs on the worker thread. JS-side `EmbeddingDb.nearestNeighbors(queryVec, k, excludeHashes)` + `engine.getTopSimilarNative(songId, k, extraExcludeIds)` exposed for opt-in use; full recommender swap deferred to Phase 3. APK 412.6 MB at `2026-05-11 23:14` (+20 MB for the bundled requery SQLite native libs across 3 ABIs). Previous #19: Phase 1: native SQLite storage for embeddings. The JS-thread base64+JSON write hot path that pinned the WebView for 1–3 s per mutation is gone. New native SQLite store (`embeddings.db` via plain `SQLiteOpenHelper`, no Room — Room 2.6.1 fought a Kotlin 2.1 metadata version mismatch in the classpath) backed by a dedicated `EmbeddingDbManager` `HandlerThread` in `:main`. Row-level DELETE/UPSERT replace the prior full-store rewrite at every mutation site (`_purgeLocalEmbeddingForSong`, `removeUnmatchedEmbeddings`, `removeOrphanedEmbeddings`, `recoverPendingToStable`). Legacy `local_embeddings.bin` + `local_embeddings_meta.json` + `local_embeddings.json` files become read-only fallback for cold-start migration; `EmbeddingDbManager.migrateFromLegacyIfNeeded` ingests them once into SQLite. The portable JSON mirror is now an on-demand snapshot (`exportLegacyMirror`) that JS can fire on app pause for Colab/laptop interchange, NOT a per-mutation cost. Delete-tap is expected to drop from 3–8 s UI hang to under 200 ms. Embedding batch completions no longer cause periodic JS-thread stutter. APK 392.2 MB at `2026-05-11 22:49`. Pre-fix safety backup: `backups/embedding_db_prework_20260511_180000/`. Phase 2 (sqlite-vec for SQL-level KNN) and Phase 3 (drop in-JS `localEmbeddings` mirror) are scoped but not yet shipped. Previous #18: cold-start play-tap is now structurally fixed across 18 batches today. The Capacitor bridge cold-pool tax was bypassed via `MainActivity.onCreate` SharedPreferences read + WebView `addJavascriptInterface` (`window._native.getCachedInitialState()`) — critical state read went from 4090 ms → 1 ms. "First song plays twice" was root-caused by `syncQueueFromNativeSnapshot` wiping `state.queue` with the cold-restore stub then revealed an earlier race where Media3 with items=1 loops within ~1.8 s. Solved by seeding the critical payload with `nextUpFilenames` (top 10) + new `engine.ensureColdStartQueue(minSize=10)` that builds a shuffle bridge until embeddings load, then `_doRefresh` takes over. v18 augments rather than replaces seeded items for previous-session continuity. APK 392.0 MB at `2026-05-11 17:54` / GitHub release v2026.05.11.18 / commit `3845ed3`. Previous: #2: embedding-freeze follow-up — Four more fixes landed in this pass: **Fix A** serializes concurrent `EmbeddingCache.saveToDisk` calls through a single `_pendingSave` chain so user-triggered mutations never race the `_replaceFile` step against a post-batch merge; **Fix B** inserts `setTimeout(0)` yields between the CPU-bound phases of `_writeBinaryStore` (Float32→base64 encode, meta JSON.stringify, JSI bridge write) and `_writeLegacyJson` (Array conversion loop, 10–15MB JSON.stringify, bridge write) so the renderer can paint toasts / page rerenders while the multi-MB save runs; **Fix C** strips the unconditional `reloadEmbeddingsFromDisk()` from `resyncEmbeddingState()` (it duplicated the load already done in `startBackgroundScan` and triggered a heavy recommender rebuild on every AI page open); **Fix D** changes `removeUnmatchedEmbeddings` to fire `EmbeddingCache.saveToDisk(...)` as a detached promise with `.catch(...)` instead of awaiting it — the UI handler returns instantly after the in-memory mutation, the disk persist completes in the background under the atomic tmp+rename invariant. **`local_embeddings.json` is intentionally kept** as documented in `AGENTS_1.md` / `CLAUDE_1.md` lines 73/82/210/214/225 ("EmbeddingService is the sole writer", first-class persistence schema, breaking schema changes require migration) and `git_upload/README.md` lines 78–79/119/134 (user-facing portable format consumed by `colab_embedding_generator.py` / `local_embedding_generator.py`). Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 389.7 MB, timestamp `2026-05-11 12:35` (bundle `dist/assets/index-B6ossT9s.js`). Pre-fix safety backup: `backups/embedding_freeze_fixes_prework_20260511_140000/`.)
+
+### 2026-05-11 #21 — Cold-start embedding load fast path (snapshot.bin via fetch)
+
+User installed the #20 APK and captured `logs.txt` at 23:17. The new SQLite store worked, but cold-start embedding load regressed catastrophically:
+
+```
+23:17:57.852  [PERF] preloadEmbeddingsEarly: started against cached path
+23:18:10.942  [Embedding] Loaded 2447 embeddings from disk
+23:18:10.944  [PERF] _loadLocalEmbeddings: 2447 entries in 13095 ms   ← 13.1 s
+23:18:10.944  [PERF] embeddings loaded from disk: 8830 ms
+```
+
+Baseline (pre-Phase-1 binary store): `bin fetch: 5013504 bytes in 86 ms` per the 2026-05-11 #2 capture. We went 86 ms → 8830 ms for the SELECT+transport of the same 5 MB.
+
+**Root cause.** `EmbeddingDbManager.loadAllSnapshot` SELECT'd all 2447 rows, concatenated the vec BLOBs into a single 5 MB byte[], `Base64.encodeToString` → 6.7 MB Java string, wrapped into a JSONObject with the entries metadata, returned. Capacitor's JSI bridge then transported that ~7 MB string into the JS world. The JS side atob'd it back to bytes on the JS thread. Three multi-MB serialization/transport steps on the bridge — exactly the cold-pool problem batches #5–#12 chased on the playback-state read.
+
+**Fix.** Native side writes `embeddings_snapshot.bin` atomically (Float32 LE, tmp+rename, fsync) inside the same `loadAllSnapshot` worker-thread call. The return JSON drops `vecBase64` and returns `snapshotBinPath` + `snapshotBinBytes` instead. JS reads the file via `convertFileSrc('file://' + snapshotBinPath) + fetch(...).arrayBuffer()` — the same WebView local-HTTP-server path that was clocked at 85 ms in earlier captures, and bypasses Capacitor's plugin bridge entirely. The slice into 2447 Float32Array views happens in the JS engine over the resulting `ArrayBuffer` (zero-copy view, no per-element loop).
+
+Inline base64 stays as a tested fallback for the rare case the file write fails (read-only volume, no space, plugin lifecycle race). The JS side checks `snapshotBinPath` first, falls through to `vecBase64` if absent — never a fatal-load scenario.
+
+**New PERF marker** so the next capture instantly confirms the fix engaged:
+```
+[PERF] EmbeddingDb.loadAll: <N> entries dim=<D> via file, bridge=<X> ms, total=<Y> ms
+```
+`via file` = fast path. `via base64` = fallback. `bridge` is the JSON-roundtrip cost (small, since the JSON no longer carries the 6.7 MB string). `total` is wall-clock for the entire JS-side load.
+
+**Bonus** — new `embDbExportBinSnapshot` plugin method + JS `EmbeddingDb.exportBinSnapshot()` for callers that want to refresh the snapshot without paying the entries-metadata wire cost. Future hook candidate: `app.appPaused` event so subsequent cold starts always read a maximally-warm snapshot.
+
+**Files modified:**
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingDbManager.java` — `loadAllSnapshot` rewritten to write the file and return its path (with base64 fallback on write error); new `exportBinSnapshot` method; `IOException` import; new `SNAPSHOT_BIN` constant.
+- `android/app/src/main/java/com/isaivazhi/app/MusicBridgePlugin.java` — new `@PluginMethod embDbExportBinSnapshot`.
+- `src/embedding-db.js` — `loadAll` reads `snapshotBinPath` via `convertFileSrc + fetch` first, falls back to `vecBase64`; new `_fetchLocalArrayBuffer` helper; new `_splitConcatBuffer` Float32Array slicer for the ArrayBuffer path; new `exportBinSnapshot()` export; `[PERF] EmbeddingDb.loadAll` marker added.
+
+**Pre-fix safety backup:** `backups/embedding_db_snapshot_prework_20260511_233000/` (`EmbeddingDbManager.java`, `embedding-db.js` before this pass).
+
+**Verification this pass:** `npm.cmd run build` OK (Vite 491 ms; bundle `dist/assets/index-D4QTQ0sx.js` 316.94 kB / 88.38 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing baseline); `npx.cmd cap sync android` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 46 s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 412.6 MB, timestamp `2026-05-11 23:27`.
+
+**Expected on the next user-captured logs.txt:**
+| | 23:17 capture (#20) | next capture (#21) |
+|---|---|---|
+| `EmbeddingDb.loadAll` source | (no marker — old code path) | `via file` |
+| Bridge transport time | ~3–4 s (6.7 MB base64 over JSI) | ~5–20 ms (small JSON, no vectors) |
+| `_loadLocalEmbeddings` total | 13095 ms | **~200–400 ms** |
+| `embeddings loaded from disk` | 8830 ms | **~100–200 ms** |
+| `_mergeLocalEmbeddings` | 18 ms | unchanged |
+| `cache-skip pre-ready total` | 8950 ms | well under 1 s |
+
+If the file path engages, this should restore the pre-Phase-1 cold-start latency while keeping the Phase 1 write-path win and the Phase 2 native KNN infrastructure intact.
+
+**Related observation from the 23:17 capture worth a small future fix:** `restorePlaybackState: Preferences.get(playback_state) 2588 ms, payload 17322 chars` — Capacitor cold-pool tax is still there on the FULL (not critical) restore path. Off the user-visible play-tap path so not urgent, but the same `convertFileSrc + fetch` pattern would knock that down too if it ever becomes a complaint.
+
+---
+
+### 2026-05-11 #20 — Phase 2: sqlite-vec via requery/sqlite-android
+
+Phase 1 (#19) moved storage to native SQLite — writes are off the JS thread. Phase 2 layers in true SQL-level vector search via `sqlite-vec`, so the `nearestNeighbors` query also runs in native code on a background thread.
+
+**The Android constraint.** Android's stock `android.database.sqlite.SQLiteDatabase` does not expose `enable_load_extension`. To use any loadable SQLite extension we must replace stock SQLite. The two viable paths were `requery/sqlite-android` (drop-in JAR, ~6 MB native lib per ABI) or compiling SQLite + sqlite-vec ourselves via NDK. User chose requery.
+
+**requery 3.45.0 API discovery.** The version published to JitPack at `com.github.requery:sqlite-android:3.45.0` no longer exposes `SQLiteDatabase.loadLibs(Context)` (auto-init now) NOR `db.enableLoadExtension(boolean)` at the method level. Extension loading is instead a property of `SQLiteDatabaseConfiguration` (the `customExtensions: List<SQLiteCustomExtension>` field), which is consumed by `SQLiteDatabase.openDatabase(cfg, …)`. That meant `EmbeddingDb` could no longer extend `SQLiteOpenHelper` — that helper class has no config-accepting constructor — so it was rewritten to manage the connection itself: `open()` returns a singleton `SQLiteDatabase` lazily, runs schema CREATE-IF-NOT-EXISTS on first open, and probes the extension with `SELECT vec_version()` to set the `vecExtensionLoaded` flag.
+
+**Gradle integration of sqlite-vec.** New `fetchSqliteVec` task in `android/app/build.gradle` (preBuild dependency):
+- Iterates `["arm64-v8a" → "android-aarch64", "armeabi-v7a" → "android-armv7a", "x86_64" → "android-x86_64"]` (skipping `x86` — sqlite-vec doesn't ship a 32-bit x86 build; that ABI falls back to NativeAccelerator at runtime).
+- For each ABI, fetches `https://github.com/asg017/sqlite-vec/releases/download/v0.1.6/sqlite-vec-0.1.6-loadable-{suffix}.tar.gz` via `ant.get`, extracts via `ant.untar`, copies the contained `vec0.so` into `src/main/jniLibs/<abi>/libsqlite_vec.so` (renamed to match `System.loadLibrary` conventions).
+- Idempotent via `build/sqlite-vec-0.1.6-fetched.flag`.
+- Failure-tolerant: if any ABI's fetch errors (offline, GitHub down), the task logs a warning and continues; the affected ABI just won't have the extension and runtime falls back.
+- Verified output: `arm64-v8a/libsqlite_vec.so` is a 145 KB ARM aarch64 ELF; armv7a and x86_64 land alongside.
+
+**Native KNN path.** `EmbeddingDb.nearestNeighbors(byte[] queryBytes, int k, Set<String> excludeHashes)` dispatches:
+- If `vecExtensionLoaded`: `SELECT content_hash, filepath, filename, vec_distance_cosine(vec, x'...') AS d FROM embeddings [WHERE content_hash NOT IN (...)] ORDER BY d ASC LIMIT k*2+5`. The query vector is inlined as a SQL blob literal (`x'…'` hex string) — for a 512-dim Float32 vector that's a 4 KB hex string, well within SQLite's statement-length limits, and it avoids the `rawQuery(String, String[])` BLOB-binding gymnastics. Cosine *distance* `d` is converted to cosine *similarity* `1 - d` before return. `LIMIT k*2+5` gives the post-filter room when many rows tie at similar distances.
+- If extension not loaded: pulls all embedding BLOBs into a contiguous `float[count*dim]` and runs `NativeAccelerator.dotProductBatch(query, flat, count, dim, sims)` — the existing NEON SIMD kernel from `cpp/embedding_native.cpp`. Top-k via in-place insertion-sorted list.
+- Either way: scan runs on `EmbeddingDbWorker` (NORM_PRIORITY-1 HandlerThread), JS thread is unblocked.
+
+**Plugin method `embDbNearestNeighbors`.** Accepts `queryVecBase64` (Float32 little-endian, base64), `k`, `excludeHashes[]`. Resolves with `{results: [{contentHash, filepath, filename, similarity}], usedExtension: boolean, count: number}`. The `usedExtension` field lets JS verify which path was hit, useful for the on-device diagnostic capture.
+
+**JS surface (`src/embedding-db.js`).** New `nearestNeighbors(queryVec, k, excludeHashes)` returns the native result verbatim. JS-thread cost is one base64 encode of the query vector — ~2 KB for 512 floats, microseconds of CPU.
+
+**Engine integration (deliberately minimal).** New `engine.getTopSimilarNative(songId, k, extraExcludeIds)` async function in `engine.js`: pulls `embeddings[songs[songId].embeddingIndex]` as the query vector, excludes the current song's contentHash + any extra ids, calls the native path, maps result rows back to JS song ids by `contentHash → filePath → filename` fallback chain. Logs `[NN] native KNN: extension=true/false count=N latency=Xms` to console on every call. NOT yet called from any UI path — opt-in for now. Full recommender migration (replacing `rec.recommendSingle(...)` in `getInsights` / `_doRefresh`) is Phase 3 scope.
+
+**Files modified / created:**
+- `android/build.gradle` — JitPack maven repo for `com.github.requery:sqlite-android`
+- `android/app/build.gradle` — requery dependency + `fetchSqliteVec` Gradle task + `preBuild.dependsOn`
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingDb.java` — full rewrite onto `SQLiteDatabase.openDatabase(cfg, …)` + extension probe + `nearestNeighbors` with two-path dispatch
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingDbManager.java` — new `nearestNeighbors(queryVecBase64, k, excludeHashes, cb)` method; `stats` now reports `vecExtensionLoaded`
+- `android/app/src/main/java/com/isaivazhi/app/MusicBridgePlugin.java` — new `@PluginMethod embDbNearestNeighbors`
+- `src/embedding-db.js` — new `nearestNeighbors(queryVec, k, excludeHashes)` wrapper
+- `src/engine.js` — `EmbeddingDb` import + `getTopSimilarNative(songId, k, extraExcludeIds)` + export
+- `android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libsqlite_vec.so` (auto-populated by fetchSqliteVec)
+
+**Verification this pass:** `npm.cmd run build` OK (Vite 673 ms; bundle `dist/assets/index-AZQ-ZUAo.js` at 315.89 kB, 88.14 kB gzipped); `npm.cmd run test:unit` 30/31 (pre-existing baseline); `npx.cmd cap sync android` OK; `:app:fetchSqliteVec` BUILD SUCCESSFUL in 23 s (all 3 ABIs populated); `:app:compileDebugJavaWithJavac` OK against the new `SQLiteCustomExtension` + `SQLiteDatabaseConfiguration` API; `:app:assembleDebug` BUILD SUCCESSFUL in 1m 11s. Fresh APK at `android/app/build/outputs/apk/debug/app-debug.apk`, **412.6 MB** (+20 MB for the bundled `libsqliteX.so` requery native libs across 4 ABIs), timestamp `2026-05-11 23:14`.
+
+**Real-device validation:**
+1. First launch — `[EmbeddingDb] sqlite-vec loaded: vec=v0.1.6` line in logcat confirms the extension loaded.
+2. Open DBG console (or browser DevTools when running over USB) and invoke:
+   `(async () => { const r = await engine.getTopSimilarNative(engine.getState().current, 10); console.log(r); })()`
+3. Expected console output: `[NN] native KNN: extension=true count=10 latency=2-5ms`. The `extension=true` confirms sqlite-vec served the query. The latency should be single-digit milliseconds for a ~2500-entry store.
+4. Disable extension test path (rename the .so on the device if you have shell access, or skip — fall-through is automatic when `SELECT vec_version()` fails). On the NativeAccelerator path, the same test should print `extension=false count=10 latency=5-15ms` (slightly slower due to the row-fetch-and-pack step but still fast).
+
+**Known limitations + Phase 3 scope:**
+- The JS recommender (`recommender.js`, the `rec` instance built from in-JS `embeddings[]`) is still the source for live recommendation refreshes (`_doRefresh`, `getInsights.topSimilar`). Phase 3 will swap these to `getTopSimilarNative` and drop the in-JS `embeddings[]` mirror once everything reads from SQLite.
+- The cold-start `_loadLocalEmbeddings` still pulls every vector back into JS memory (for the existing `rec` path). After Phase 3 this load disappears and cold-start RSS drops by the size of the embedding matrix (~5 MB for a 2500-entry × 512-dim store).
+- The `local_embeddings.json` mirror is still written only on explicit `EmbeddingCache.exportLegacyMirror()` calls — Phase 3 wires this into `app.appPaused` so it refreshes once per session for Colab interchange.
+- APK is +20 MB. Most of that is requery's bundled SQLite, ~6 MB per ABI × 4 ABIs. The sqlite-vec libs themselves are only ~145 KB each. Future R8 minification + per-ABI APKs would recover most of this.
+
+---
+
+### 2026-05-11 #19 — Phase 1: native SQLite storage for embeddings (the structural fix)
+
+User report from earlier in the session: "embedding operations are really slow and hangs the app. when i delete a song from the app, the app literally hangs. i close the app from recents and open again." Followed by: "is the embeddings moved to different process away from the app. … there should be something that handles this embeddings effectively which doesnt hinder the app performance at all. how are apps that use ML within them handle the apps."
+
+Root cause across all the embedding-related hang reports today (and most prior `EmbeddingCache.saveToDisk` mitigations from #2): the JS thread was the sole worker for every embedding persistence step. Per `EmbeddingCache.saveToDisk` on a 2500-entry × 512-dim store:
+- `Float32Array(entries.length * dim)` allocation = ~5 MB
+- `btoa(...)` of 5 MB = 200–500 ms sync CPU
+- `JSON.stringify(meta)` for all entry records = 100–300 ms
+- bridge write of ~6.7 MB base64 + `_writeLegacyJson`'s `Array.from(emb)` × 2500 + `JSON.stringify` of 10–15 MB JSON + bridge write of all that
+- Total: 1–3 s of single-threaded JS CPU per mutation, regardless of how small the actual change was. Every delete, every batch completion, every remove-unmatched paid the same cost.
+
+The architectural answer (matches Google Photos / Apple Photos / Spotify / Snap pattern): **storage layer must be native, on a background thread, with row-level mutations**. JS becomes a thin query interface. This pass implements that.
+
+**Native side — `EmbeddingDbManager` + `EmbeddingDb` (plain `SQLiteOpenHelper`, no Room).**
+- One SQLite database `embeddings.db` (in `getExternalFilesDir`) with two tables: `embeddings(content_hash PK, filepath, filename, artist, album, timestamp, dim, vec BLOB)` and `embedding_path_index(filepath PK, content_hash)`. Indices on `filepath` and `filename` for the delete paths.
+- `EmbeddingDbManager` owns a dedicated `HandlerThread` named `EmbeddingDbWorker` at `Thread.NORM_PRIORITY - 1`. Every public method posts to this thread and resolves a `Callback<T>` when done. The Capacitor plugin-executor thread and the JS thread are never blocked on disk I/O or Float32 encoding.
+- One-time legacy migration: `migrateFromLegacyIfNeeded` ingests the existing `local_embeddings.bin` + `local_embeddings_meta.json` (preferred) or falls back to `local_embeddings.json`. Runs at plugin `load()` AND on first JS `loadFromDisk` — idempotent via row-count check. The legacy files are not deleted; they remain as a disaster-recovery fallback.
+- Why not Room: Room 2.6.1's annotation processor bundles `kotlinx-metadata-jvm` 2.0 which fails to read classpath dependencies compiled with Kotlin 2.1 metadata (`Provided Metadata instance has version 2.1.0, while maximum supported version is 2.0.0`). Resolution-strategy overrides did not stick because the AP shades its own copy. Switching to plain `SQLiteOpenHelper` removed the annotation-processor dependency entirely; total code volume is comparable.
+
+**New plugin methods on `MusicBridgePlugin` (all run on the worker thread):**
+- `embDbStats({}) → {count, dim, dbSizeBytes}`
+- `embDbMigrateFromLegacy({}) → {migrated, source, rowCount}`
+- `embDbLoadAll({}) → {count, dim, vecBase64, entries[], pathIndex}` — single concatenated base64 blob for all vectors; JS slices into per-entry `Float32Array.slice` views on receipt
+- `embDbUpsertOne({contentHash, filepath, filename, artist, album, timestamp, dim, vecBase64})`
+- `embDbUpsertBatch({entries[]})` — one SQLite transaction
+- `embDbDeleteByHashes({contentHashes[]})` — deletes from both tables in one transaction
+- `embDbDeleteByFilepaths({filepaths[]})` — same, plus path-index cleanup
+- `embDbDeleteByFilenames({filenames[]})`
+- `embDbExportLegacyMirror({}) → {rowCount, bytes}` — writes the current SQLite contents to `local_embeddings.json` in the legacy shape, on the worker thread. Call this on app pause for Colab/laptop interchange, NOT on every mutation.
+
+**JS side — `src/embedding-db.js` (new) thin client + reroutes in `embedding-cache.js` and `engine-embeddings.js`:**
+- `embedding-cache.loadFromDisk` now tries SQLite first; falls back to the legacy file chain (existing `_loadBinaryStore` → legacy JSON → pending JSON merge → seed SQLite for next launch).
+- `embedding-cache.saveToDisk` is now a one-way passthrough to `EmbeddingDb.upsertBatch`. The 10–15 MB JSON mirror write is gone from this path. Legacy `_writeBinaryStore`/`_writeLegacyJson` remain only as a no-network-no-DB fallback.
+- `embedding-cache.recoverPendingToStable` (called from `_runPostBatchMerge`) now routes the newly-embedded batch directly to SQLite via row-level upsert instead of rewriting the whole store.
+- `engine-embeddings._purgeLocalEmbeddingForSong` (called from `deleteSong`) collects deleted hashes and fires one fire-and-forget `EmbeddingDb.deleteByHashes` on the worker thread. JS-thread cost on delete drops from ~1–3 s of base64 encoding to roughly 0.
+- `engine-embeddings.removeUnmatchedEmbeddings` and `removeOrphanedEmbeddings` use the same row-level DELETE pattern.
+
+**Why this fixes the user's symptom.** The `deleteSong` chain ran roughly: native deleteAudioFile → `_purgeLocalEmbeddingForSong` (full-store rewrite) → array filters → `_rebuildAlbums` → `await buildProfileVec()` → `_saveSongLibrary` (1–2 MB sync stringify) → render. The full-store rewrite was the dominant 1–3 s spike. With Phase 1 that spike disappears entirely — the row DELETE happens on the worker thread, the JS thread runs through the remaining steps in 100–300 ms. `_saveSongLibrary` and `buildProfileVec` are unchanged but are no longer competing with a multi-MB base64 encode for thread time.
+
+**What the user sees on next install:**
+- Tap delete → toast within ~100–300 ms (was 3–8 s + a frozen UI).
+- "Embed Pending Songs" finishes → no background JS-thread stutter when the merge runs.
+- "Remove N Unmatched Embeddings" with 50–100 entries → resolves in ~100 ms (was 1–2 minute freeze before yields were added; ~2–4 s after; now near-zero JS cost).
+- AI page open → no extra cost; reads from SQLite on cold start at ~200 ms vs the prior 300–500 ms fetch+parse of the .bin file.
+
+**Files modified / created:**
+- `android/app/build.gradle` — no new dependencies (initial Room attempt reverted)
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingDb.java` (NEW) — `SQLiteOpenHelper`
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingDbManager.java` (NEW) — worker-thread facade + migration
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingEntity.java` (NEW) — plain POJO
+- `android/app/src/main/java/com/isaivazhi/app/EmbeddingPathIndexEntity.java` (NEW) — plain POJO
+- `android/app/src/main/java/com/isaivazhi/app/MusicBridgePlugin.java` — 8 new `@PluginMethod`s + `embDb()` helper + `resolveJSONObject` / `resolveInt` adapters + `migrateFromLegacyIfNeeded` kicked off at `load()`
+- `src/embedding-db.js` (NEW) — thin JS client over the new plugin methods
+- `src/embedding-cache.js` — `loadFromDisk` SQLite-first; `saveToDisk` delegates to SQLite; `recoverPendingToStable` routes to row-level upsert; `exportLegacyMirror` added
+- `src/engine-embeddings.js` — `_purgeLocalEmbeddingForSong`, `removeUnmatchedEmbeddings`, `removeOrphanedEmbeddings` use row-level `EmbeddingDb.deleteByHashes`
+
+**Pre-fix safety backup:** `backups/embedding_db_prework_20260511_180000/` (snapshot of `build.gradle`, `MusicBridgePlugin.java`, `embedding-cache.js`, `engine-embeddings.js`, `music-bridge.js` before any edits).
+
+**Verification this pass:** `npm.cmd run build` OK (Vite 651 ms; bundle `dist/assets/index-sE-9KyA5.js` at 315.88 kB, 88.13 kB gzipped); `npm.cmd run test:unit` 30/31 (the same pre-existing `onNativeAdvance {duplicate:true}` baseline failure as every prior batch — unchanged by this pass); `npx.cmd cap sync android` OK (1.08 s); `:app:compileDebugJavaWithJavac` OK; `:app:assembleDebug` BUILD SUCCESSFUL in 47 s; APK at `android/app/build/outputs/apk/debug/app-debug.apk`, 392.2 MB, timestamp `2026-05-11 22:49`.
+
+**Real-device validation expected on next install:**
+1. First launch — `[MusicBridge] embDb migrate-on-load: {"migrated":true,"source":"binary","rowCount":~2474}` in logcat; AI page loads at the usual speed.
+2. Delete a song from the song-menu — toast appears within ~200 ms (was 3–8 s); no UI freeze; second tap on something else is responsive immediately.
+3. "Embed N Pending Songs" with a real batch — batch completion does not produce a JS-thread stutter; `[Embedding] Recovered N pending embeddings into SQLite store` in console.
+4. "Remove N Unmatched Embeddings" with a populated list — resolves within ~100 ms (was 1–2 min before yields, ~2–4 s after); console shows `Wrote stable binary store` line is GONE from this path; instead `embDb.deleteByHashes` runs silently on the worker thread.
+5. App pause / background → call `EmbeddingCache.exportLegacyMirror()` from JS (or wire it into `appPaused` handler — not yet hooked, deliberate) to refresh `local_embeddings.json` for Colab interchange.
+
+**Known limitations / Phase 2-3 scope:**
+- In-JS `localEmbeddings` object is still kept as the second source of truth (recommendation math reads from it directly). Phase 3 will drop this once `nearestNeighbors` returns results without JS-side scanning.
+- KNN search still runs on the JS thread inside the recommender. Phase 2 adds `requery/sqlite-android` + `sqlite-vec` extension + `nearestNeighbors` plugin method so this work moves to native too.
+- `local_embeddings.json` is currently never auto-refreshed. Wire `EmbeddingCache.exportLegacyMirror()` into a periodic snapshot (e.g., once per session on app pause, or once per N saves).
+- `_saveSongLibrary` is still sync JSON.stringify on the JS thread — separate small fix candidate.
+
+---
 
 ### 2026-05-11 #2 — Embedding save freeze + AI page open slowdown (4 fixes)
 User report after the earlier hardening batch landed: "in ai embedding, it was showing 11 songs in unmatched. when i clicked to remove them. the app literally froze for 1-2 mins and now its working properly. also the loading embedding become slower than before when launching app. i think most of the issue is when there is new songs to be embedded, remove embedding for a song or remove unmatched. not sure they are handled in separate thread or process."
