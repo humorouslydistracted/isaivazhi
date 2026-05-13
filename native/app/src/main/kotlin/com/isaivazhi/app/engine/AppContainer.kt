@@ -167,13 +167,31 @@ class AppContainer(private val appContext: Context) {
             appContext.getSharedPreferences("playback_pending_evidence", android.content.Context.MODE_PRIVATE)
                 .edit().clear().apply()
         } catch (_: Throwable) {}
-        toaster.show("Engine reset")
-        // Favorites + Disliked are part of the user's intentional taste —
-        // include them in the reset per the Capacitor parity contract.
-        disliked.clear()
-        // Best-effort favorites clear — FavoritesEngine has no public clear()
-        // helper today, so iterate the current set.
-        for (fn in favorites.favorites.value) favorites.remove(fn)
+
+        // Push #72: PRESERVE favorites + dislikes across reset. They
+        // represent the user's intentional taste signal — not playback
+        // history. Re-apply each manual prior so the taste signal map
+        // gets fresh entries with directScore from the priors (favorite
+        // → +2.0, dislike → -3.0). Without this re-apply, favorites
+        // would have isFavorite=true in FavoritesEngine but no
+        // TasteSignal entry, so they'd show as 0 in the Taste page's
+        // positive list.
+        val favSet = favorites.favorites.value.toSet()
+        val disSet = disliked.disliked.value.toSet()
+        val toReapply = (favSet + disSet)
+        for (fn in toReapply) {
+            taste.applyManualPriorChange(
+                filename = fn,
+                isFavorite = fn in favSet,
+                isDisliked = fn in disSet,
+            )
+        }
+        android.util.Log.i(
+            "AppContainer",
+            "Engine reset: preserved ${favSet.size} favorites + ${disSet.size} dislikes; re-applied priors for ${toReapply.size} songs"
+        )
+
+        toaster.show("Engine reset (favorites + dislikes preserved)")
         // Saved playback state — wipe queue + position so cold restart starts fresh.
         sideEffectScope.launch {
             try { preferences.clear() } catch (t: Throwable) { android.util.Log.w("AppContainer", "preferences.clear failed: ${t.message}") }

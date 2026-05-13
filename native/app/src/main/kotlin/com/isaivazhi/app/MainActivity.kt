@@ -1026,6 +1026,19 @@ private fun AppRoot(container: AppContainer) {
         coroutineScope.launch(Dispatchers.IO) {
             val tapStart = android.os.SystemClock.elapsedRealtime()
             val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
+            // Push #72: Phase-2 AI tail should respect the session+profile
+            // blend, not just the tapped song's neighbors. Capacitor parity.
+            val blendedTriple = runCatching {
+                container.recommender.buildBlendedVec(
+                    currentSongHash = song.contentHash,
+                    sessionListened = container.session.listened.value,
+                    profileVec = cachedProfileVec,
+                    library = songs,
+                    mode = "play",
+                    sessionBias = tuning.sessionBias,
+                )
+            }.getOrNull()
+            val blendedVec = blendedTriple?.first
             val tail: List<Song> = if (recMode && hasEmbeddings) {
                 runCatching {
                     container.recommender.buildPlayQueue(
@@ -1034,6 +1047,7 @@ private fun AppRoot(container: AppContainer) {
                         k = 50,
                         adventurous = tuning.adventurous,
                         hardBlockedFilenames = hardBlockedFilenames,
+                        blendedQueryVec = blendedVec,
                     ).drop(1)   // drop the current song; replaceUpcoming dedupes anyway
                 }.getOrElse {
                     songs.asSequence()
@@ -1688,6 +1702,21 @@ private fun AppRoot(container: AppContainer) {
                                     val byFn = songs.associateBy { it.filename }
                                     val playNextSongs = playNextSet.mapNotNull { byFn[it] }
                                     val excludeFns = playNextSet + mediaId
+                                    // Push #72: AI/Shuffle toggle uses the
+                                    // blended query vec (mode=refresh) so
+                                    // recommendations reflect current+session
+                                    // +profile blend, not just current-song.
+                                    val blendedTriple = runCatching {
+                                        container.recommender.buildBlendedVec(
+                                            currentSongHash = current.contentHash,
+                                            sessionListened = container.session.listened.value,
+                                            profileVec = cachedProfileVec,
+                                            library = songs,
+                                            mode = "refresh",
+                                            sessionBias = tuning.sessionBias,
+                                        )
+                                    }.getOrNull()
+                                    val blendedVec = blendedTriple?.first
                                     val newTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
                                             container.recommender.recommendUpcoming(
@@ -1695,6 +1724,7 @@ private fun AppRoot(container: AppContainer) {
                                                 adventurous = tuning.adventurous,
                                                 extraExcludeFilenames = excludeFns,
                                                 hardBlockedFilenames = hardBlockedFilenames,
+                                                blendedQueryVec = blendedVec,
                                             )
                                         }.getOrDefault(emptyList())
                                     } else {
@@ -1704,7 +1734,7 @@ private fun AppRoot(container: AppContainer) {
                                     val finalUpcoming = playNextSongs + newTail
                                     android.util.Log.i(
                                         "QueueOp",
-                                        "UpNext toggle aiMode=$aiMode: preserved ${playNextSongs.size} Play Next + ${newTail.size} new"
+                                        "UpNext toggle aiMode=$aiMode: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} new"
                                     )
                                     container.playback.replaceUpcoming(
                                         newUpcoming = finalUpcoming,
@@ -1724,10 +1754,26 @@ private fun AppRoot(container: AppContainer) {
                                     // but PRESERVES Play Next songs at the front
                                     // of the new upcoming list. Reset queue
                                     // context to AI_RECOMMENDED.
+                                    // Push #72: use blended query vec with
+                                    // mode="refresh" so recommendations respect
+                                    // current+session+profile blend, not just
+                                    // current-song neighbors. Capacitor parity
+                                    // for `_doRefresh('manual')`.
                                     val playNextSet = playbackState.playNextFilenames
                                     val byFn = songs.associateBy { it.filename }
                                     val playNextSongs = playNextSet.mapNotNull { byFn[it] }
                                     val excludeFns = playNextSet + mediaId
+                                    val blendedTriple = runCatching {
+                                        container.recommender.buildBlendedVec(
+                                            currentSongHash = current.contentHash,
+                                            sessionListened = container.session.listened.value,
+                                            profileVec = cachedProfileVec,
+                                            library = songs,
+                                            mode = "refresh",
+                                            sessionBias = tuning.sessionBias,
+                                        )
+                                    }.getOrNull()
+                                    val blendedVec = blendedTriple?.first
                                     val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
                                             container.recommender.recommendUpcoming(
@@ -1735,16 +1781,18 @@ private fun AppRoot(container: AppContainer) {
                                                 adventurous = tuning.adventurous,
                                                 extraExcludeFilenames = excludeFns,
                                                 hardBlockedFilenames = hardBlockedFilenames,
+                                                blendedQueryVec = blendedVec,
                                             )
                                         }.getOrDefault(emptyList())
                                     } else {
                                         songs.filter { it.filePath != null && it.filename !in excludeFns }
                                             .shuffled().take(50)
                                     }
+                                    container.toaster.show("Up Next refreshed (blend=${blendedTriple?.third ?: "current"})")
                                     val finalUpcoming = playNextSongs + newTail
                                     android.util.Log.i(
                                         "QueueOp",
-                                        "Refresh button: preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
+                                        "Refresh button: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
                                     )
                                     if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
                                         newUpcoming = finalUpcoming,

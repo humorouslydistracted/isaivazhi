@@ -90,6 +90,9 @@ fun TasteScreen(
     var sortDescending by remember { mutableStateOf(true) } // true=Top positive, false=Top negative
     var snapshotExpanded by remember { mutableStateOf(true) }
     var timelineExpanded by remember { mutableStateOf(true) }
+    // Push #72: paginate "Last 30 Playback Signal Updates" — show 10
+    // initially, then Load More bumps by 10 up to the 30 the backend caps at.
+    var timelineVisibleCount by remember { mutableStateOf(10) }
     var showResetConfirm by remember { mutableStateOf(false) }
 
     // Build one row per song in the library. For embedded songs with a
@@ -306,8 +309,27 @@ fun TasteScreen(
                         )
                     }
                 } else {
-                    items(timelineEvents, key = { "ev_${it.timestamp}_${it.filename}" }) { ev ->
+                    // Push #72: only render the first [timelineVisibleCount]
+                    // events. Load More bumps by 10. Copy uses the visible
+                    // subset so the user gets exactly what they see.
+                    val timelineVisible = timelineEvents.take(timelineVisibleCount)
+                    val timelineRemaining = (timelineEvents.size - timelineVisible.size).coerceAtLeast(0)
+                    items(timelineVisible, key = { "ev_${it.timestamp}_${it.filename}" }) { ev ->
                         TimelineEventRow(ev)
+                    }
+                    if (timelineRemaining > 0) {
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                            ) {
+                                TextButton(onClick = {
+                                    timelineVisibleCount = (timelineVisibleCount + 10).coerceAtMost(timelineEvents.size)
+                                }) {
+                                    val nextBatch = minOf(10, timelineRemaining)
+                                    Text("Show $nextBatch more (${timelineRemaining} remaining)")
+                                }
+                            }
+                        }
                     }
                     item {
                         Row(
@@ -316,14 +338,14 @@ fun TasteScreen(
                         ) {
                             TextButton(
                                 onClick = {
-                                    val text = buildTimelineCopyText(timelineEvents)
+                                    val text = buildTimelineCopyText(timelineVisible)
                                     onCopyTimelineText(text)
-                                    copyToClipboard(ctx, "IsaiVazhi Last 30 Signals", text)
+                                    copyToClipboard(ctx, "IsaiVazhi Last ${timelineVisible.size} Signals", text)
                                 },
                             ) {
                                 Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Copy Last 30 Signals")
+                                Text("Copy ${timelineVisible.size} visible signals")
                             }
                         }
                     }

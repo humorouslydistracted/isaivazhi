@@ -534,11 +534,16 @@ class Recommender(
         // Push #63: forwarded into recommendUpcoming.
         extraExcludeFilenames: Set<String> = emptySet(),
         hardBlockedFilenames: Set<String> = emptySet(),
+        // Push #72: optional blended query vector. When non-null, the
+        // recommender ranks against the blend (current + session + profile)
+        // instead of only the current song's neighbors.
+        blendedQueryVec: FloatArray? = null,
     ): List<Song> {
         val recs = recommendUpcoming(
             currentSong, library, k, adventurous,
             extraExcludeFilenames = extraExcludeFilenames,
             hardBlockedFilenames = hardBlockedFilenames,
+            blendedQueryVec = blendedQueryVec,
         )
         val head = listOf(currentSong)
         val tail = if (recs.isNotEmpty()) {

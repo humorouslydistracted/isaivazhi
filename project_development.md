@@ -6,6 +6,58 @@ Pre-Kotlin history (Capacitor + WebView build, pushes #1–#21 plus all earlier 
 
 Each entry below is dated and numbered. Most recent first.
 
+### 2026-05-14 #72 — Timeline pagination + favorites preserved on reset + Refresh uses blended query
+
+Three independent fixes the user requested:
+
+**#1 — Last 30 Playback Signal Updates: pagination.** `TasteScreen.kt` — added `timelineVisibleCount` state (initial 10). Renders `timelineEvents.take(timelineVisibleCount)` rather than the full list. "Show 10 more (N remaining)" button bumps the count by 10 (up to the 30-event backend cap). Copy button label is now "Copy N visible signals" and `buildTimelineCopyText` is called with the visible subset only, so the user gets exactly what's on screen (10 or 20 or 30).
+
+**#2 — Reset Engine preserves favorites + dislikes.** `AppContainer.resetEngine` previously wiped both sets (Capacitor parity). The user pointed out that's the wrong default — favorites/dislikes are intentional manual taste, not playback history, and should survive a reset of session signals. Fix:
+- Removed `disliked.clear()` and the favorites-iteration removal.
+- After `taste.resetAllSignals()` (which empties the signal map), iterate the favorite + dislike sets and call `taste.applyManualPriorChange(filename, isFavorite, isDisliked)` for each. This recreates fresh `TasteSignal` entries with directScore from the manual priors (+2.0 favorite, -3.0 dislike). Favorited songs now appear at the top of the Taste page's positive list immediately after reset.
+- Toast updated to "Engine reset (favorites + dislikes preserved)".
+- Log line: `Engine reset: preserved N favorites + M dislikes; re-applied priors for K songs`.
+
+**#3 — Refresh button + AI/Shuffle toggle + playFromTap Phase-2 all use blended query vec.** Audit found three Up Next entry points were still calling `recommendUpcoming` without `blendedQueryVec`, falling back to current-song-only neighbors and ignoring the session+profile blend. Capacitor parity required mode="refresh" for the Refresh button and mode="play" for taps.
+
+- `Recommender.buildPlayQueue` gained an optional `blendedQueryVec: FloatArray? = null` parameter, forwarded into `recommendUpcoming`.
+- `MainActivity.playFromTap` Phase-2 — builds blended vec with `mode="play"` from the tapped song's hash, current `session.listened.value`, and `cachedProfileVec`. Passes it into `buildPlayQueue`. Songs-tab single-song tap now produces an AI tail that reflects the user's blend.
+- `MainActivity` Up Next Refresh button — same pattern but with `mode="refresh"`. Capacitor's `_doRefresh('manual')` uses flatter blend weights (0.30 current / 0.40 session / 0.30 profile) for explicit refreshes, encoded already in `Recommender.blendWeights("refresh", ...)`. Toast now shows `"Up Next refreshed (blend=session+profile)"` so the user can SEE which blend was applied.
+- `MainActivity` AI/Shuffle toggle — same pattern with `mode="refresh"`.
+
+**Blend mechanism — where it lives and how it works (the user's verification request)**
+
+| Layer | Where | What it does |
+|---|---|---|
+| Weight schedule | `Recommender.blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)` | Returns `BlendWeights(wCurrent, wSession, wProfile)`. Mode "play": current-heavy at session start (wCurrent ≈ 0.50), ramps to balanced as `nListened` grows toward 10 (wSession → 0.52). Mode "refresh": flat 0.30/0.40/0.30 by default. Capacitor parity (`_blendWeights` in `engine.js:653`). |
+| Session bias | Inside `buildBlendedVec` | When both session and profile are present, the user's `sessionBias` knob (0..1) biases the session-vs-profile split: `wSession = (wSession + wProfile) × sessionBias`. Lets the user steer "current mood vs long-term taste". |
+| Vector mix | `Recommender.buildBlendedVec(currentSongHash, sessionListened, profileVec, library, mode, sessionBias)` | Weighted-sums (currentSong embedding × wCurrent) + (avg of recent listened × wSession) + (profileVec × wProfile), then L2-normalizes. Returns Triple(vec, BlendWeights, label like "session+profile" / "current"). |
+| Query path | `Recommender.recommendUpcoming(..., blendedQueryVec)` | When non-null, candidates are ranked via `nearestNeighborsForVector(blendedQueryVec, library, k, exclude)` instead of `nearestNeighborsForFilename(currentSong)`. The recommender sees the blend in its query, not just the current song. |
+
+**Verification that the blend actually shifts:**
+1. Cold start (`nListened=0`) → `wCurrent=1.0` (no session, no profile) → recommendations are pure current-song neighbors.
+2. After a few qualified listens (`nListened=4`) → mode "play" gives `wCurrent≈0.50, wSession≈0.21, wProfile≈0.29` → recommendations start blending in session evidence.
+3. After `nListened≥10` → `wCurrent≈0.38, wSession≈0.52, wProfile=0.10` → recommendations are session-heavy.
+4. Refresh button → mode "refresh" → 0.30/0.40/0.30 → session-heaviest mix.
+5. `sessionBias` slider → final split of session-vs-profile inside their combined budget.
+
+Log lines `[QueueOp] Refresh button: blend=session+profile preserved N Play Next + M AI` confirm at runtime which blend label fired.
+
+**Files affected**
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/TasteScreen.kt` — timeline pagination.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt` — Reset Engine preserves favorites/dislikes + re-applies priors.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/Recommender.kt` — `buildPlayQueue` accepts `blendedQueryVec`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — `playFromTap` Phase-2 + UpNext Refresh + AI/Shuffle toggle all build and pass blended query.
+
+BUILD SUCCESSFUL in 10s. APK at `2026-05-14 00:51`.
+
+**Verification**
+1. **Timeline pagination.** Open Taste page → expand Last 30 Playback Signal Updates. See 10 entries. Click "Show 10 more (N remaining)". See 20. Click again. See 30. The Copy button label changes to "Copy 10 visible signals" / "Copy 20 visible signals" / "Copy 30 visible signals" and copies exactly that many.
+2. **Reset Engine preserves favorites.** Favorite 3 songs. Reset Engine. Open Taste page → "All Embedded" sort by Top Positive. The 3 favorited songs should appear at the top with score +2.00. Logcat: `Engine reset: preserved 3 favorites + 0 dislikes; re-applied priors for 3 songs`.
+3. **Refresh button respects blend.** Play 5+ songs. Open Up Next → tap Refresh. Toast should read "Up Next refreshed (blend=session+profile)" (or similar). Logcat: `[QueueOp] Refresh button: blend=session+profile preserved N Play Next + 50 AI`.
+4. **AI/Shuffle toggle respects blend.** Toggle to AI mode after a few listens. Toast/log shows the blend label.
+5. **playFromTap Phase-2 blend.** Tap a song from Songs tab after a session has built up. The AI tail (visible in Up Next after ~500ms phase-2 build) should reflect the session blend, not just the tapped song's neighbors.
+
 ### 2026-05-14 #71 — Cold-start: skip prepareForResume when service has an active session
 
 **The bug user reported.** Played "Kanne Kanne" through to ~37% in foreground. Backgrounded the app. Used HEADPHONE SKIP to advance the service to subsequent songs. Returned to the app. Activity cold-started and seeked Kanne Kanne back to position ~133s, restarting the song from the middle even though the service had already advanced past it.
