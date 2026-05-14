@@ -3,6 +3,7 @@ package com.isaivazhi.app.engine
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -62,6 +63,7 @@ class SignalTimelineEngine(private val appContext: Context) {
         val sessionSkipsAfter: Int = 0,
         val sessionPositivesBefore: Int = 0,
         val sessionPositivesAfter: Int = 0,
+        val eventId: String = "",
     )
 
     private val KEY = stringPreferencesKey("signal_timeline_v1_json")
@@ -71,6 +73,7 @@ class SignalTimelineEngine(private val appContext: Context) {
     val events: StateFlow<List<Event>> = _events.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
 
     init {
         scope.launch {
@@ -79,8 +82,14 @@ class SignalTimelineEngine(private val appContext: Context) {
                 _events.value = parse(raw)
             } catch (t: Throwable) {
                 android.util.Log.w("SignalTimeline", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun append(event: Event) {
@@ -94,6 +103,10 @@ class SignalTimelineEngine(private val appContext: Context) {
         }
         if (event.filename.isBlank()) {
             android.util.Log.w("SignalTimeline", "  dropped: blank filename")
+            return
+        }
+        if (event.eventId.isNotBlank() && _events.value.any { it.eventId == event.eventId }) {
+            android.util.Log.i("SignalTimeline", "  skipped duplicate eventId=${event.eventId}")
             return
         }
         // Push #65: removed the "<10% skip" noise filter. It was inherited
@@ -110,6 +123,44 @@ class SignalTimelineEngine(private val appContext: Context) {
     fun clear() {
         _events.value = emptyList()
         scope.launch { persist() }
+    }
+
+    /**
+     * Push #76: one-time scan that removes the pre-#74 historical
+     * duplicate pairs (same filename + same fraction + same timestamp,
+     * one tagged `background_recovery_task_removed` and the other
+     * `background_recovery_datastore`). These appear in the user's
+     * timeline because the cold-start LE drained both DataStore and SP
+     * pending-evidence stores independently before push #74's dedup
+     * landed. Returns the number of duplicate entries removed.
+     */
+    fun cleanLegacyDuplicates(): Int {
+        val before = _events.value
+        if (before.isEmpty()) return 0
+        // Group by (filename, timestamp-rounded-to-5sec, fraction-rounded-to-1pct).
+        // Within each group, if multiple events exist where one has source
+        // ending in "_task_removed" or "_datastore" (the bug's pairing),
+        // keep the first and drop the rest.
+        val seen = HashMap<String, Int>()  // key → index of first occurrence
+        val toRemove = HashSet<Int>()
+        for ((idx, e) in before.withIndex()) {
+            val srcRoot = when {
+                e.source.endsWith("_task_removed") -> "_recovery_legacy"
+                e.source.endsWith("_datastore") -> "_recovery_legacy"
+                else -> e.source
+            }
+            val key = "${e.filename}|${e.timestamp / 5000L}|${(e.fraction * 100).toInt()}|$srcRoot"
+            val firstIdx = seen[key]
+            if (firstIdx == null) {
+                seen[key] = idx
+            } else {
+                toRemove += idx
+            }
+        }
+        if (toRemove.isEmpty()) return 0
+        _events.value = before.filterIndexed { i, _ -> i !in toRemove }
+        scope.launch { persist() }
+        return toRemove.size
     }
 
     fun snapshotCopyText(): String = events.value.mapIndexed { idx, e ->
@@ -159,6 +210,7 @@ class SignalTimelineEngine(private val appContext: Context) {
                 o.put("sessionSkipsAfter", e.sessionSkipsAfter)
                 o.put("sessionPositivesBefore", e.sessionPositivesBefore)
                 o.put("sessionPositivesAfter", e.sessionPositivesAfter)
+                if (e.eventId.isNotBlank()) o.put("eventId", e.eventId)
                 arr.put(o)
             }
             appContext.dataStoreLocal.edit { it[KEY] = JSONObject().put("events", arr).toString() }
@@ -217,6 +269,7 @@ class SignalTimelineEngine(private val appContext: Context) {
                 sessionSkipsAfter = o.optInt("sessionSkipsAfter", 0),
                 sessionPositivesBefore = o.optInt("sessionPositivesBefore", 0),
                 sessionPositivesAfter = o.optInt("sessionPositivesAfter", 0),
+                eventId = o.optString("eventId", ""),
             )
         }
         return out

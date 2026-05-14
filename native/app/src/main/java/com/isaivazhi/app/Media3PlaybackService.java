@@ -59,6 +59,11 @@ public class Media3PlaybackService extends MediaSessionService {
     private static final String RECOVERY_PREFS_NAME = "playback_recovery_v1";
     private static final String RECOVERY_TRANSITIONS_KEY = "recent_transitions";
     private static final int MAX_RECOVERY_TRANSITIONS = 24;
+    private static final String SIGNAL_LEDGER_PREFS_NAME = "playback_signal_ledger_v1";
+    private static final String SIGNAL_LEDGER_EVENTS_KEY = "events_json";
+    private static final int MAX_SIGNAL_LEDGER_EVENTS = 200;
+    private static final String ACCUMULATOR_PREFS_NAME = "playback_accumulator_v1";
+    private static final long ACCUMULATOR_PERSIST_INTERVAL_MS = 5000L;
     private static final String CAPACITOR_STORAGE_PREFS = "CapacitorStorage";
     private static final String PREF_KEY_PLAYBACK_STATE = "playback_state";
     private static final String PREF_KEY_FAVORITES = "favorites";
@@ -90,6 +95,7 @@ public class Media3PlaybackService extends MediaSessionService {
     private long lastProgressSampleMs = -1L;
     private long lastKnownPositionMs = 0L;
     private long lastKnownDurationMs = 0L;
+    private long lastAccumulatorPersistAtMs = 0L;
     // Captured BEFORE resetPlayedProgress in onMediaItemTransition so the
     // Kotlin PlaybackEngine can read the prev song's true played-ms after
     // the service has already reset its accumulator. Read via the public
@@ -98,6 +104,15 @@ public class Media3PlaybackService extends MediaSessionService {
     private volatile long lastTransitionPrevPlayedMs = 0L;
     private volatile long lastTransitionPrevDurationMs = 0L;
     private volatile long lastTransitionAtMs = 0L;
+    // Push #76: snapshot the PREV song's playbackInstanceId (the song that
+    // just ENDED) at transition time. Kotlin's onMediaItemTransition needs
+    // this for its watermark and dedup paths — getCurrentPlaybackInstanceId
+    // returns the NEW song's id by the time Kotlin's listener fires
+    // (because the service bumps currentPlaybackInstanceId immediately
+    // after capturing the snapshot at line ~354), which was inflating the
+    // watermark to the new song's id and causing legitimate buffer
+    // entries (keyed on prev id) to fail the > watermark filter.
+    private volatile long lastTransitionPrevPlaybackInstanceId = 0L;
     private boolean playbackCompletedState = false;
     private boolean suppressNextTransitionEvent = false;
     // 2026-05-11 #19: track last emitted play-state so we can dedupe and avoid
@@ -107,6 +122,10 @@ public class Media3PlaybackService extends MediaSessionService {
     private String displayTitle = "";
     private String displayArtist = "";
     private String displayAlbum = "";
+    private String lastKnownMediaId = "";
+    private String lastKnownTitle = "";
+    private String lastKnownArtist = "";
+    private String lastKnownAlbum = "";
 
     @Override
     public void onCreate() {
@@ -203,10 +222,12 @@ public class Media3PlaybackService extends MediaSessionService {
                         ArrayList<PlaybackQueueItem> items = PlaybackQueueItem.fromCommandBundle(safeArgs);
                         int startIndex = safeArgs.getInt(PlaybackCommandContract.KEY_START_INDEX, 0);
                         long seekToMs = safeArgs.getLong(PlaybackCommandContract.KEY_SEEK_TO_MS, 0L);
+                        boolean playWhenReady = safeArgs.getBoolean(PlaybackCommandContract.KEY_PLAY_WHEN_READY, true);
                         Log.i(TAG, "CMD_SET_QUEUE items=" + items.size()
                                 + " startIndex=" + startIndex
+                                + " playWhenReady=" + playWhenReady
                                 + " first=" + summarizePath(items.isEmpty() ? "" : items.get(0).filePath));
-                        setQueue(items, startIndex, seekToMs);
+                        setQueue(items, startIndex, seekToMs, playWhenReady);
                         return success();
                     }
                     case PlaybackCommandContract.CMD_PLAY_AUDIO: {
@@ -341,9 +362,7 @@ public class Media3PlaybackService extends MediaSessionService {
             // truth moved from PlaybackEngine's poll-tick accumulator
             // (which dies with the Activity) to the service (durable
             // across Activity destruction / Doze).
-            lastTransitionPrevPlayedMs = snapshot.prevPlayedMs;
-            lastTransitionPrevDurationMs = snapshot.prevDurationMs;
-            lastTransitionAtMs = System.currentTimeMillis();
+            stashLastTransitionSnapshot(snapshot);
             // Push #66: record the transition into a rolling buffer so
             // cold-start reconciliation can correlate a pending listen
             // snapshot against an authoritative native transition. The
@@ -402,6 +421,10 @@ public class Media3PlaybackService extends MediaSessionService {
     }
 
     private void setQueue(List<PlaybackQueueItem> items, int startIndex, long seekToMs) {
+        setQueue(items, startIndex, seekToMs, true);
+    }
+
+    private void setQueue(List<PlaybackQueueItem> items, int startIndex, long seekToMs, boolean playWhenReady) {
         synchronized (queueLock) {
             queue = new ArrayList<>(items != null ? items : new ArrayList<>());
             if (queue.isEmpty()) {
@@ -420,6 +443,10 @@ public class Media3PlaybackService extends MediaSessionService {
                 displayTitle = "";
                 displayArtist = "";
                 displayAlbum = "";
+                lastKnownMediaId = "";
+                lastKnownTitle = "";
+                lastKnownArtist = "";
+                lastKnownAlbum = "";
                 refreshNotificationUiState();
                 emitQueueChanged();
                 return;
@@ -431,6 +458,7 @@ public class Media3PlaybackService extends MediaSessionService {
             playbackCompletedState = false;
             suppressUpcomingTransition(currentIndex);
             PlaybackQueueItem startItem = queue.get(currentIndex);
+            rememberKnownItem(startItem);
             // 2026-05-11 #15: log first 5 ids of the queue for end-to-end trace.
             StringBuilder ids = new StringBuilder();
             for (int i = 0; i < Math.min(5, queue.size()); i++) {
@@ -440,13 +468,18 @@ public class Media3PlaybackService extends MediaSessionService {
             Log.i(TAG, "setQueue: starting index=" + currentIndex
                     + " size=" + queue.size()
                     + " seekMs=" + Math.max(0L, seekToMs)
+                    + " playWhenReady=" + playWhenReady
                     + " firstIds=[" + ids + "]"
                     + " file=" + summarizePath(startItem.filePath));
 
             player.setMediaItems(PlaybackQueueItem.toMediaItems(queue), currentIndex, Math.max(0L, seekToMs));
             applyLoopMode();
             player.prepare();
-            player.play();
+            if (playWhenReady) {
+                player.play();
+            } else {
+                player.pause();
+            }
             refreshNotificationUiState();
             emitQueueChanged();
         }
@@ -474,14 +507,24 @@ public class Media3PlaybackService extends MediaSessionService {
                 return;
             }
 
+            PlaybackQueueItem current = queue.get(currentIndex);
             ArrayList<PlaybackQueueItem> rebuilt = new ArrayList<>();
-            for (int i = 0; i <= currentIndex && i < queue.size(); i++) rebuilt.add(queue.get(i));
+            rebuilt.add(current);
             if (items != null) rebuilt.addAll(items);
             queue = rebuilt;
 
-            int fromIndex = Math.min(currentIndex + 1, player.getMediaItemCount());
-            int toIndex = player.getMediaItemCount();
-            player.replaceMediaItems(fromIndex, toIndex, PlaybackQueueItem.toMediaItems(items));
+            int oldIndex = currentIndex;
+            int total = player.getMediaItemCount();
+            if (oldIndex + 1 < total) {
+                player.removeMediaItems(oldIndex + 1, total);
+            }
+            if (oldIndex > 0) {
+                player.removeMediaItems(0, oldIndex);
+            }
+            currentIndex = 0;
+            if (items != null && !items.isEmpty()) {
+                player.addMediaItems(1, PlaybackQueueItem.toMediaItems(items));
+            }
             // Log final queue state after the rebuild.
             StringBuilder finalIds = new StringBuilder();
             for (int i = 0; i < Math.min(5, queue.size()); i++) {
@@ -491,7 +534,7 @@ public class Media3PlaybackService extends MediaSessionService {
             Log.i(TAG, "replaceUpcoming: after rebuild queueSize=" + queue.size()
                     + " currentIndex=" + currentIndex
                     + " firstIds=[" + finalIds + "]"
-                    + " replaceMediaItems(from=" + fromIndex + ", to=" + toIndex + ")");
+                    + " normalizedFromIndex=" + oldIndex + ")");
             emitQueueChanged();
         }
     }
@@ -660,7 +703,9 @@ public class Media3PlaybackService extends MediaSessionService {
     private void emitAudioTimeUpdate() {
         long positionMs = currentPositionMs();
         long durationMs = currentDurationMs();
+        updateLastKnownMediaSnapshot();
         noteProgressSample(positionMs);
+        persistAccumulatorSnapshot(false);
 
         Bundle bundle = new Bundle();
         bundle.putDouble("position", positionMs / 1000.0);
@@ -689,6 +734,7 @@ public class Media3PlaybackService extends MediaSessionService {
     }
 
     private void emitCurrentChanged(TransitionSnapshot snapshot) {
+        stashLastTransitionSnapshot(snapshot);
         Bundle data = new Bundle();
         data.putString("action", snapshot.action);
         data.putInt("prevIndex", snapshot.prevIndex);
@@ -710,6 +756,7 @@ public class Media3PlaybackService extends MediaSessionService {
         data.putInt("queueLength", queue.size());
         PlaybackQueueItem currentItem = currentItem();
         if (currentItem != null) {
+            rememberKnownItem(currentItem);
             data.putInt("songId", currentItem.songId);
             data.putString("filePath", currentItem.filePath);
             data.putString("title", currentItem.title);
@@ -717,9 +764,18 @@ public class Media3PlaybackService extends MediaSessionService {
             data.putString("album", currentItem.album);
         }
 
+        rememberPlaybackSignalEvent(snapshot);
         rememberTransition(snapshot, currentItem);
         refreshNotificationUiState();
         emitCustomCommandToControllers(PlaybackCommandContract.EVT_QUEUE_CURRENT_CHANGED, data);
+    }
+
+    private void stashLastTransitionSnapshot(TransitionSnapshot snapshot) {
+        if (snapshot == null) return;
+        lastTransitionPrevPlayedMs = snapshot.prevPlayedMs;
+        lastTransitionPrevDurationMs = snapshot.prevDurationMs;
+        lastTransitionPrevPlaybackInstanceId = snapshot.prevPlaybackInstanceId;
+        lastTransitionAtMs = System.currentTimeMillis();
     }
 
     private Bundle buildAudioStateBundle() {
@@ -833,6 +889,7 @@ public class Media3PlaybackService extends MediaSessionService {
         lastProgressSampleMs = Math.max(0L, initialPositionMs);
         lastKnownPositionMs = Math.max(0L, initialPositionMs);
         lastKnownDurationMs = currentDurationMs();
+        lastAccumulatorPersistAtMs = 0L;
     }
 
     /**
@@ -858,6 +915,15 @@ public class Media3PlaybackService extends MediaSessionService {
      *  was captured. PlaybackEngine uses this to decide whether the
      *  snapshot belongs to the transition it's currently handling. */
     public long getLastTransitionAtMs() { return lastTransitionAtMs; }
+
+    /** Push #76: prev song's playbackInstanceId from the last transition.
+     *  Kotlin PlaybackEngine reads this for watermark + dedup so it tracks
+     *  the song that just ENDED (the one whose listen is being recorded),
+     *  not the new song that started (which getCurrentPlaybackInstanceId
+     *  returns by the time Kotlin's onMediaItemTransition fires). */
+    public long getLastTransitionPrevPlaybackInstanceId() {
+        return lastTransitionPrevPlaybackInstanceId;
+    }
 
     /** Public so Kotlin can read duration without going through the
      *  MediaController for every fraction calculation. */
@@ -887,12 +953,17 @@ public class Media3PlaybackService extends MediaSessionService {
      *  empty string if no item is loaded. Used by MainActivity.onPause to
      *  identify which song the to-be-flushed accumulator belongs to. */
     public String getCurrentMediaIdSnapshot() {
+        PlaybackQueueItem item = currentItem();
+        if (item != null) {
+            String filename = item.fileName();
+            if (!filename.isEmpty()) return filename;
+        }
         if (player == null) return "";
         try {
             androidx.media3.common.MediaItem mi = player.getCurrentMediaItem();
             if (mi == null) return "";
             String id = mi.mediaId;
-            return id == null ? "" : id;
+            return normalizeMediaId(id);
         } catch (Throwable t) {
             return "";
         }
@@ -980,6 +1051,7 @@ public class Media3PlaybackService extends MediaSessionService {
     @Override
     public void onTaskRemoved(android.content.Intent rootIntent) {
         try {
+            persistAccumulatorSnapshot(true);
             long played = getAccumulatedPlayedMsSnapshot();
             long dur = getCurrentDurationMsSnapshot();
             String mediaId = getCurrentMediaIdSnapshot();
@@ -1033,6 +1105,48 @@ public class Media3PlaybackService extends MediaSessionService {
             if (currentIndex < 0 || currentIndex >= queue.size()) return null;
             return queue.get(currentIndex);
         }
+    }
+
+    private void rememberKnownItem(PlaybackQueueItem item) {
+        if (item == null) return;
+        lastKnownMediaId = item.fileName();
+        lastKnownTitle = item.title;
+        lastKnownArtist = item.artist;
+        lastKnownAlbum = item.album;
+    }
+
+    private void updateLastKnownMediaSnapshot() {
+        if (player == null) return;
+        try {
+            MediaItem mediaItem = player.getCurrentMediaItem();
+            if (mediaItem == null || mediaItem.mediaId == null || mediaItem.mediaId.isEmpty()) return;
+            MediaMetadata metadata = mediaItem.mediaMetadata;
+            lastKnownMediaId = normalizeMediaId(mediaItem.mediaId);
+            lastKnownTitle = metadata.title != null ? metadata.title.toString() : "";
+            lastKnownArtist = metadata.artist != null ? metadata.artist.toString() : "";
+            lastKnownAlbum = metadata.albumTitle != null ? metadata.albumTitle.toString() : "";
+        } catch (Throwable ignore) { }
+    }
+
+    private boolean matchesLastKnownMedia(PlaybackQueueItem item) {
+        if (lastKnownMediaId == null || lastKnownMediaId.isEmpty()) return true;
+        if (item == null) return false;
+        String filename = item.fileName();
+        return lastKnownMediaId.equals(filename)
+                || lastKnownMediaId.equals(item.filePath)
+                || lastKnownMediaId.equals(item.mediaId());
+    }
+
+    @Nullable
+    private PlaybackQueueItem lastKnownPlaybackItem() {
+        if (lastKnownMediaId == null || lastKnownMediaId.isEmpty()) return null;
+        return new PlaybackQueueItem(
+                -1,
+                lastKnownMediaId,
+                lastKnownTitle != null ? lastKnownTitle : "",
+                lastKnownArtist != null ? lastKnownArtist : "",
+                lastKnownAlbum != null ? lastKnownAlbum : ""
+        );
     }
 
     private String currentItemPath() {
@@ -1093,6 +1207,10 @@ public class Media3PlaybackService extends MediaSessionService {
         displayTitle = "";
         displayArtist = "";
         displayAlbum = "";
+        lastKnownMediaId = "";
+        lastKnownTitle = "";
+        lastKnownArtist = "";
+        lastKnownAlbum = "";
         refreshNotificationUiState();
         if (clearQueueEvent) {
             emitQueueChanged();
@@ -1315,20 +1433,138 @@ public class Media3PlaybackService extends MediaSessionService {
 
     private TransitionSnapshot captureTransitionSnapshot(String action, float prevFractionOverride) {
         PlaybackQueueItem prevItem = currentItem();
+        if (!matchesLastKnownMedia(prevItem)) {
+            PlaybackQueueItem fallbackItem = lastKnownPlaybackItem();
+            if (fallbackItem != null) {
+                Log.i(TAG, "captureTransitionSnapshot: using last-known media fallback prev="
+                        + summarizePath(fallbackItem.filePath)
+                        + " queued=" + summarizePath(prevItem != null ? prevItem.filePath : ""));
+                prevItem = fallbackItem;
+            }
+        }
         float prevFraction = prevFractionOverride >= 0f ? prevFractionOverride : computePrevFraction();
+        long prevPlayed = getAccumulatedPlayedMsSnapshot();
+        long prevDuration = currentDurationMs();
+        long recoveredPlayed = recoverPlayedMsFromAccumulatorSnapshot(prevPlayed, prevDuration);
+        if (recoveredPlayed > prevPlayed) {
+            prevPlayed = recoveredPlayed;
+            prevFraction = prevDuration > 0L
+                    ? Math.max(0f, Math.min(1f, (float) prevPlayed / (float) prevDuration))
+                    : prevFraction;
+        }
         return new TransitionSnapshot(
                 action,
                 currentIndex,
                 prevFraction,
-                getAccumulatedPlayedMsSnapshot(),
-                currentDurationMs(),
+                prevPlayed,
+                prevDuration,
                 currentPlaybackInstanceId,
                 prevItem
         );
     }
 
+    private void persistAccumulatorSnapshot(boolean force) {
+        try {
+            long now = System.currentTimeMillis();
+            if (!force && lastAccumulatorPersistAtMs > 0L
+                    && now - lastAccumulatorPersistAtMs < ACCUMULATOR_PERSIST_INTERVAL_MS) {
+                return;
+            }
+            String mediaId = getCurrentMediaIdSnapshot();
+            if (mediaId.isEmpty()) return;
+            long duration = currentDurationMs();
+            long played = getAccumulatedPlayedMsSnapshot();
+            long position = currentPositionMs();
+            getSharedPreferences(ACCUMULATOR_PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString("mediaId", mediaId)
+                    .putLong("playbackInstanceId", currentPlaybackInstanceId)
+                    .putLong("playedMs", played)
+                    .putLong("durationMs", duration)
+                    .putLong("positionMs", position)
+                    .putLong("capturedAtMs", now)
+                    .apply();
+            lastAccumulatorPersistAtMs = now;
+        } catch (Throwable t) {
+            Log.w(TAG, "persistAccumulatorSnapshot failed: " + t.getMessage());
+        }
+    }
+
+    private long recoverPlayedMsFromAccumulatorSnapshot(long currentPlayed, long currentDuration) {
+        if (currentPlayed >= 1000L || currentDuration <= 0L) return currentPlayed;
+        try {
+            SharedPreferences prefs = getSharedPreferences(ACCUMULATOR_PREFS_NAME, MODE_PRIVATE);
+            String mediaId = getCurrentMediaIdSnapshot();
+            String savedMediaId = prefs.getString("mediaId", "");
+            if (mediaId.isEmpty() || savedMediaId == null || !mediaId.equals(savedMediaId)) return currentPlayed;
+            long savedPlayed = prefs.getLong("playedMs", 0L);
+            long savedDuration = prefs.getLong("durationMs", 0L);
+            long savedPosition = prefs.getLong("positionMs", 0L);
+            long capturedAt = prefs.getLong("capturedAtMs", 0L);
+            long now = System.currentTimeMillis();
+            long currentPosition = currentPositionMs();
+            boolean recent = capturedAt > 0L && now - capturedAt < 30L * 60L * 1000L;
+            boolean sameInstance = prefs.getLong("playbackInstanceId", 0L) == currentPlaybackInstanceId;
+            boolean plausiblePosition = savedPosition <= currentPosition + 15000L;
+            boolean plausibleDuration = savedDuration <= 0L || Math.abs(savedDuration - currentDuration) < 15000L;
+            if (savedPlayed > currentPlayed && recent && plausibleDuration && (sameInstance || plausiblePosition)) {
+                Log.i(TAG, "recoverPlayedMsFromAccumulatorSnapshot: " + currentPlayed + "ms -> " + savedPlayed + "ms for " + mediaId);
+                return Math.min(savedPlayed, currentDuration);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "recoverPlayedMsFromAccumulatorSnapshot failed: " + t.getMessage());
+        }
+        return currentPlayed;
+    }
+
     private SharedPreferences getRecoveryPrefs() {
         return getSharedPreferences(RECOVERY_PREFS_NAME, MODE_PRIVATE);
+    }
+
+    private void rememberPlaybackSignalEvent(TransitionSnapshot snapshot) {
+        if (snapshot == null || snapshot.prevPlaybackInstanceId <= 0L) return;
+        if (snapshot.prevItem == null || snapshot.prevPlayedMs < 1000L || snapshot.prevDurationMs <= 0L) return;
+        try {
+            String eventId = "signal_" + snapshot.prevPlaybackInstanceId;
+            SharedPreferences prefs = getSharedPreferences(SIGNAL_LEDGER_PREFS_NAME, MODE_PRIVATE);
+            String raw = prefs.getString(SIGNAL_LEDGER_EVENTS_KEY, null);
+            JSONArray arr = raw != null && !raw.isEmpty() ? new JSONArray(raw) : new JSONArray();
+
+            JSONArray deduped = new JSONArray();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject existing = arr.optJSONObject(i);
+                if (existing == null) continue;
+                if (eventId.equals(existing.optString("eventId", ""))) continue;
+                deduped.put(existing);
+            }
+
+            JSONObject event = new JSONObject();
+            event.put("eventId", eventId);
+            event.put("timestamp", System.currentTimeMillis());
+            event.put("action", snapshot.action != null ? snapshot.action : "");
+            event.put("prevIndex", snapshot.prevIndex);
+            event.put("prevFraction", snapshot.prevFraction);
+            event.put("prevPlayedMs", snapshot.prevPlayedMs);
+            event.put("prevDurationMs", snapshot.prevDurationMs);
+            event.put("prevPlaybackInstanceId", snapshot.prevPlaybackInstanceId);
+            event.put("currentPlaybackInstanceId", currentPlaybackInstanceId);
+            event.put("prevSongId", snapshot.prevItem.songId);
+            event.put("prevFilePath", snapshot.prevItem.filePath);
+            event.put("prevFilename", summarizePath(snapshot.prevItem.filePath));
+            event.put("prevTitle", snapshot.prevItem.title);
+            event.put("prevArtist", snapshot.prevItem.artist);
+            event.put("prevAlbum", snapshot.prevItem.album);
+            deduped.put(event);
+
+            JSONArray trimmed = new JSONArray();
+            int start = Math.max(0, deduped.length() - MAX_SIGNAL_LEDGER_EVENTS);
+            for (int i = start; i < deduped.length(); i++) {
+                trimmed.put(deduped.getJSONObject(i));
+            }
+            prefs.edit().putString(SIGNAL_LEDGER_EVENTS_KEY, trimmed.toString()).commit();
+        } catch (Exception e) {
+            Log.w(TAG, "rememberPlaybackSignalEvent failed", e);
+        }
     }
 
     private void rememberTransition(TransitionSnapshot snapshot, @Nullable PlaybackQueueItem currentItem) {
@@ -1381,6 +1617,8 @@ public class Media3PlaybackService extends MediaSessionService {
     private void rememberStopTransition(String action) {
         if (currentPlaybackInstanceId <= 0L) return;
         TransitionSnapshot snapshot = captureTransitionSnapshot(action, -1f);
+        stashLastTransitionSnapshot(snapshot);
+        rememberPlaybackSignalEvent(snapshot);
         rememberTransition(snapshot, null);
     }
 
@@ -1398,6 +1636,10 @@ public class Media3PlaybackService extends MediaSessionService {
         accumulatedPlayedMs = 0L;
         currentPlaybackInstanceId = 0L;
         lastProgressSampleMs = -1L;
+        lastKnownMediaId = "";
+        lastKnownTitle = "";
+        lastKnownArtist = "";
+        lastKnownAlbum = "";
         refreshNotificationUiState();
         emitPlayStateIfChanged(false);
     }
@@ -1406,6 +1648,17 @@ public class Media3PlaybackService extends MediaSessionService {
         if (filePath == null || filePath.isEmpty()) return "(none)";
         int slash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
         return slash >= 0 ? filePath.substring(slash + 1) : filePath;
+    }
+
+    private String normalizeMediaId(String mediaId) {
+        if (mediaId == null || mediaId.isEmpty()) return "";
+        String value = mediaId;
+        int marker = value.indexOf("::");
+        if (marker >= 0 && marker + 2 < value.length()) {
+            value = value.substring(marker + 2);
+        }
+        String filename = summarizePath(value);
+        return "(none)".equals(filename) ? "" : filename;
     }
 
     private ListenableFuture<SessionResult> success() {

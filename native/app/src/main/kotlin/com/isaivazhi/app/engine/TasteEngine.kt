@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -12,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -173,6 +175,7 @@ class TasteEngine(private val appContext: Context) {
 
         // Decoration ranking window (engine-taste.js:644-660).
         private const val TOP_RANK_LIMIT = 30
+        private const val MAX_PROCESSED_EVENT_IDS = 1000
     }
 
     private val KEY_ADV = floatPreferencesKey("taste_adventurous")
@@ -180,6 +183,7 @@ class TasteEngine(private val appContext: Context) {
     private val KEY_SES = floatPreferencesKey("taste_session_bias")
     private val KEY_FAM_LEGACY = floatPreferencesKey("taste_familiarity")
     private val KEY_SIGNALS = stringPreferencesKey("taste_signals_v1_json")
+    private val KEY_PROCESSED_EVENT_IDS = stringPreferencesKey("taste_processed_playback_event_ids_v1_json")
 
     private val _tuning = MutableStateFlow(Tuning())
     val tuning: StateFlow<Tuning> = _tuning.asStateFlow()
@@ -224,6 +228,8 @@ class TasteEngine(private val appContext: Context) {
     @Volatile var neighborLookup: (suspend (filename: String, k: Int) -> List<String>)? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
+    private var processedPlaybackEventIds: Set<String> = emptySet()
 
     init {
         scope.launch {
@@ -236,11 +242,18 @@ class TasteEngine(private val appContext: Context) {
                     negativeStrength = data[KEY_NEG] ?: DEFAULT_NEGATIVE_STRENGTH,
                 )
                 data[KEY_SIGNALS]?.let { _signals.value = parseSignals(it) }
+                data[KEY_PROCESSED_EVENT_IDS]?.let { processedPlaybackEventIds = parseEventIds(it) }
                 refreshDecorated()
             } catch (t: Throwable) {
                 android.util.Log.w("TasteEngine", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun setAdventurous(value: Float) {
@@ -282,8 +295,16 @@ class TasteEngine(private val appContext: Context) {
         fraction: Float,
         source: String,
         playbackInstanceId: Long = 0L,
+        eventId: String = "",
     ): Pair<TasteSignal, TasteSignal> {
         val before = signalFor(filename)
+        if (eventId.isNotBlank() && eventId in processedPlaybackEventIds) {
+            android.util.Log.i(
+                "TasteEngine",
+                "recordPlaybackEvent skipped fn=$filename src=$source: duplicate eventId=$eventId"
+            )
+            return before to before
+        }
         // Push #66 dedupe: if this is the same playbackInstanceId we just
         // recorded, the caller is re-firing for a transition we already
         // captured. No-op.
@@ -377,6 +398,9 @@ class TasteEngine(private val appContext: Context) {
 
         _signals.value = _signals.value + (filename to after)
         if (playbackInstanceId > 0L) lastCapturedPlaybackInstanceId = playbackInstanceId
+        if (eventId.isNotBlank()) {
+            processedPlaybackEventIds = (processedPlaybackEventIds + eventId).takeLastIds(MAX_PROCESSED_EVENT_IDS)
+        }
         scope.launch { persistSignals() }
         refreshDecorated()
         return before to after
@@ -580,6 +604,7 @@ class TasteEngine(private val appContext: Context) {
     /** Clears every per-song signal — paired with Reset Engine. */
     fun resetAllSignals() {
         _signals.value = emptyMap()
+        processedPlaybackEventIds = emptySet()
         scope.launch { persistSignals() }
         refreshDecorated()
     }
@@ -762,7 +787,10 @@ class TasteEngine(private val appContext: Context) {
                     put("similarityBoostUpdatedAt", s.similarityBoostUpdatedAt)
                 })
             }
-            appContext.dataStoreLocal.edit { it[KEY_SIGNALS] = root.toString() }
+            appContext.dataStoreLocal.edit {
+                it[KEY_SIGNALS] = root.toString()
+                it[KEY_PROCESSED_EVENT_IDS] = eventIdsJson(processedPlaybackEventIds)
+            }
         } catch (t: Throwable) {
             android.util.Log.w("TasteEngine", "persistSignals failed: ${t.message}")
         }
@@ -799,6 +827,32 @@ class TasteEngine(private val appContext: Context) {
             android.util.Log.w("TasteEngine", "parseSignals failed: ${t.message}")
             emptyMap()
         }
+    }
+
+    private fun parseEventIds(raw: String): Set<String> {
+        return try {
+            val arr = JSONArray(raw)
+            buildSet {
+                for (i in 0 until arr.length()) {
+                    val id = arr.optString(i, "")
+                    if (id.isNotBlank()) add(id)
+                }
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("TasteEngine", "parseEventIds failed: ${t.message}")
+            emptySet()
+        }
+    }
+
+    private fun eventIdsJson(ids: Set<String>): String {
+        val arr = JSONArray()
+        for (id in ids.takeLastIds(MAX_PROCESSED_EVENT_IDS)) arr.put(id)
+        return arr.toString()
+    }
+
+    private fun Set<String>.takeLastIds(limit: Int): Set<String> {
+        if (size <= limit) return this
+        return toList().takeLast(limit).toSet()
     }
 }
 

@@ -3,6 +3,7 @@ package com.isaivazhi.app.engine
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,6 +33,7 @@ class HistoryEngine(private val appContext: Context) {
         val filename: String,
         val startedAt: Long,
         val fractionPlayed: Float,
+        val eventId: String = "",
     )
 
     data class Stats(
@@ -51,6 +53,7 @@ class HistoryEngine(private val appContext: Context) {
     val stats: StateFlow<Map<String, Stats>> = _stats.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
 
     private var pendingStartFilename: String? = null
     private var pendingStartAt: Long = 0L
@@ -63,8 +66,14 @@ class HistoryEngine(private val appContext: Context) {
                 data[KEY_STATS]?.let { _stats.value = parseStats(it) }
             } catch (t: Throwable) {
                 android.util.Log.w("HistoryEngine", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun recordStart(filename: String) {
@@ -88,12 +97,37 @@ class HistoryEngine(private val appContext: Context) {
         val ev = Event(filename, pendingStartAt, frac)
         pendingStartFilename = null
         pendingStartAt = 0L
+        appendEventAndUpdateStats(ev, frac)
+    }
 
+    /**
+     * Push #75: authoritative end-of-listen record that BYPASSES the
+     * pendingStartFilename guard. Used by cold-start ingest paths
+     * (drainTransitionsBuffer, ingestPendingEvidence, reconcilePending)
+     * where the listen happened on the service while the Activity was dead
+     * or before the Activity attached its transition listener — so
+     * pendingStartFilename was never set. Without this, an entire morning
+     * of background listening would not show up in Recently Played
+     * (the symptom Elay Keechan exposed: played ~76%, skip-next captured,
+     * but Recently Played stayed empty because recordEnd was rejected).
+     */
+    fun recordCompleted(filename: String, startedAt: Long, fractionPlayed: Float, eventId: String = "") {
+        if (filename.isBlank()) return
+        val frac = fractionPlayed.coerceIn(0f, 1f)
+        val ev = Event(filename, if (startedAt > 0L) startedAt else System.currentTimeMillis(), frac, eventId)
+        appendEventAndUpdateStats(ev, frac)
+    }
+
+    private fun appendEventAndUpdateStats(ev: Event, frac: Float) {
+        if (ev.eventId.isNotBlank() && _events.value.any { it.eventId == ev.eventId }) {
+            android.util.Log.i("HistoryEngine", "record skipped duplicate eventId=${ev.eventId}")
+            return
+        }
         val nextEvents = (listOf(ev) + _events.value).take(MAX_EVENTS)
         _events.value = nextEvents
 
-        val prev = _stats.value[filename] ?: Stats()
-        val nextStats = _stats.value + (filename to Stats(
+        val prev = _stats.value[ev.filename] ?: Stats()
+        val nextStats = _stats.value + (ev.filename to Stats(
             plays = prev.plays + 1,
             lastPlayedAt = ev.startedAt,
             // Running average — same formula as the JS app for parity.
@@ -127,6 +161,7 @@ class HistoryEngine(private val appContext: Context) {
                 o.put("filename", e.filename)
                 o.put("startedAt", e.startedAt)
                 o.put("fractionPlayed", e.fractionPlayed.toDouble())
+                if (e.eventId.isNotBlank()) o.put("eventId", e.eventId)
                 ea.put(o)
             }
             val so = JSONObject()
@@ -156,6 +191,7 @@ class HistoryEngine(private val appContext: Context) {
                 filename = o.optString("filename", ""),
                 startedAt = o.optLong("startedAt", 0L),
                 fractionPlayed = o.optDouble("fractionPlayed", 0.0).toFloat(),
+                eventId = o.optString("eventId", ""),
             )
         }
         return out

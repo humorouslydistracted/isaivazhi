@@ -49,6 +49,20 @@ class AppPreferences(private val appContext: Context) {
         // instead of waiting for the LE to recompute.
         val PROFILE_VEC_JSON = stringPreferencesKey("profile_vec_v1_json")
         val PROFILE_VEC_FINGERPRINT = stringPreferencesKey("profile_vec_fingerprint_v1")
+        // Push #74: monotonic watermark on the highest playbackInstanceId
+        // already credited to TasteEngine. Used by cold-start replay of the
+        // service transitions buffer to skip entries already captured live
+        // (by PlaybackEngine.onMediaItemTransition) and by snapshot
+        // reconciliation to skip events covered by the buffer drain.
+        val LAST_INGESTED_PLAYBACK_INSTANCE_ID = longPreferencesKey("last_ingested_playback_instance_id")
+        // Push #76: one-time migration flag. Push #74/#75 bumped this
+        // watermark with the NEW song's instId (a bug fixed in #76 by
+        // reading lastTransitionPrevPlaybackInstanceId from the service);
+        // on devices that ran #74/#75 the watermark sits at the wrong
+        // (too-high) value and silently blocks every legitimate buffer
+        // replay. Clearing it once on the first #76 boot lets the
+        // accumulated background auto-advance entries flow through.
+        val MIGRATION_V76_WATERMARK_RESET = booleanPreferencesKey("migration_v76_watermark_reset")
     }
 
     val recMode: kotlinx.coroutines.flow.Flow<Boolean> =
@@ -182,6 +196,44 @@ class AppPreferences(private val appContext: Context) {
         return PendingEvidence(id, played, dur, instId)
     }
 
+    /**
+     * Push #74: read the highest playbackInstanceId already credited to the
+     * taste engine. Returns 0L when no listen has been recorded yet.
+     */
+    suspend fun loadIngestWatermark(): Long {
+        return appContext.dataStore.data.first()[Keys.LAST_INGESTED_PLAYBACK_INSTANCE_ID] ?: 0L
+    }
+
+    /**
+     * Push #74: monotonically bump the watermark. Writes only when
+     * `instanceId` exceeds the stored value, preventing a stale cold-start
+     * replay from overwriting a fresher live transition's watermark.
+     */
+    suspend fun saveIngestWatermark(instanceId: Long) {
+        if (instanceId <= 0L) return
+        appContext.dataStore.edit { prefs ->
+            val current = prefs[Keys.LAST_INGESTED_PLAYBACK_INSTANCE_ID] ?: 0L
+            if (instanceId > current) prefs[Keys.LAST_INGESTED_PLAYBACK_INSTANCE_ID] = instanceId
+        }
+    }
+
+    /**
+     * Push #76: one-shot watermark reset. Returns true if the migration ran
+     * (so the cold-start LE can log it), false if it was already done.
+     * Clears LAST_INGESTED_PLAYBACK_INSTANCE_ID so drainTransitionsBuffer
+     * can finally process the buffer entries that #74/#75's inflated
+     * watermark was silently filtering out.
+     */
+    suspend fun runV76WatermarkResetIfNeeded(): Boolean {
+        val prefs = appContext.dataStore.data.first()
+        if (prefs[Keys.MIGRATION_V76_WATERMARK_RESET] == true) return false
+        appContext.dataStore.edit { p ->
+            p.remove(Keys.LAST_INGESTED_PLAYBACK_INSTANCE_ID)
+            p[Keys.MIGRATION_V76_WATERMARK_RESET] = true
+        }
+        return true
+    }
+
     /** Wipes saved current-song + queue. Used by AppContainer.resetEngine(). */
     suspend fun clear() {
         appContext.dataStore.edit { prefs ->
@@ -195,6 +247,7 @@ class AppPreferences(private val appContext: Context) {
             prefs.remove(Keys.PENDING_EVIDENCE_INSTANCE_ID)
             prefs.remove(Keys.PROFILE_VEC_JSON)
             prefs.remove(Keys.PROFILE_VEC_FINGERPRINT)
+            prefs.remove(Keys.LAST_INGESTED_PLAYBACK_INSTANCE_ID)
         }
     }
 }

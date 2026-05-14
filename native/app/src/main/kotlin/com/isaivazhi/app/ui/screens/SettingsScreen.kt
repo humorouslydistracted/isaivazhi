@@ -46,6 +46,7 @@ fun SettingsScreen(
     onEmbedAllNow: () -> Unit,
     onRescanLibrary: () -> Unit,
     onClearArtCache: () -> Unit,
+    onOpenActivityLog: (() -> Unit)? = null,
 ) {
     Box(
         modifier = Modifier
@@ -103,6 +104,13 @@ fun SettingsScreen(
                 subtitle = "Re-extracts art on next view.",
                 onClick = onClearArtCache,
             )
+            if (onOpenActivityLog != null) {
+                ActionRow(
+                    title = "Activity Log",
+                    subtitle = "Last 200 playback/taste/notification events with timestamps.",
+                    onClick = onOpenActivityLog,
+                )
+            }
         }
     }
 }

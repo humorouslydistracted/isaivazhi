@@ -1,10 +1,335 @@
 # Project Development Log
 
+### 2026-05-14 #82 - Normalize service-command media ids back to filenames
+
+User shared `logs.txt` after #81. The core ledger fix is confirmed:
+- `LEDGER_STATE` before drain showed `ledgerRawCount:1`, `pendingCount:2`, and `newestFilename:"Vettrikkodi Kattu.opus"`.
+- `LEDGER_DRAIN` processed pending events (`events:2`, `applied:1`, `skipped:1`).
+- A durable `LEDGER Vettrikkodi Kattu - 72% via auto_advance` entry was applied.
+
+**Remaining gap found in the same log**
+Routing playback through the service command path made Media3 expose `PlaybackQueueItem.mediaId()` (`songId::fullPath`) to Kotlin `Player.Listener` events. Foreground `PLAY`, `FLUSH`, and `SKIP` logs therefore used ids such as `2350::/storage/emulated/0/songs_downloaded/Vettrikkodi Kattu.opus`, while ledger events used the app's canonical filename (`Vettrikkodi Kattu.opus`). That would create duplicate Taste/History/Favorites keys for the same song.
+
+**Changes**
+- `PlaybackQueueItem.toMediaItem()` now sets Media3 `mediaId` to `fileName()` so controller callbacks use the same canonical key as the Kotlin app.
+- `Media3PlaybackService.getCurrentMediaIdSnapshot()` now returns the service queue item's filename first, and normalizes legacy `songId::path` ids when falling back to `player.currentMediaItem`.
+- `Media3PlaybackService.updateLastKnownMediaSnapshot()` stores normalized filenames, not raw Media3 ids.
+- `PlaybackEngine` now normalizes any raw controller media ids in `onMediaItemTransition()` and `syncStateFromController()` before updating state or recording Taste/History/SignalTimeline events.
+
+**Files modified**
+- `native/app/src/main/java/com/isaivazhi/app/PlaybackQueueItem.java`
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt`
+
+**Build:** `./gradlew.bat :app:assembleDebug` from `native/` BUILD SUCCESSFUL in 7s. APK at `native/app/build/outputs/apk/debug/app-debug.apk`, size 341,936,921 bytes, timestamp `2026-05-14 17:55`.
+
+### 2026-05-14 #81 - Route Kotlin playback through service queue commands
+
+User shared updated `logs.txt` with `LEDGER_STATE` payloads. The diagnostics showed:
+- `ledgerRawCount:0` on every checkpoint, so the new dedicated playback ledger was never receiving events.
+- `recoveryRawCount:24` and `transitionRawCount:24`, so the service was seeing transition moments.
+- `newestFilename:""` on the newest legacy transition event, so Kotlin's ledger parser filtered every legacy event as non-actionable (`pendingCount:0`, `processedIdCount:0`).
+- Foreground Activity log still showed `SKIP ... via auto_advance` with `origin:"service"`, proving the Activity-side observer could read service played-ms snapshots when the Activity was alive, but the durable service-authored path was incomplete.
+
+**Root cause**
+Kotlin `PlaybackEngine.playQueue()` and `prepareForResume()` were calling `MediaController.setMediaItems(...)` directly. That makes ExoPlayer play the right media ids, but it bypasses `Media3PlaybackService.CMD_SET_QUEUE`, leaving the service's internal `queue/currentIndex` empty or stale. `captureTransitionSnapshot()` therefore had `prevItem == null`; `rememberPlaybackSignalEvent()` refused to write the dedicated ledger, and legacy transition buffers were written without `prevFilename`.
+
+**Changes**
+- Added `KEY_PLAY_WHEN_READY` to `PlaybackCommandContract`.
+- `Media3PlaybackService.CMD_SET_QUEUE` now accepts `playWhenReady`; `setQueue(..., playWhenReady=false)` prepares without starting playback for cold-start resume.
+- Kotlin `PlaybackEngine` now sends JSON queue payloads through service custom commands for:
+  - main queue load / play (`CMD_SET_QUEUE`),
+  - cold-start prepare (`CMD_SET_QUEUE` with `playWhenReady=false`),
+  - next / previous / play-index,
+  - append-to-queue / play-next / replace-upcoming,
+  - repeat mode and notification refresh.
+- `Media3PlaybackService.replaceUpcoming()` now normalizes the native queue to `[current, ...newUpcoming]` so service queue order matches Kotlin's visible Up Next model.
+- `Media3PlaybackService` now keeps a last-known media snapshot from playback ticks and uses it as a defensive fallback when transition capture finds an empty/stale service queue item, preventing `prevFilename` from being blank.
+
+**Files modified**
+- `native/app/src/main/java/com/isaivazhi/app/PlaybackCommandContract.java`
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt`
+
+**Build:** `./gradlew.bat :app:assembleDebug` from `native/` BUILD SUCCESSFUL in 15s. APK at `native/app/build/outputs/apk/debug/app-debug.apk`, size 341,936,598 bytes, timestamp `2026-05-14 17:47`.
+
+**Expected next-log validation:** after installing this build and playing through a locked/background transition, `LEDGER_STATE` should show `ledgerRawCount > 0` or at minimum a non-empty `newestFilename` from transition/recovery buffers. `LEDGER_DRAIN` should process events instead of always logging `events:0`.
+
+### 2026-05-14 #80 - Activity Log export includes diagnostic payloads
+
+User shared a new `logs.txt` after #79. The file showed the new `LEDGER_STATE` checkpoint rows, but the copied Activity Log lines only contained the summary text. The detailed `data` payload (`serviceMediaId`, `serviceInstId`, `pendingCount`, raw ledger/recovery/transition counts, newest ledger event metadata) was stored in `ActivityLogEngine.Entry.data` but dropped by `ActivityLogScreen.formatLine()`. This made `logs.txt` insufficient for diagnosing whether a locked-phone transition was missed by the service, missed by ledger persistence, or filtered by the processor.
+
+**Changes**
+- `ActivityLogScreen.formatLine()` now appends `| data={...}` for entries with JSON payloads, so Settings -> Activity Log -> Copy all exports the full diagnostic state.
+- `ActivityLogEngine.log()` now includes the same payload in Android logcat lines, so raw `adb logcat` captures also contain the details.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/ActivityLogScreen.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/ActivityLogEngine.kt`
+
+**Build:** `./gradlew.bat :app:assembleDebug` from `native/` BUILD SUCCESSFUL in 5s. APK at `native/app/build/outputs/apk/debug/app-debug.apk`, size 342,239,432 bytes, timestamp `2026-05-14 17:32`.
+
+**Current log finding before this fix:** latest `logs.txt` shows `SKIP Vaadiamma - 19% via auto_advance` at `17:26:16`, followed by `PLAY/PAUSE Vai Raja Vai`. That means at least one auto-advance capture path is now firing, but the copied file did not include enough payload to confirm whether it came from the service ledger or foreground playback observer.
+
 Active build: **Kotlin + Jetpack Compose** rewrite at `native/`. Application id `com.isaivazhi.app.kt`. Started 2026-05-11 push #22 — see entry below.
 
 Pre-Kotlin history (Capacitor + WebView build, pushes #1–#21 plus all earlier architectural specs, Engine split campaign, GPU stack, etc.) is archived in [`capasitor_legacy.md`](capasitor_legacy.md).
 
 Each entry below is dated and numbered. Most recent first.
+
+### 2026-05-14 #79 — Ledger state diagnostics for locked-phone transition debugging
+
+User shared `logs.txt` after a locked-phone song-change test. The in-app log showed `LEDGER_DRAIN — No pending playback ledger events`, but no `LEDGER`, `LISTEN`, or `SKIP` for the locked-phone transition. It also showed `RECON_B Kovakkara Kiliye.opus — deferred (still playing)`, which means Kotlin believed the same service playback instance was still active when the app returned. The current Activity Log did not expose enough service/ledger state to distinguish "service never transitioned" from "service transitioned but ledger write failed" from "processor filtered the event."
+
+**Changes**
+- Added `PlaybackSignalLedger.Diagnostics` and `diagnostics()` reporting:
+  - raw `playback_signal_ledger_v1` count,
+  - raw `playback_recovery_v1/recent_transitions` count,
+  - raw `playback_transitions_history` count,
+  - processed-event-id count,
+  - pending event count after dedupe/filter,
+  - newest event id/filename/action/instance id.
+- Added top-level `logLedgerState(container, reason)` in `MainActivity.kt`.
+- Activity Log now records `LEDGER_STATE` before/after cold-start drain and before/after foreground-resume drain. Payload includes:
+  - service alive/mediaId/instanceId/position/duration/playedMs,
+  - ledger/recovery/transition raw counts,
+  - pending count and newest event metadata.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackSignalLedger.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt`
+
+**Build:** `./gradlew.bat :app:assembleDebug` from `native/` BUILD SUCCESSFUL in 10s. APK at `native/app/build/outputs/apk/debug/app-debug.apk`, size 341,935,007 bytes, timestamp `2026-05-14 17:23`.
+
+**Verification**
+1. Install APK and reproduce locked-phone/background transition.
+2. Open Settings -> Activity Log.
+3. Expand `LEDGER_STATE` rows. If `serviceMediaId` remains the old song and `serviceInstId` unchanged, the service did not transition. If transition/recovery/ledger raw counts increase but `pendingCount=0`, the processor filtered or marked it processed. If all raw counts stay unchanged despite a song change, service transition persistence is not firing.
+
+### 2026-05-14 #78 — Ledger diagnostics visible + foreground-resume drain
+
+User installed the #77 build and reported no `LEDGER_DRAIN` / `LEDGER` entries were visible in Settings -> Activity Log. This exposed two practical issues in the diagnostics/recovery path:
+- `PlaybackSignalProcessor.processPending()` returned silently when the ledger had zero pending events, so a healthy-but-empty ledger was indistinguishable from the processor not running.
+- The ledger processor was only invoked from the cold-start `LaunchedEffect(songs)` path. If the process stayed alive while the app backgrounded and then foregrounded, pending service-authored ledger events would not drain immediately on return.
+
+**Changes**
+- `PlaybackSignalProcessor.processPending(..., logWhenEmpty = true)` now logs `LEDGER_DRAIN` with message `No pending playback ledger events` when requested and the ledger is empty.
+- `MainActivity.AppRoot` now installs a lifecycle `ON_RESUME` observer and calls `container.playbackSignalProcessor.processPending(songs, reason = "foreground_resume", logWhenEmpty = true)` whenever the app returns to foreground with a scanned library.
+- Cold-start ledger processing also passes `logWhenEmpty = true`, so every install/open has an observable Activity Log checkpoint.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackSignalProcessor.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt`
+
+**Build:** `./gradlew.bat :app:assembleDebug` from `native/` BUILD SUCCESSFUL in 38s. APK at `native/app/build/outputs/apk/debug/app-debug.apk`, size 341,932,954 bytes, timestamp `2026-05-14 17:12`.
+
+**Verification**
+1. Install the APK and open the app.
+2. Go to Settings -> Activity Log -> Engine filter or All.
+3. You should now see `LEDGER_DRAIN` even if no pending events exist. If message says `No pending playback ledger events`, the processor ran and found nothing to apply.
+4. Background playback through a transition, reopen the app, and check for `LEDGER_DRAIN` with `applied > 0` plus `LEDGER` entries.
+
+### 2026-05-14 #77 — Service-authored playback signal ledger + engine-load ordering + notification favorite reconciliation
+
+User confirmed latest #76 APK was installed and all four issues still persisted: missing Taste Signal/Recently Played entries, duplicates, notification heart desync, and the 0%-despite-prior-FLUSH class of capture failure. Re-read the Kotlin rewrite against the Capacitor backup and found this was no longer just a single bug: signal capture was still architecturally split across Activity-scoped Kotlin engines, service-side recovery buffers, DataStore async loads, SharedPreferences, and IPC.
+
+**Root gaps addressed**
+- `PlaybackEngine`/`MainActivity` were still effectively responsible for applying playback signals. When Activity state was dead or cold-start DataStore loads raced recovery, service playback could be missed or overwritten.
+- `TasteEngine`, `SignalTimelineEngine`, `HistoryEngine`, `ActivityLogEngine`, and `FavoritesEngine` loaded DataStore asynchronously, while cold-start recovery wrote immediately. A late async load could replace freshly recovered in-memory state with stale disk state.
+- There were two service transition buffers (`playback_transitions_history` and `playback_recovery_v1/recent_transitions`) and Kotlin only drained one as a primary path.
+- Notification heart state still had split-brain storage: service notification used `CapacitorStorage` SharedPreferences, Kotlin UI used `FavoritesEngine` DataStore.
+- Service accumulator was still volatile. If the accumulator was wiped while ExoPlayer still had a valid position, transition capture could record 0%.
+
+**Tier 1 — durable service-authored playback signal ledger** (`PlaybackSignalLedger.kt`, `PlaybackSignalProcessor.kt`, `Media3PlaybackService.java`).
+- New `playback_signal_ledger_v1` SharedPreferences ledger. The service writes a compact event whenever a playback instance ends: `eventId`, `prevPlaybackInstanceId`, filename/title/artist/album, played/duration/fraction, action, timestamp.
+- `Media3PlaybackService.emitCurrentChanged()` now calls `rememberPlaybackSignalEvent(snapshot)` before emitting controller state, so auto-advance, user jump, skip, and queue transitions get a durable signal event independent of Activity lifetime.
+- `rememberStopTransition()` also writes the ledger event so queue-end and notification-dismiss style endings are not only in the older recovery buffer.
+- New `PlaybackSignalLedger` reads the new ledger and also imports both legacy transition buffers, deduping all sources by stable `eventId = signal_<playbackInstanceId>`.
+- New `PlaybackSignalProcessor.processPending()` applies pending service-authored events after engine state is ready, writes Taste, SignalTimeline, History, ActivityLog, saves the ingest watermark synchronously, and marks processed event ids.
+
+**Tier 2 — idempotent engine-level processing** (`TasteEngine.kt`, `SignalTimelineEngine.kt`, `HistoryEngine.kt`).
+- `TasteEngine.recordPlaybackEvent()` now accepts optional `eventId` and persists a rolling processed-event-id set with the signals. Duplicate event ids become no-ops even across restarts.
+- `SignalTimelineEngine.Event` gained `eventId`; append skips duplicates by event id.
+- `HistoryEngine.Event` gained `eventId`; `recordCompleted()` skips duplicates by event id.
+
+**Tier 3 — startup ordering fix** (`MainActivity.kt`, engine classes).
+- Added `awaitReady()` readiness gates to Taste, SignalTimeline, History, ActivityLog, and Favorites.
+- Cold-start recovery now waits for all relevant engines to finish DataStore load before migration cleanup, ledger processing, old buffer drain, snapshot reconciliation, and notification favorite reconciliation. This removes the stale-load-overwrites-fresh-recovery race.
+
+**Tier 4 — notification favorite reconciliation** (`FavoritesEngine.kt`, `AppContainer.kt`, `MainActivity.kt`).
+- `FavoritesEngine.replaceAllFromExternal()` lets startup reconcile service-side notification favorite storage into Kotlin state.
+- `AppContainer.reconcileNotificationFavoriteStorage()` reads `CapacitorStorage.favorites` and aligns `FavoritesEngine`; if service storage is missing, it mirrors Kotlin favorites back to service storage and refreshes the notification.
+- Cold start calls this after favorites are loaded, so notification taps made while the Activity/controller path was not reliable are no longer dependent only on live `EVT_MEDIA_ACTION` IPC.
+
+**Tier 5 — accumulator hardening for 0% transition captures** (`Media3PlaybackService.java`).
+- Service now persists accumulator snapshots every ~5 seconds while emitting time updates and forces a snapshot on `onTaskRemoved`.
+- `captureTransitionSnapshot()` now recovers played-ms from the persisted accumulator snapshot if the in-memory accumulator is near zero but the saved snapshot matches the current media and is recent/plausible.
+- `stashLastTransitionSnapshot(snapshot)` centralizes the `lastTransitionPrev*` fields and is called from both Media3 listener transitions and service-driven `emitCurrentChanged()` paths.
+
+**Files modified/created**
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java`
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/ActivityLogEngine.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/FavoritesEngine.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/HistoryEngine.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/SignalTimelineEngine.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/TasteEngine.kt`
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackSignalLedger.kt` (new)
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackSignalProcessor.kt` (new)
+
+**Build:** `./gradlew.bat :app:assembleDebug` from `native/` BUILD SUCCESSFUL. APK at `native/app/build/outputs/apk/debug/app-debug.apk`, size 341,672,458 bytes, timestamp `2026-05-14 17:04`.
+
+**Verification after install**
+1. Open app after install. Activity Log should show `LEDGER_DRAIN` if any pending service-authored/legacy transitions were applied.
+2. Play 2-3 songs with the app backgrounded/phone idle, then reopen. Taste Signal and Recently Played should show the completed songs without relying on Activity-scoped live listeners.
+3. Repeat the same flow twice; duplicates should not appear because event ids are persisted in Taste/Timeline/History and the ledger marks processed ids.
+4. Toggle favorite from notification/lockscreen, reopen the app, and check the mini-player heart. Startup reconciliation should align the Kotlin heart even if live IPC did not fire.
+5. For the previous 0% capture scenario, expand any `LEDGER`/`SKIP`/`LISTEN` Activity Log entry and confirm played/duration/fraction are non-zero when the service had prior progress.
+
+### 2026-05-14 #76 — Watermark/instId bug that silently dropped background auto-advances + one-time migration to recover lost plays + legacy duplicate cleanup
+
+User installed push #75 and reported all three previous issues are still present: recent plays missing from Taste Signal AND Recently Played, duplicates still appearing, notification heart not syncing. Activity Log shows extensive playback (Ponni Nadhi 1%→6%→11% then 14 minutes of idle background → Hey Rama Rama at 91%) but NO `REPLAY`/`INGEST` entries fired between 10:05:28 and 10:19:42 cold-start, even though the service was playing in the background through multiple auto-advances.
+
+**The smoking gun**: PlaybackEngine's live-transition handler at line 224 reads `transitionInstId` via `svc.getCurrentPlaybackInstanceId()`. The service had ALREADY bumped its `currentPlaybackInstanceId` to the NEW song's id (`Media3PlaybackService.java:354`, immediately after capturing the transition snapshot) by the time Kotlin's listener fires. So `transitionInstId` was actually the NEW song's id, not the prev song's id. That value then flowed into:
+- `recordPlaybackEvent(..., transitionInstId)` — dedup key now points at the wrong song.
+- `saveIngestWatermark(transitionInstId)` — **the watermark advanced to the NEW song's id after every live transition**.
+
+The cold-start `drainTransitionsBuffer` filter is `prevPlaybackInstanceId > watermark`. Buffer entries store the PREV song's id (the song that just ended). Once the watermark was inflated to a NEW-song id by any live transition, every legitimate buffer entry failed `> watermark` because the inflated watermark always sat at-or-above the buffer's prev ids. **Result**: 14 minutes of background auto-advance silently dropped. No `REPLAY` entries, no Taste Signal updates, no Recently Played updates — exactly what the user reported.
+
+**Tier 1 — surface the prev-song instId from the service** (`Media3PlaybackService.java`).
+- New `private volatile long lastTransitionPrevPlaybackInstanceId` field, captured alongside `lastTransitionPrevPlayedMs` and `lastTransitionPrevDurationMs` in `onMediaItemTransition` from `snapshot.prevPlaybackInstanceId` BEFORE the `currentPlaybackInstanceId = nextPlaybackInstanceId()` bump.
+- New public getter `getLastTransitionPrevPlaybackInstanceId()`.
+
+**Tier 2 — PlaybackEngine reads the prev id, not the current** (`PlaybackEngine.kt`).
+Single one-line semantic fix at line ~224: read `svc.javaClass.getMethod("getLastTransitionPrevPlaybackInstanceId")` instead of `getCurrentPlaybackInstanceId`. Now `transitionInstId` correctly represents the song whose listen is being recorded. The watermark bump tracks "highest prev-id ever ingested" — which is exactly what `drainTransitionsBuffer`'s `prevPlaybackInstanceId > watermark` filter expects.
+
+**Tier 3 — one-time migration to undo the inflated watermark on devices that ran #74/#75** (`AppPreferences.kt`, `MainActivity.kt`).
+The user's device already has the watermark sitting at the bug-induced (too-high) value, so even with Tier 1+2 fixed, the very next cold-start would still filter out the buffer entries because the old watermark dominates. Migration:
+- New `MIGRATION_V76_WATERMARK_RESET` boolean key in DataStore.
+- New `AppPreferences.runV76WatermarkResetIfNeeded()` — checks the flag; if unset, removes `LAST_INGESTED_PLAYBACK_INSTANCE_ID` and sets the flag. Idempotent.
+- Cold-start LE calls this BEFORE `drainTransitionsBuffer` on first boot of #76, so the buffer's existing 14-minute-worth of entries finally get replayed. Activity Log entry `MIGRATION_V76` flags when the reset fires.
+
+**Tier 4 — sweep legacy `_task_removed` + `_datastore` duplicate pairs out of the Taste Signal timeline** (`SignalTimelineEngine.kt`).
+The user is still seeing items #7-#20 of `logs.txt` (Thenmozhi × 6, Kanimaa × 4) which are pre-#74 duplicate pairs. Push #74's dedup prevents NEW duplicates but didn't retroactively prune old ones. New `SignalTimelineEngine.cleanLegacyDuplicates()` scans the 30-entry buffer, groups by `(filename, timestamp/5sec, fraction%, source-root)` where source-root collapses `_task_removed` and `_datastore` into the same bucket. Keeps the first occurrence in each group, drops the rest. Runs once during the same v76 migration; reports the count in the Activity Log.
+
+**Files modified**
+- `native/app/src/main/java/com/isaivazhi/app/Media3PlaybackService.java` — `lastTransitionPrevPlaybackInstanceId` field + getter; captured in `onMediaItemTransition`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — read `getLastTransitionPrevPlaybackInstanceId` instead of `getCurrentPlaybackInstanceId`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppPreferences.kt` — `MIGRATION_V76_WATERMARK_RESET` key + `runV76WatermarkResetIfNeeded()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/SignalTimelineEngine.kt` — `cleanLegacyDuplicates()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — migration block at the top of the cold-start LE, before `drainTransitionsBuffer`.
+
+**Build:** BUILD SUCCESSFUL in 1m 28s. APK 329 MB at `2026-05-14 13:40`.
+
+**Verification (5-point check after install)**
+1. **First boot after install — the recovery** — open the app. Open Activity Log. You should see ONE `MIGRATION_V76` entry near the top: "Watermark reset; cleaned N legacy duplicate signals" with `legacyDuplicatesRemoved: N` in the data payload. Followed shortly by `buffer_replay_start` and one `REPLAY` entry per recovered transition.
+2. **Taste Signal log** — items #7-#20 (the Thenmozhi × 6 + Kanimaa × 4 duplicates) should be GONE. New entries should appear for the 10:05–10:19 background auto-advance chain (Ponni Nadhi, intermediate songs, Hey Rama Rama) tagged `background_recovery_buffer_replay_auto_advance`.
+3. **Recently Played tab** — Browse → Recently Played should now list those recovered songs.
+4. **Going forward — new background plays** — close the app, let songs auto-advance through 2-3 tracks via lockscreen-next or just letting them end naturally, reopen. Activity Log should show `REPLAY` entries for each, and they appear in Taste Signal + Recently Played.
+5. **No new duplicates** — when both `flushCurrentPlayback` (onPause) and `onTaskRemoved` write pending evidence for the same song+session, the cold-start dedup should still produce ONE entry tagged `merged_*` or `_only`. NEVER a `_task_removed` + `_datastore` pair for the same instId.
+
+**Notification heart sync is still unconfirmed from these logs.** Push #74's wiring (controller listener for `EVT_MEDIA_ACTION` + SP mirror in `onChangeHook` + `refreshNotification()` after Kotlin-side toggles) should work end-to-end. If push #76 install still shows the heart not syncing, share the Activity Log entries when you toggle favorite — the controller listener logs `FAV+` / `FAV-` under category `notification`, so we can tell whether the IPC made it to Kotlin.
+
+---
+
+### 2026-05-14 #75 — Recently Played fix (stale-event guard + cold-start HistoryEngine gap) + SEEK log false-positive + richer transition diagnostics
+
+User installed push #74 and reported: "the Elay Keechan song didn't update in Recently Played tab. please investigate this as well and do code changes." Activity Log captured the full Elay Keechan session (FLUSH 60%/65%/76% across multiple Activity destruction cycles, then PAUSE, then SKIP at 0%), but Browse → Recently Played never reflected it.
+
+**Two compounding bugs in the HistoryEngine path:**
+
+1. **Stale-event guard rejected the live `recordEnd`.** `HistoryEngine.recordEnd` (line 81) returns silently when `pendingStartFilename != filename`. The guard exists to drop stale events, but it fails the "Activity cold-started onto an already-playing song" case: when the user reopens the app and the service is still playing a song mid-listen (`syncStateFromController` takes over via push #71), no `onMediaItemTransition` fires for the current song — same item was already loaded. So `pendingStartFilename = null` throughout. When the user later taps skip-next, the transition handler calls `recordEnd("Elay Keechan", 0f)` which the guard rejects. Elay Keechan never enters `historyEvents`.
+
+2. **Cold-start ingest never touched HistoryEngine.** `drainTransitionsBuffer`, `ingestPendingEvidence`, and all three `reconcilePending` cases update TasteEngine + SignalTimeline but never write to HistoryEngine. So even background auto-advance listens replayed on cold start were invisible to Recently Played. Push #74 unblocked the Taste page from these losses but Recently Played remained broken.
+
+**Tier 1 — `HistoryEngine.recordCompleted(filename, startedAt, fractionPlayed)`.** New authoritative writer that bypasses the pendingStartFilename guard. Extracted the shared "append event + update stats" body into `appendEventAndUpdateStats` so `recordEnd` and `recordCompleted` share the persistence path. `recordCompleted` defaults `startedAt` to now when 0L.
+
+**Tier 2 — `PlaybackEngine.syncStateFromController` primes the pending filename.** After populating `_state.value` with the controller's current track, calls `history?.recordStart(curMediaId)` so the eventual transition's `recordEnd` matches the guard and succeeds. Fixes the cold-start "same song already playing" case without needing the bypass.
+
+**Tier 3 — `ingestPendingEvidence` writes HistoryEngine too.** Added `container.history.recordCompleted(mediaId, System.currentTimeMillis(), frac)` at the end of the ingest. Every cold-start replay (buffer drain, snapshot reconcile) now appears in Recently Played alongside its existing TasteEngine + SignalTimeline writes.
+
+**Tier 4 — SEEK log false-positive.** `onPositionDiscontinuity` was logging SEEK entries whenever `reason == DISCONTINUITY_REASON_SEEK`. But Media3 also fires this reason for `seekToNextMediaItem` (it IS a seek — across items). That produced phantom "SEEK Elay Keechan — seek to 0ms" lines right before every skip-next transition. Tightened filter: `reason == DISCONTINUITY_REASON_SEEK && oldPosition.mediaItemIndex == newPosition.mediaItemIndex`. Now only true scrubber drags get logged.
+
+**Tier 5 — richer transition diagnostics.** The Activity Log's SKIP/LISTEN entries now include `prevPlayedMs`, `prevDurationMs`, and `origin` in the data payload. Critical for diagnosing the still-open Elay Keechan 0% bug (FLUSH wrote 76%, live transition recorded 0%) — origin tells us whether the value came from the service snapshot (`service`) or the Kotlin live-position fallback (`fallback`). Without these fields, the in-app log couldn't tell us whether the service's accumulator was reset or Kotlin's _livePosition fallback fired.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/HistoryEngine.kt` — new `recordCompleted`; refactored shared append into `appendEventAndUpdateStats`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — `syncStateFromController` calls `history?.recordStart(curMediaId)`; SEEK log requires same-item; transition log payload extended with `prevPlayedMs`/`prevDurationMs`/`origin`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — `ingestPendingEvidence` calls `container.history.recordCompleted`.
+
+**Known issue NOT fixed by this push:** the live transition still recorded Elay Keechan at 0% via `neutral_skip` even though the song played ~76%. Root cause is service-side — `accumulatedPlayedMs` was 0 at the moment of transition despite the FLUSH at 09:04:35 reading 76%. Most likely the foreground service was killed by GrapheneOS between FLUSH and SKIP and respawned with a fresh accumulator (default 0L), while the Activity stayed alive and didn't detect the respawn. Deferred to a future push; the new Activity Log payload (`prevPlayedMs`, `origin`) gives us the diagnostic surface to confirm next time.
+
+**Build:** BUILD SUCCESSFUL in 18s. APK 329 MB at `2026-05-14 09:54`.
+
+**Verification (4-point check)**
+1. **Cold-start onto an already-playing song.** Force-kill app while a song is playing. Reopen — Activity rebinds to the still-alive service via syncStateFromController. Play through the song to a different one (auto-advance OR skip-next). Open Browse → Recently Played. The previously-playing song should now appear at position 1.
+2. **Background auto-advance into Recently Played.** Play 3 songs in succession with the app backgrounded (or screen off). Reopen. Browse → Recently Played should show all 3 (push #74 already drained them into the Taste timeline; push #75 propagates the same drain into HistoryEngine).
+3. **SEEK log filter.** Open Activity Log. Tap skip-next on the mini-player. No `SEEK <prev song> — seek to 0ms` should appear above the resulting `SKIP` line. Drag the scrubber within the current song — a SEEK entry DOES appear with `fromMs`/`toMs` differing.
+4. **Transition diagnostics.** Open Activity Log → tap any SKIP or LISTEN entry to expand. The JSON payload now includes `prevPlayedMs`, `prevDurationMs`, and `origin` ("service" / "fallback"). If you see a transition with `prevPlayedMs=0 origin=service`, the service-side accumulator was wiped — that's the next bug to chase.
+
+---
+
+### 2026-05-14 #74 — Restore signal capture, kill the duplicate-event bug, add in-app Activity Log, sync notification heart
+
+User morning-listening pattern produced ZERO new Taste signals despite 5+ songs played. Browse → Recently Played empty; Taste positive/negative lists not reflecting plays. `logs.txt` also showed duplicate events for the same song (same %, same time, different sources `background_recovery_task_removed` + `background_recovery_datastore`). User asked for Capacitor-style in-app logging (current logcat unreadable) and re-flagged the notification favorite/close icons "not implemented" — actually present but state never syncing back to the in-app heart. User is on GrapheneOS but Capacitor worked there fine → this is a Kotlin-rewrite gap.
+
+**Three root causes confirmed in code, then fixed:**
+
+1. **Background auto-advance loss.** `PlaybackEngine`'s listener lives in Activity scope (`PlaybackEngine.kt:35-46`). When the Activity is destroyed, the service continues auto-advancing in the background and writes each transition to its `playback_transitions_history` rolling buffer (`Media3PlaybackService.java:921-950`), but `MainActivity.reconcilePending` only matched the ONE entry whose `prevPlaybackInstanceId` equalled the snapshot's instId. Other transitions (4 of 5 in the typical morning-listening case) were silently discarded.
+
+2. **Duplicate ingestion.** Cold-start LE drained BOTH `AppPreferences.loadPendingEvidence()` (DataStore, written by `flushCurrentPlayback` on `onPause`/`onDestroy`) AND the service's `playback_pending_evidence` SharedPreferences (written by `onTaskRemoved`), each going through `reconcilePending` independently. Same instId produced two events with different `origin` labels.
+
+3. **Notification heart stale after in-app toggle.** Service's `handleNotificationFavorite` emits `EVT_MEDIA_ACTION` (`Media3PlaybackService.java:1276-1280`), but no Kotlin `MediaController.Listener.onCustomCommand` existed to receive it. And the service reads favorites from `CapacitorStorage` SharedPreferences while Kotlin's `FavoritesEngine` writes only to DataStore — different stores, no mirror.
+
+**Tier A — Watermark-based replay (`AppPreferences.kt`, `MainActivity.kt`, `PlaybackEngine.kt`).** New monotonic `LAST_INGESTED_PLAYBACK_INSTANCE_ID` key on DataStore with `loadIngestWatermark()` / `saveIngestWatermark(instanceId)` (write only when `new > current`). New top-level `drainTransitionsBuffer(container, songs, recentTransitions)` in MainActivity that filters transitions to entries above the watermark and replays each via the existing `ingestPendingEvidence` (origin = `buffer_replay_${action}`). After looping, persists `max(watermark, highest seen instId)`. Called as the FIRST step of the cold-start LE before any snapshot reconcile. PlaybackEngine bumps the watermark inside its existing `scope.launch(Dispatchers.IO)` block at PlaybackEngine.kt:268 so live transitions are immediately marked as ingested and never replayed.
+
+**Tier B — Snapshot dedup with watermark gate (`MainActivity.kt`).** Cold-start LE now reads BOTH stores, builds a small `TaggedSnapshot` list, and dedupes:
+- Same `playbackInstanceId` in both stores → pick the one with higher `playedMs` (truer accumulator). Tag origin `merged_datastore` or `merged_task_removed`.
+- Distinct instIds → keep both as `datastore_only` / `task_removed_only` (legitimate distinct sessions).
+- Then drop any survivor whose `playbackInstanceId <= watermark` (Tier A already covered it).
+- Always clear both stores after handling.
+
+**Tier C — Activity Log + comprehensive event logging.** The existing `ActivityLogEngine.kt` (push #69, 200-entry rolling buffer in DataStore) was reused; `MAX_ENTRIES` unchanged. Calls added at every critical playback/cold-start point: `PlaybackEngine.onIsPlayingChanged` → `PLAY`/`PAUSE`; `onMediaItemTransition` → `LISTEN`/`SKIP` with full direct-score deltas; `onPositionDiscontinuity` filtered to `Player.DISCONTINUITY_REASON_SEEK` → `SEEK`; `MainActivity.flushCurrentPlayback` → `FLUSH`; `ingestPendingEvidence` → `INGEST` or `REPLAY` (depending on `origin.startsWith("buffer_replay_")`); `reconcilePending` cases → `RECON_A` / `RECON_B` / `RECON_C`; `drainTransitionsBuffer` → `buffer_replay_start`. Notification taps via the new controller listener → `FAV+` / `FAV-` / `CLOSE`.
+
+New `ActivityLogScreen.kt` modelled on `DebugLogsScreen.kt`: monospace one-line rows formatted as `[HH:mm:ss]  TYPE_PAD12  message` with category-colored chips, top-bar filter chips (All / Playback / Engine / Taste / Queue / Notification / UI with per-category counts), Copy All to clipboard, Clear. Tap a row to expand the JSON `data` field below it (pretty-printed via `JSONObject.toString(2)`). Entry added to the existing `Overlay` sealed class (`Overlay.ActivityLog`) with a sibling `AnimatedVisibility` block alongside `Overlay.Debug`.
+
+Two entry points: (1) Settings → "Activity Log" row (new `onOpenActivityLog: (() -> Unit)?` parameter on `SettingsScreen`); (2) long-press on the Taste page header (new `onOpenActivityLog` param on `TasteScreen`, wired via `combinedClickable` with `@OptIn(ExperimentalFoundationApi::class)`).
+
+**Tier D — Notification favorite/close sync (`PlaybackCommandContract.java`, `PlaybackEngine.kt`, `FavoritesEngine.kt`, `AppContainer.kt`).**
+- Promoted `PlaybackCommandContract`, its `EVT_MEDIA_ACTION` constant, and `KEY_FILENAME` to `public` so Kotlin in `com.isaivazhi.app.engine` can reference them by name (no string duplication).
+- `PlaybackEngine.ensureController` now passes a `MediaController.Listener` via `.setListener(controllerListener)` (different interface from the existing `Player.Listener` attached via `addListener`). The listener overrides `onCustomCommand` and, when `command.customAction == EVT_MEDIA_ACTION`, reads `args.getString("action")` plus `KEY_FILENAME` / `isFavorite`:
+  - `action == "favorite"` → `favorites.setExplicit(filename, isFavorite)`. New idempotent setter on `FavoritesEngine` — no-op if state already matches, otherwise delegates to existing `add`/`remove` so `onChangeHook` still fires. Idempotency is what breaks the SP → controller-listener → setExplicit → onChangeHook → SP feedback loop.
+  - `action == "dismiss"` → activity log only; the service's own `pauseAllPlayersAndStopSelf` already handles audio teardown.
+- `AppContainer.favorites.onChangeHook` now ALSO writes the Kotlin favorites set into the `CapacitorStorage` SharedPreferences (`{"filenames": [...]}`) that the Java service reads in `isCurrentFavorite()`. Mirror, not migration — the service still owns SP, but Kotlin keeps it current. Side-effect launches on the existing supervisor scope.
+- New `PlaybackEngine.refreshNotification()` sends `CMD_UPDATE_NOTIFICATION_STATE` (already wired in the service to call `refreshNotificationUiState`), which rebuilds the notification immediately. `AppContainer.onChangeHook` calls it after every Kotlin-side toggle so the lockscreen heart never lags.
+- Slot placement deliberately unchanged: both buttons remain in `SLOT_OVERFLOW`. Project history pushes #34-#38 documented multiple inline-slot attempts breaking Close on the GrapheneOS notification renderer; the user's real complaint was the sync (taps had no visible effect in-app), not visibility. Tier D resolves that.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppPreferences.kt` — `LAST_INGESTED_PLAYBACK_INSTANCE_ID` key, `loadIngestWatermark`, `saveIngestWatermark`, extended `clear()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — cold-start LE rewritten with `drainTransitionsBuffer` first + dedup logic for the two snapshot stores; new top-level `drainTransitionsBuffer` function; ActivityLog calls in `flushCurrentPlayback`, `ingestPendingEvidence`, `reconcilePending` cases A/B/C; watermark bump inside `ingestPendingEvidence`; `Overlay.ActivityLog` variant + `AnimatedVisibility`; Settings + Taste wired to open it.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/PlaybackEngine.kt` — constructor adds `activityLog` + `favorites` params; ActivityLog calls in `onIsPlayingChanged`, `onMediaItemTransition`, `onPositionDiscontinuity` (filtered to user seeks); watermark bump in the IO cleanup block; new `controllerListener` (`MediaController.Listener`) for `EVT_MEDIA_ACTION` with idempotent FavoritesEngine sync; `ensureController` uses `.setListener(controllerListener)`; new `refreshNotification()` method sends `CMD_UPDATE_NOTIFICATION_STATE`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt` — pass `activityLog` + `favorites` to PlaybackEngine; favorites `onChangeHook` mirrors to `CapacitorStorage` SP and calls `playback.refreshNotification()`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/FavoritesEngine.kt` — new `setExplicit(filename, isFavorite)` no-op-when-matching guard.
+- `native/app/src/main/java/com/isaivazhi/app/PlaybackCommandContract.java` — class and `EVT_MEDIA_ACTION`, `KEY_FILENAME` constants promoted to `public`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/SettingsScreen.kt` — optional `onOpenActivityLog` param + ActionRow.
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/TasteScreen.kt` — optional `onOpenActivityLog` param; long-press combinedClickable on the header; `@OptIn(ExperimentalFoundationApi::class)`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/ActivityLogScreen.kt` — **new file**, monospace timeline with category chips + filter + Copy/Clear + tap-to-expand JSON.
+
+**Build:** BUILD SUCCESSFUL in 1m 20s. APK 329 MB at `2026-05-14 08:52`. Only pre-existing icon-deprecation warnings, none from new code.
+
+**Verification (canonical 6-point check)**
+
+1. **Background auto-advance captured.** Play song A, skip to B, skip to C, skip to D, skip to E (or let them auto-advance). Force-kill app. Reopen. Open Settings → Activity Log → filter Engine. Expect 4× `REPLAY` entries (one per song that transitioned while the activity was dead). Taste page should show all 5 songs' plays incremented.
+2. **No more duplicate events.** Play song X to ~30%. Press Home (DataStore snapshot written). Force-kill via recents (SharedPreferences snapshot written). Reopen. Activity Log should show ONE `INGEST` for X with origin `merged_*` or `task_removed_only` — never two entries for the same instId. Pre-fix the Thenmozhi rows showed both `_task_removed` and `_datastore` for the same time/percent.
+3. **Live playback events captured.** Tap play/pause on mini-player → `PLAY`/`PAUSE` entries. Drag the scrubber → `SEEK` entry. Auto-transitions do NOT add `SEEK` entries (filter is `DISCONTINUITY_REASON_SEEK`).
+4. **Activity Log reachable.** Settings → tap "Activity Log" row → screen opens. Long-press the "Taste Signal" header → same screen opens.
+5. **Notification heart syncs both ways.** Tap heart in mini-player → pull down notification → favorite icon reflects new state. Tap notification favorite → mini-player heart flips immediately. Activity Log shows `FAV+` or `FAV-` from category `notification`.
+6. **Cold-start replay watermark works across multiple launches.** Run scenario #1 once → entries appear. Force-kill again with no new playback → reopen → NO new `REPLAY` entries (watermark filters out already-replayed transitions).
+
+**Note on duplicate timeline entries from past sessions.** The Thenmozhi/Kanimaa rows visible in the user's existing "Last 30" remain — Push #74 prevents NEW duplicates but doesn't retroactively prune old ones. If the user wants a clean start, Taste page → Reset Engine still preserves favorites + dislikes per Push #72.
+
+---
 
 ### 2026-05-14 #73 — Asymmetric priors + recency decay for xScore/similarityBoost + single-encounter rejection
 
@@ -2634,4 +2959,3 @@ The 313 MB reduction is mostly the ONNX model files which the new app doesn't bu
 adb install native/app/build/outputs/apk/debug/app-debug.apk
 ```
 Both APKs coexist; the Kotlin one shows in the launcher as "IsaiVazhi" (same label) but installs as `com.isaivazhi.app.kt`.
-

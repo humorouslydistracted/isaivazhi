@@ -2,12 +2,18 @@ package com.isaivazhi.app.engine
 
 import android.content.ComponentName
 import android.content.Context
+import android.os.Bundle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
 import androidx.media3.session.SessionToken
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import com.isaivazhi.app.Media3PlaybackService
+import com.isaivazhi.app.PlaybackCommandContract
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -19,6 +25,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -43,6 +51,11 @@ class PlaybackEngine(
     // Push #41: optional toaster for shuffle/repeat/queue-end feedback.
     // Optional + null-default so unit tests + ad-hoc constructions still work.
     private val toaster: Toaster? = null,
+    // Push #74: app-wide activity log for human-readable in-app diagnostics.
+    private val activityLog: ActivityLogEngine? = null,
+    // Push #74: favorites engine — wired so the MediaController.Listener for
+    // EVT_MEDIA_ACTION can sync notification taps into the Kotlin state.
+    private val favorites: FavoritesEngine? = null,
 ) {
 
     /**
@@ -102,6 +115,31 @@ class PlaybackEngine(
         val playNextFilenames: Set<String> = emptySet(),
     )
 
+    private companion object {
+        const val CMD_SET_QUEUE = "isaivazhi.playback.SET_QUEUE"
+        const val CMD_APPEND_TO_QUEUE = "isaivazhi.playback.APPEND_TO_QUEUE"
+        const val CMD_INSERT_AFTER_CURRENT = "isaivazhi.playback.INSERT_AFTER_CURRENT"
+        const val CMD_REPLACE_UPCOMING = "isaivazhi.playback.REPLACE_UPCOMING"
+        const val CMD_PLAY_INDEX = "isaivazhi.playback.PLAY_INDEX"
+        const val CMD_NEXT_TRACK = "isaivazhi.playback.NEXT_TRACK"
+        const val CMD_PREV_TRACK = "isaivazhi.playback.PREV_TRACK"
+        const val CMD_SET_LOOP_MODE = "isaivazhi.playback.SET_LOOP_MODE"
+        const val CMD_UPDATE_NOTIFICATION_STATE = "isaivazhi.playback.UPDATE_NOTIFICATION_STATE"
+
+        const val KEY_ITEMS_JSON = "itemsJson"
+        const val KEY_START_INDEX = "startIndex"
+        const val KEY_SEEK_TO_MS = "seekToMs"
+        const val KEY_PLAY_WHEN_READY = "playWhenReady"
+        const val KEY_FILE_PATH = "filePath"
+        const val KEY_TITLE = "title"
+        const val KEY_ARTIST = "artist"
+        const val KEY_ALBUM = "album"
+        const val KEY_SONG_ID = "songId"
+        const val KEY_INDEX = "index"
+        const val KEY_ACTION = "action"
+        const val KEY_LOOP_MODE = "loopMode"
+    }
+
     private val _state = MutableStateFlow(PlaybackState())
     val state: StateFlow<PlaybackState> = _state.asStateFlow()
 
@@ -151,6 +189,15 @@ class PlaybackEngine(
             // confirm the engine's actual playback status; the user-intent
             // "is the user trying to play" comes from onPlayWhenReadyChanged.
             _state.value = _state.value.copy(isPlaying = isPlaying, preparedNotPlaying = false)
+            activityLog?.log(
+                category = "playback",
+                type = if (isPlaying) "PLAY" else "PAUSE",
+                message = "${_state.value.title.ifBlank { _state.value.currentMediaId ?: "(none)" }} — ${if (isPlaying) "playing" else "paused"}",
+                data = mapOf(
+                    "mediaId" to (_state.value.currentMediaId ?: ""),
+                    "isPlaying" to isPlaying,
+                ),
+            )
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
@@ -173,6 +220,8 @@ class PlaybackEngine(
             val md = mediaItem?.mediaMetadata
             val ctrl = controller
             val prevState = _state.value
+            val prevMediaId = mediaIdToFilename(prevState.currentMediaId)
+            val nextMediaId = mediaIdToFilename(mediaItem?.mediaId)
             // Push #39: read the prev song's played-ms + duration from
             // the service (Java) which captured them right before
             // resetPlayedProgress in its own onMediaItemTransition. The
@@ -195,27 +244,33 @@ class PlaybackEngine(
                 prevDuration = _liveDuration.value
                 origin = "fallback"
             }
-            if (prevState.currentMediaId != null && prevState.currentMediaId != mediaItem?.mediaId) {
+            if (prevMediaId != null && prevMediaId != nextMediaId) {
                 val frac = if (prevDuration > 0) (prevPlayed.toFloat() / prevDuration.toFloat()).coerceIn(0f, 1f) else 0f
-                // Push #66: read the playback instance ID associated with
-                // this transition. The service incremented it just before
-                // resetting accumulator, so it identifies the just-ended
-                // playback session uniquely.
+                // Push #76: read the PREV song's playbackInstanceId from the
+                // dedicated snapshot field. Until #76 we read
+                // getCurrentPlaybackInstanceId() which the service had
+                // already bumped to the NEW song's id by the time this
+                // listener fired — that caused saveIngestWatermark to track
+                // the NEW id, and the cold-start drainTransitionsBuffer
+                // filter (prev > watermark) silently dropped every
+                // background auto-advance entry because the buffer stored
+                // PREV ids that always sat at-or-below the inflated
+                // watermark. Use the explicit prev field now.
                 val transitionInstId = svc?.let {
-                    runCatching { svc.javaClass.getMethod("getCurrentPlaybackInstanceId").invoke(svc) as? Long }
+                    runCatching { svc.javaClass.getMethod("getLastTransitionPrevPlaybackInstanceId").invoke(svc) as? Long }
                         .getOrNull() ?: 0L
                 } ?: 0L
                 android.util.Log.i(
                     "PlaybackEngine",
-                    "transition: prev=${prevState.currentMediaId} played=${prevPlayed}ms dur=${prevDuration}ms frac=$frac source=$pendingTransitionSource origin=$origin instId=$transitionInstId → next=${mediaItem?.mediaId}"
+                    "transition: prev=$prevMediaId played=${prevPlayed}ms dur=${prevDuration}ms frac=$frac source=$pendingTransitionSource origin=$origin instId=$transitionInstId → next=$nextMediaId rawNext=${mediaItem?.mediaId}"
                 )
-                history?.recordEnd(prevState.currentMediaId, frac)
+                history?.recordEnd(prevMediaId, frac)
                 // Feed the taste signal pipeline. Snapshot before/after and
                 // append to the timeline so the user can audit each event.
                 val source = pendingTransitionSource
                 val t = taste
                 if (t != null) {
-                    val (before, after) = t.recordPlaybackEvent(prevState.currentMediaId, frac, source, transitionInstId)
+                    val (before, after) = t.recordPlaybackEvent(prevMediaId, frac, source, transitionInstId)
                     val isSkip = frac < TasteEngine.SKIP_THRESHOLD
                     val isManual = source.startsWith("manual_") || source == "song_tap" ||
                         source == "queue_tap" || source == "neutral_skip"
@@ -225,8 +280,31 @@ class PlaybackEngine(
                         fraction = frac,
                         isSkip = isSkip,
                         isManual = isManual,
-                        filename = prevState.currentMediaId,
+                        filename = prevMediaId,
                         source = source,
+                    )
+                    activityLog?.log(
+                        category = "playback",
+                        type = if (isSkip) "SKIP" else "LISTEN",
+                        message = "${prevState.title.ifBlank { prevMediaId }} — ${(frac * 100).toInt()}% via $source",
+                        data = mapOf(
+                            "mediaId" to prevMediaId,
+                            "fraction" to frac,
+                            // Push #75: include the raw played/duration/origin
+                            // so cases like "FLUSH wrote 76% but transition
+                            // recorded 0%" are debuggable from the in-app log.
+                            // Origin = "service" means the value came from the
+                            // service's transition snapshot; "fallback" means
+                            // we used the Kotlin _livePosition (usually 0
+                            // because skipNext resets it before the seek).
+                            "prevPlayedMs" to prevPlayed,
+                            "prevDurationMs" to prevDuration,
+                            "origin" to origin,
+                            "source" to source,
+                            "instId" to transitionInstId,
+                            "directBefore" to before.directScore,
+                            "directAfter" to after.directScore,
+                        ),
                     )
                     signalTimeline?.let { tl ->
                         val cls = if (isSkip) SignalTimelineEngine.Classification.SKIP
@@ -238,7 +316,7 @@ class PlaybackEngine(
                         tl.append(
                             SignalTimelineEngine.Event(
                                 timestamp = System.currentTimeMillis(),
-                                filename = prevState.currentMediaId,
+                                filename = prevMediaId,
                                 title = prevState.title,
                                 artist = prevState.artist,
                                 source = source,
@@ -265,6 +343,8 @@ class PlaybackEngine(
                     // playback session. Clear any pending listen snapshot
                     // that matches the just-ended instanceId so cold-start
                     // reconciliation doesn't re-record this listen.
+                    // Push #74: also bump the ingest watermark so the cold-start
+                    // transitions-buffer replay skips this entry next time.
                     if (transitionInstId > 0L) {
                         scope.launch(Dispatchers.IO) {
                             runCatching {
@@ -276,6 +356,7 @@ class PlaybackEngine(
                                         "cleared pending snapshot resolved by transition instId=$transitionInstId"
                                     )
                                 }
+                                preferences.saveIngestWatermark(transitionInstId)
                             }
                         }
                     }
@@ -286,7 +367,7 @@ class PlaybackEngine(
                     if (kotlin.math.abs(delta) > 0.001f) {
                         scope.launch {
                             t.propagateSimilarityBoost(
-                                sourceFilename = prevState.currentMediaId,
+                                sourceFilename = prevMediaId,
                                 scoreDelta = delta,
                                 reason = if (isSkip) "playback_skip" else "playback_complete",
                             )
@@ -299,7 +380,7 @@ class PlaybackEngine(
             // Push #70: if the song transitioning IN is in the Play Next
             // marker set, clear its marker — it's about to start playing,
             // no longer needs the "preserve through rebuilds" badge.
-            val newMediaId = mediaItem?.mediaId
+            val newMediaId = nextMediaId
             val updatedPlayNext = if (newMediaId != null && newMediaId in prevState.playNextFilenames) {
                 android.util.Log.i("QueueOp", "playNext cleared on transition: $newMediaId")
                 prevState.playNextFilenames - newMediaId
@@ -307,7 +388,7 @@ class PlaybackEngine(
                 prevState.playNextFilenames
             }
             _state.value = prevState.copy(
-                currentMediaId = mediaItem?.mediaId,
+                currentMediaId = newMediaId,
                 title = md?.title?.toString() ?: "",
                 artist = md?.artist?.toString() ?: "",
                 album = md?.albumTitle?.toString() ?: "",
@@ -319,7 +400,7 @@ class PlaybackEngine(
             // the next poll tick.
             _livePosition.value = 0L
             _liveDuration.value = ctrl?.duration?.takeIf { it > 0 } ?: 0L
-            mediaItem?.mediaId?.let {
+            newMediaId?.let {
                 history?.recordStart(it)
                 persistCurrent(it, 0L)
             }
@@ -331,6 +412,25 @@ class PlaybackEngine(
             reason: Int
         ) {
             _livePosition.value = newPosition.positionMs.coerceAtLeast(0L)
+            // Push #74/#75: log user-initiated seeks only. AUTO_TRANSITION
+            // and INTERNAL discontinuities flood otherwise. Also require the
+            // discontinuity to STAY within the same media item — Media3 fires
+            // DISCONTINUITY_REASON_SEEK for seekToNextMediaItem too (it's a
+            // seek-across-items), which would otherwise log a false "seek to
+            // 0ms on <old song>" entry alongside every skip-next tap.
+            if (reason == Player.DISCONTINUITY_REASON_SEEK &&
+                oldPosition.mediaItemIndex == newPosition.mediaItemIndex) {
+                activityLog?.log(
+                    category = "playback",
+                    type = "SEEK",
+                    message = "${_state.value.title.ifBlank { _state.value.currentMediaId ?: "(none)" }} — seek to ${newPosition.positionMs}ms",
+                    data = mapOf(
+                        "mediaId" to (_state.value.currentMediaId ?: ""),
+                        "fromMs" to oldPosition.positionMs,
+                        "toMs" to newPosition.positionMs,
+                    ),
+                )
+            }
         }
 
         override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
@@ -339,6 +439,49 @@ class PlaybackEngine(
 
         override fun onRepeatModeChanged(repeatMode: Int) {
             _state.value = _state.value.copy(repeatMode = repeatMode)
+        }
+    }
+
+    /**
+     * Push #74: receives custom commands the service broadcasts to
+     * controllers — most importantly EVT_MEDIA_ACTION, which fires when the
+     * user taps Favorite or Close on the notification. Syncs the resulting
+     * state into the Kotlin FavoritesEngine so the in-app heart icon
+     * matches the notification's heart icon.
+     */
+    private val controllerListener = object : MediaController.Listener {
+        override fun onCustomCommand(
+            controller: MediaController,
+            command: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            if (command.customAction == PlaybackCommandContract.EVT_MEDIA_ACTION) {
+                val action = args.getString("action", "")
+                val filename = args.getString(PlaybackCommandContract.KEY_FILENAME, "")
+                when (action) {
+                    "favorite" -> {
+                        val isFav = args.getBoolean("isFavorite", false)
+                        if (filename.isNotBlank()) {
+                            favorites?.setExplicit(filename, isFav)
+                        }
+                        activityLog?.log(
+                            category = "notification",
+                            type = if (isFav) "FAV+" else "FAV-",
+                            message = "Notification favorite ${if (isFav) "added" else "removed"} for $filename",
+                            data = mapOf("filename" to filename, "isFavorite" to isFav),
+                        )
+                    }
+                    "dismiss" -> {
+                        activityLog?.log(
+                            category = "notification",
+                            type = "CLOSE",
+                            message = "Notification close tapped for $filename",
+                            data = mapOf("filename" to filename),
+                        )
+                    }
+                }
+            }
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
         }
     }
 
@@ -352,7 +495,13 @@ class PlaybackEngine(
                 ComponentName(appContext, Media3PlaybackService::class.java)
             )
             val ctrl = suspendCancellableCoroutine<MediaController> { cont ->
-                val future = MediaController.Builder(appContext, token).buildAsync()
+                // Push #74: setListener supplies the MediaController.Listener
+                // (separate interface from Player.Listener). Required for
+                // onCustomCommand to fire when the service emits
+                // EVT_MEDIA_ACTION on notification button taps.
+                val future = MediaController.Builder(appContext, token)
+                    .setListener(controllerListener)
+                    .buildAsync()
                 future.addListener({
                     try {
                         val c = future.get()
@@ -367,6 +516,47 @@ class PlaybackEngine(
             startPositionPoll()
             ctrl
         }
+    }
+
+    private fun sendPlaybackCommand(
+        ctrl: MediaController,
+        action: String,
+        args: Bundle = Bundle.EMPTY,
+    ) {
+        ctrl.sendCustomCommand(SessionCommand(action, Bundle.EMPTY), args)
+    }
+
+    private fun queueCommandArgs(
+        songs: List<Song>,
+        startIndex: Int = 0,
+        seekToMs: Long = 0L,
+        playWhenReady: Boolean = true,
+    ): Bundle {
+        val arr = JSONArray()
+        for (song in songs) {
+            val path = song.filePath ?: continue
+            if (path.isBlank()) continue
+            arr.put(
+                JSONObject()
+                    .put(KEY_SONG_ID, song.id)
+                    .put(KEY_FILE_PATH, path)
+                    .put(KEY_TITLE, song.title)
+                    .put(KEY_ARTIST, song.artist)
+                    .put(KEY_ALBUM, song.album)
+            )
+        }
+        return Bundle().apply {
+            putString(KEY_ITEMS_JSON, arr.toString())
+            putInt(KEY_START_INDEX, startIndex)
+            putLong(KEY_SEEK_TO_MS, seekToMs.coerceAtLeast(0L))
+            putBoolean(KEY_PLAY_WHEN_READY, playWhenReady)
+        }
+    }
+
+    private fun mediaIdToFilename(mediaId: String?): String? {
+        if (mediaId.isNullOrBlank()) return null
+        val value = mediaId.substringAfter("::", mediaId)
+        return File(value).name.ifBlank { mediaId }
     }
 
     /**
@@ -441,10 +631,15 @@ class PlaybackEngine(
         )
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            val items = rebuilt.map { buildMediaItem(it) }
-            ctrl.setMediaItems(items, finalSafeStart, 0L)
-            ctrl.prepare()
-            ctrl.play()
+            sendPlaybackCommand(
+                ctrl,
+                CMD_SET_QUEUE,
+                queueCommandArgs(
+                    songs = rebuilt,
+                    startIndex = finalSafeStart,
+                    playWhenReady = true,
+                ),
+            )
             val first = rebuilt[finalSafeStart]
             _state.value = _state.value.copy(
                 currentSongId = first.id,
@@ -495,9 +690,9 @@ class PlaybackEngine(
         }
         val curIdx = ctrl.currentMediaItemIndex.coerceIn(0, total - 1)
         val curItem = ctrl.currentMediaItem
-        val curMediaId = curItem?.mediaId
+        val curMediaId = mediaIdToFilename(curItem?.mediaId)
         val filenames = (0 until total).mapNotNull {
-            runCatching { ctrl.getMediaItemAt(it).mediaId }.getOrNull()
+            runCatching { mediaIdToFilename(ctrl.getMediaItemAt(it).mediaId) }.getOrNull()
         }
         val song = curMediaId?.let { byFilename[it] }
         val durationMs = runCatching { ctrl.duration.takeIf { it > 0 } ?: 0L }.getOrDefault(0L)
@@ -528,6 +723,13 @@ class PlaybackEngine(
         // accurate state if the service later dies.
         curMediaId?.let { persistCurrent(it, positionMs) }
         persistQueue(filenames, curIdx)
+        // Push #75: prime HistoryEngine's pendingStartFilename so the
+        // eventual transition fires a successful recordEnd. Without this,
+        // when the Activity cold-starts onto an already-playing song
+        // (no onMediaItemTransition fires for the current item),
+        // recordEnd later gets rejected by the stale-event guard and the
+        // song never appears in Recently Played.
+        curMediaId?.let { history?.recordStart(it) }
     }
 
     fun prepareForResume(songs: List<Song>, startIndex: Int, seekToMs: Long) {
@@ -545,9 +747,16 @@ class PlaybackEngine(
         )
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            val items = playable.map { buildMediaItem(it) }
-            ctrl.setMediaItems(items, safeStart, seekToMs.coerceAtLeast(0L))
-            ctrl.prepare()
+            sendPlaybackCommand(
+                ctrl,
+                CMD_SET_QUEUE,
+                queueCommandArgs(
+                    songs = playable,
+                    startIndex = safeStart,
+                    seekToMs = seekToMs,
+                    playWhenReady = false,
+                ),
+            )
             val first = playable[safeStart]
             _state.value = _state.value.copy(
                 currentSongId = first.id,
@@ -617,7 +826,15 @@ class PlaybackEngine(
         _livePosition.value = 0L
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            if (ctrl.hasNextMediaItem()) ctrl.seekToNextMediaItem()
+            if (ctrl.hasNextMediaItem()) {
+                sendPlaybackCommand(
+                    ctrl,
+                    CMD_NEXT_TRACK,
+                    Bundle().apply {
+                        putString(KEY_ACTION, if (neutral) "neutral_skip" else "next_button")
+                    },
+                )
+            }
         }
     }
 
@@ -629,15 +846,7 @@ class PlaybackEngine(
         val livePos = _livePosition.value
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            // Mirror common music-app convention: tap-prev restarts the current
-            // track if we're past 3 s, otherwise jumps to the previous track.
-            if (ctrl.currentPosition > 3000L) {
-                ctrl.seekTo(0L)
-            } else if (ctrl.hasPreviousMediaItem()) {
-                ctrl.seekToPreviousMediaItem()
-            } else {
-                ctrl.seekTo(0L)
-            }
+            sendPlaybackCommand(ctrl, CMD_PREV_TRACK)
         }
         // Optimistic update for the prev-track case so the UI doesn't lag.
         if (livePos <= 3000L && cur.queueIndex > 0) {
@@ -662,8 +871,7 @@ class PlaybackEngine(
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val count = ctrl.mediaItemCount
             if (count <= 0 || index < 0 || index >= count) return@launch
-            ctrl.seekTo(index, 0L)
-            ctrl.play()
+            sendPlaybackCommand(ctrl, CMD_PLAY_INDEX, Bundle().apply { putInt(KEY_INDEX, index) })
         }
     }
 
@@ -758,7 +966,7 @@ class PlaybackEngine(
         })
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            ctrl.repeatMode = next
+            sendPlaybackCommand(ctrl, CMD_SET_LOOP_MODE, Bundle().apply { putInt(KEY_LOOP_MODE, next) })
         }
     }
 
@@ -869,7 +1077,7 @@ class PlaybackEngine(
                 android.util.Log.i("QueueOp", "appendToQueue SKIP: all ${playable.size} already in queue")
                 return@launch
             }
-            ctrl.addMediaItems(toAdd.map { buildMediaItem(it) })
+            sendPlaybackCommand(ctrl, CMD_APPEND_TO_QUEUE, queueCommandArgs(toAdd))
             val cur = _state.value
             val nextFilenames = cur.queueFilenames + toAdd.map { it.filename }
             // Push #70: AI tail append flips context to AI_RECOMMENDED so
@@ -900,7 +1108,7 @@ class PlaybackEngine(
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val insertAt = (ctrl.currentMediaItemIndex + 1).coerceAtLeast(0)
-            ctrl.addMediaItem(insertAt, buildMediaItem(song))
+            sendPlaybackCommand(ctrl, CMD_INSERT_AFTER_CURRENT, queueCommandArgs(listOf(song)))
             val cur = _state.value
             val nextFilenames = cur.queueFilenames.toMutableList().also {
                 if (insertAt <= it.size) it.add(insertAt, song.filename) else it.add(song.filename)
@@ -942,24 +1150,13 @@ class PlaybackEngine(
             if (curIdx < 0 || totalBefore == 0) return@launch
             val curState = _state.value
             val curFilename = curState.currentMediaId
-            // Push #42 Tier 2J: remove ALL items before AND after the
-            // current MediaItem so Media3's queue ends as
-            // [current, ...newTail].
-            if (curIdx + 1 < totalBefore) {
-                ctrl.removeMediaItems(curIdx + 1, totalBefore)
-            }
-            if (curIdx > 0) {
-                ctrl.removeMediaItems(0, curIdx)
-            }
             // De-dupe newUpcoming against current and itself.
             val seen = HashSet<String>()
             curFilename?.let { seen += it }
             val nextSongs = newUpcoming.filter {
                 !it.filePath.isNullOrEmpty() && seen.add(it.filename)
             }
-            if (nextSongs.isNotEmpty()) {
-                ctrl.addMediaItems(nextSongs.map { buildMediaItem(it) })
-            }
+            sendPlaybackCommand(ctrl, CMD_REPLACE_UPCOMING, queueCommandArgs(nextSongs))
             val nextFilenames = buildList {
                 if (curFilename != null) add(curFilename)
                 addAll(nextSongs.map { it.filename })
@@ -1040,5 +1237,20 @@ class PlaybackEngine(
         controller?.removeListener(playerListener)
         controller?.release()
         controller = null
+    }
+
+    /**
+     * Push #74: tells the service to rebuild the notification (and therefore
+     * its Favorite/Close buttons + heart icon) right now. Used after a
+     * Kotlin-side favorite toggle to keep the notification icon in lockstep
+     * with the in-app mini-player heart.
+     */
+    fun refreshNotification() {
+        scope.launch {
+            val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            runCatching {
+                sendPlaybackCommand(ctrl, CMD_UPDATE_NOTIFICATION_STATE)
+            }
+        }
     }
 }

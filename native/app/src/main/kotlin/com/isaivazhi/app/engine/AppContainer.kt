@@ -60,7 +60,51 @@ class AppContainer(private val appContext: Context) {
                     taste.propagateSimilarityBoost(fn, delta, "favorite_toggle")
                     _rebuildSignal.emit("favorite_toggle")
                 }
+                // Push #74: mirror the favorites set to the CapacitorStorage
+                // SharedPreferences the Java service reads in
+                // Media3PlaybackService.isCurrentFavorite (line 1157). Without
+                // this, a Kotlin-side toggle from the mini-player or NowPlaying
+                // would leave the notification's heart icon stale.
+                sideEffectScope.launch {
+                    runCatching {
+                        val arr = org.json.JSONArray()
+                        for (f in fav.favorites.value) arr.put(f)
+                        val payload = org.json.JSONObject().put("filenames", arr).toString()
+                        appContext.getSharedPreferences("CapacitorStorage", android.content.Context.MODE_PRIVATE)
+                            .edit().putString("favorites", payload).apply()
+                    }
+                }
+                // Push #74: tell the service to rebuild its notification so
+                // the heart icon (which reads from CapacitorStorage SP)
+                // refreshes immediately, not on the next metadata change.
+                runCatching { playback.refreshNotification() }
             }
+        }
+    }
+
+    suspend fun reconcileNotificationFavoriteStorage() {
+        favorites.awaitReady()
+        val prefs = appContext.getSharedPreferences("CapacitorStorage", android.content.Context.MODE_PRIVATE)
+        val raw = prefs.getString("favorites", null)
+        if (!raw.isNullOrBlank()) {
+            val fromService = runCatching {
+                val arr = org.json.JSONObject(raw).optJSONArray("filenames") ?: org.json.JSONArray()
+                buildSet {
+                    for (i in 0 until arr.length()) {
+                        val filename = arr.optString(i, "")
+                        if (filename.isNotBlank()) add(filename)
+                    }
+                }
+            }.getOrDefault(emptySet())
+            favorites.replaceAllFromExternal(fromService)
+            return
+        }
+        runCatching {
+            val arr = org.json.JSONArray()
+            for (f in favorites.favorites.value) arr.put(f)
+            val payload = org.json.JSONObject().put("filenames", arr).toString()
+            prefs.edit().putString("favorites", payload).apply()
+            playback.refreshNotification()
         }
     }
 
@@ -113,6 +157,10 @@ class AppContainer(private val appContext: Context) {
 
     val signalTimeline: SignalTimelineEngine by lazy { SignalTimelineEngine(appContext) }
 
+    val playbackSignalLedger: PlaybackSignalLedger by lazy { PlaybackSignalLedger(appContext) }
+
+    val playbackSignalProcessor: PlaybackSignalProcessor by lazy { PlaybackSignalProcessor(this) }
+
     // Push #63: in-memory session counters (encounters/skips/positives).
     // Reset on app start; not persisted. TasteEngine reads `current()` to
     // build the session-level snapshots that the SignalTimeline records.
@@ -128,7 +176,10 @@ class AppContainer(private val appContext: Context) {
     val activityLog: ActivityLogEngine by lazy { ActivityLogEngine(appContext) }
 
     val playback: PlaybackEngine by lazy {
-        PlaybackEngine(appContext, preferences, history, taste, signalTimeline, session, toaster)
+        PlaybackEngine(
+            appContext, preferences, history, taste, signalTimeline, session, toaster,
+            activityLog, favorites,
+        )
     }
 
     val recommender: Recommender by lazy { Recommender(embeddingDb) }
@@ -163,6 +214,7 @@ class AppContainer(private val appContext: Context) {
         // Push #66: clear the transitions history buffer + pending evidence
         // so cold-start reconciliation doesn't replay pre-reset listens.
         com.isaivazhi.app.Media3PlaybackService.clearRecentTransitionsStatic(appContext)
+        playbackSignalLedger.clear()
         try {
             appContext.getSharedPreferences("playback_pending_evidence", android.content.Context.MODE_PRIVATE)
                 .edit().clear().apply()

@@ -3,6 +3,7 @@ package com.isaivazhi.app.engine
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,6 +30,7 @@ class FavoritesEngine(private val appContext: Context) {
     val favorites: StateFlow<Set<String>> = _favorites.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
 
     /**
      * Hook invoked after any membership change (toggle/add/remove). Wired
@@ -48,8 +50,14 @@ class FavoritesEngine(private val appContext: Context) {
                 _favorites.value = initial
             } catch (t: Throwable) {
                 android.util.Log.w("FavoritesEngine", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun isFavorite(filename: String): Boolean = _favorites.value.contains(filename)
@@ -78,6 +86,33 @@ class FavoritesEngine(private val appContext: Context) {
         _favorites.value = next
         scope.launch { persist(next) }
         onChangeHook?.invoke(filename, false)
+    }
+
+    /**
+     * Push #74: idempotent setter used by the MediaController.Listener when
+     * the notification's Favorite button is tapped. No-op if the requested
+     * state already matches — this breaks the feedback loop where a
+     * notification tap → SP write → controller listener → setExplicit
+     * would otherwise re-fire onChangeHook indefinitely.
+     */
+    fun setExplicit(filename: String, isFavorite: Boolean) {
+        val currently = _favorites.value.contains(filename)
+        if (currently == isFavorite) return
+        if (isFavorite) add(filename) else remove(filename)
+    }
+
+    fun replaceAllFromExternal(next: Set<String>) {
+        val sanitized = next.filter { it.isNotBlank() }.toSet()
+        val cur = _favorites.value
+        if (cur == sanitized) return
+        _favorites.value = sanitized
+        scope.launch { persist(sanitized) }
+        val changed = cur union sanitized
+        for (filename in changed) {
+            val before = filename in cur
+            val after = filename in sanitized
+            if (before != after) onChangeHook?.invoke(filename, after)
+        }
     }
 
     private suspend fun persist(set: Set<String>) {

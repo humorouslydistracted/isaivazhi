@@ -5,7 +5,7 @@ import android.os.Bundle;
 import androidx.media3.session.SessionCommand;
 import androidx.media3.session.SessionCommands;
 
-final class PlaybackCommandContract {
+public final class PlaybackCommandContract {
 
     private PlaybackCommandContract() {}
 
@@ -34,7 +34,7 @@ final class PlaybackCommandContract {
     static final String EVT_QUEUE_CHANGED = "isaivazhi.playback.event.QUEUE_CHANGED";
     static final String EVT_QUEUE_ENDED = "isaivazhi.playback.event.QUEUE_ENDED";
     static final String EVT_AUDIO_ERROR = "isaivazhi.playback.event.AUDIO_ERROR";
-    static final String EVT_MEDIA_ACTION = "isaivazhi.playback.event.MEDIA_ACTION";
+    public static final String EVT_MEDIA_ACTION = "isaivazhi.playback.event.MEDIA_ACTION";
 
     static final String KEY_ITEMS = "items";
     static final String KEY_ITEMS_JSON = "itemsJson";
@@ -44,10 +44,11 @@ final class PlaybackCommandContract {
     static final String KEY_DURATION_MS = "durationMs";
     static final String KEY_PLAYED_MS = "playedMs";
     static final String KEY_IS_PLAYING = "isPlaying";
+    static final String KEY_PLAY_WHEN_READY = "playWhenReady";
     static final String KEY_PLAYBACK_INSTANCE_ID = "currentPlaybackInstanceId";
     static final String KEY_COMPLETED_STATE = "completedState";
     static final String KEY_FILE_PATH = "filePath";
-    static final String KEY_FILENAME = "filename";
+    public static final String KEY_FILENAME = "filename";
     static final String KEY_TITLE = "title";
     static final String KEY_ARTIST = "artist";
     static final String KEY_ALBUM = "album";

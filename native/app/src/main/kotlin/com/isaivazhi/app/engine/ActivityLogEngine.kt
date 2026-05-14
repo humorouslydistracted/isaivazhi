@@ -3,6 +3,7 @@ package com.isaivazhi.app.engine
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -44,6 +45,7 @@ class ActivityLogEngine(private val appContext: Context) {
     val entries: StateFlow<List<Entry>> = _entries.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
 
     init {
         scope.launch {
@@ -52,8 +54,14 @@ class ActivityLogEngine(private val appContext: Context) {
                 _entries.value = parse(raw)
             } catch (t: Throwable) {
                 android.util.Log.w("ActivityLog", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun log(
@@ -71,7 +79,8 @@ class ActivityLogEngine(private val appContext: Context) {
             level = level,
             data = if (data.isEmpty()) "" else dataToJson(data),
         )
-        android.util.Log.i("ActivityLog", "[$category/$type] $message")
+        val dataSuffix = if (entry.data.isBlank()) "" else " data=${entry.data}"
+        android.util.Log.i("ActivityLog", "[$category/$type] $message$dataSuffix")
         _entries.value = (listOf(entry) + _entries.value).take(MAX_ENTRIES)
         scope.launch { persist() }
     }

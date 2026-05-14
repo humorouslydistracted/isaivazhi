@@ -57,12 +57,14 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -83,6 +85,7 @@ import com.isaivazhi.app.engine.signedDirectScore
 import com.isaivazhi.app.ui.rememberAudioPermissionGate
 import com.isaivazhi.app.ui.rememberDeleteSongHelper
 import com.isaivazhi.app.ui.rememberNotificationsPermissionGate
+import com.isaivazhi.app.ui.screens.ActivityLogScreen
 import com.isaivazhi.app.ui.screens.AiManagementScreen
 import com.isaivazhi.app.ui.screens.AlbumsScreen
 import com.isaivazhi.app.ui.screens.BrowseCategory
@@ -109,6 +112,9 @@ import com.isaivazhi.app.ui.screens.ViewAllScreen
 import com.isaivazhi.app.ui.screens.browseCategorySongs
 import com.isaivazhi.app.ui.screens.buildBrowseTiles
 import com.isaivazhi.app.ui.theme.IsaiVazhiTheme
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -132,10 +138,39 @@ private sealed class Overlay {
     data object Taste : Overlay()
     data object Ai : Overlay()
     data object Debug : Overlay()
+    data object ActivityLog : Overlay()
     data class PlaylistDetail(val playlistId: String) : Overlay()
     data class ViewAll(val category: BrowseCategory) : Overlay()
     /** Generic "View all" overlay for a Discover section. */
     data class SectionViewAll(val title: String, val songs: List<Song>) : Overlay()
+}
+
+private fun logLedgerState(container: AppContainer, reason: String) {
+    val svc = com.isaivazhi.app.Media3PlaybackService.INSTANCE
+    val diag = runCatching { container.playbackSignalLedger.diagnostics() }.getOrNull()
+    container.activityLog.log(
+        category = "engine",
+        type = "LEDGER_STATE",
+        message = "Ledger state checked ($reason)",
+        data = mapOf(
+            "reason" to reason,
+            "serviceAlive" to (svc != null),
+            "serviceMediaId" to (svc?.getCurrentMediaIdSnapshot() ?: ""),
+            "serviceInstId" to (svc?.getCurrentPlaybackInstanceId() ?: 0L),
+            "servicePositionMs" to (svc?.getCurrentPositionMsSnapshot() ?: 0L),
+            "serviceDurationMs" to (svc?.getCurrentDurationMsSnapshot() ?: 0L),
+            "servicePlayedMs" to (svc?.getAccumulatedPlayedMsSnapshot() ?: 0L),
+            "ledgerRawCount" to (diag?.ledgerRawCount ?: -1),
+            "recoveryRawCount" to (diag?.recoveryRawCount ?: -1),
+            "transitionRawCount" to (diag?.transitionRawCount ?: -1),
+            "processedIdCount" to (diag?.processedIdCount ?: -1),
+            "pendingCount" to (diag?.pendingCount ?: -1),
+            "newestEventId" to (diag?.newestEventId ?: ""),
+            "newestFilename" to (diag?.newestFilename ?: ""),
+            "newestAction" to (diag?.newestAction ?: ""),
+            "newestInstanceId" to (diag?.newestInstanceId ?: 0L),
+        ),
+    )
 }
 
 class MainActivity : ComponentActivity() {
@@ -238,6 +273,19 @@ class MainActivity : ComponentActivity() {
             "MainActivity",
             "flushCurrentPlayback (tentative snapshot) reason=$reason mediaId=$mediaId played=${played}ms dur=${duration}ms frac=${"%.3f".format(frac)} instId=$instId"
         )
+        container.activityLog.log(
+            category = "engine",
+            type = "FLUSH",
+            message = "$mediaId — ${(frac * 100).toInt()}% reason=$reason",
+            data = mapOf(
+                "mediaId" to mediaId,
+                "playedMs" to played,
+                "durationMs" to duration,
+                "fraction" to frac,
+                "reason" to reason,
+                "instId" to instId,
+            ),
+        )
         // Tentative snapshot only — no SignalTimeline event, no
         // recordPlaybackEvent, no markEvidenceFlushed. The actual scoring
         // happens when (a) a real native transition fires for this
@@ -294,6 +342,30 @@ private fun AppRoot(container: AppContainer) {
     var albumMenuTracks by remember { mutableStateOf<List<Song>?>(null) }
     var albumMenuName by remember { mutableStateOf<String?>(null) }
     var showAlbumDeleteConfirm by remember { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val latestSongs by rememberUpdatedState(songs)
+
+    DisposableEffect(lifecycleOwner, permission.granted) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && permission.granted) {
+                val currentSongs = latestSongs
+                if (currentSongs.isNotEmpty()) {
+                    coroutineScope.launch {
+                        container.activityLog.awaitReady()
+                        logLedgerState(container, "foreground_resume_before_drain")
+                        container.playbackSignalProcessor.processPending(
+                            songs = currentSongs,
+                            reason = "foreground_resume",
+                            logWhenEmpty = true,
+                        )
+                        logLedgerState(container, "foreground_resume_after_drain")
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     val playbackState by container.playback.state.collectAsState()
     // Live position/duration come from separate StateFlows so the 500 ms
@@ -522,26 +594,36 @@ private fun AppRoot(container: AppContainer) {
 
     LaunchedEffect(songs) {
         if (songs.isEmpty()) return@LaunchedEffect
-        // Push #65: ingest pending playback evidence BEFORE preparing
-        // resume playback. Two sources, both belt-and-suspenders for the
-        // "user closed the app mid-song" case where the in-memory
-        // accumulator value would otherwise be lost:
-        //   1. DataStore record written by MainActivity.onPause's
-        //      flushCurrentPlayback.
-        //   2. SharedPreferences record written by
-        //      Media3PlaybackService.onTaskRemoved (force-kill path
-        //      that may bypass onPause entirely).
-        // Push #66 — Capacitor parity (`_recoverPendingListenIfNeeded` in
-        // app.js:601). Three-path reconciliation:
-        //   A. If a recent native transition's prevPlaybackInstanceId
-        //      matches the pending snapshot's instanceId, the transition
-        //      is authoritative — use ITS values (more accurate than
-        //      our pre-transition guess). Clear the snapshot.
-        //   B. If the same playback instance is still active in the
-        //      service, defer — the eventual transition will record it
-        //      naturally. Don't double-record now.
-        //   C. Otherwise the service is gone and no transition fired —
-        //      use the snapshot's playedMs/durationMs as-is.
+        // Engine state loads from DataStore asynchronously. Recovery writes
+        // must wait for those loads; otherwise the load coroutine can replace
+        // freshly-recovered Taste/History/Timeline state with stale disk state.
+        container.taste.awaitReady()
+        container.signalTimeline.awaitReady()
+        container.history.awaitReady()
+        container.activityLog.awaitReady()
+        container.favorites.awaitReady()
+        container.reconcileNotificationFavoriteStorage()
+        logLedgerState(container, "cold_start_before_drain")
+        // Push #65/#66/#74: ingest pending playback evidence BEFORE preparing
+        // resume playback. Three sources, each covering a different failure
+        // mode:
+        //   * playback_transitions_history (SharedPreferences, written by
+        //     Media3PlaybackService.rememberTransitionToPrefs on every
+        //     auto-advance/skip): rolling buffer of every transition while
+        //     the Activity was dead. Push #74 drains all entries above the
+        //     watermark, fixing the "5 songs auto-advanced in background but
+        //     only the last one was captured" bug.
+        //   * DataStore (written by MainActivity.flushCurrentPlayback on
+        //     onPause/onDestroy): tentative snapshot of the song that was
+        //     playing when the Activity backgrounded.
+        //   * SharedPreferences playback_pending_evidence (written by
+        //     Media3PlaybackService.onTaskRemoved): tentative snapshot for
+        //     the force-kill path that bypasses onPause.
+        // Push #74 dedupe: when both snapshots reference the same
+        // playbackInstanceId we pick the one with the higher playedMs and
+        // ingest once, eliminating the historic
+        // background_recovery_task_removed + background_recovery_datastore
+        // duplicate pairs.
         try {
             val transitionsJson = com.isaivazhi.app.Media3PlaybackService
                 .readRecentTransitionsStatic(ctx)
@@ -551,40 +633,108 @@ private fun AppRoot(container: AppContainer) {
                     .getOrNull() ?: 0L
             } ?: 0L
 
-            val pending = container.preferences.loadPendingEvidence()
-            if (pending != null) {
-                reconcilePending(
-                    container = container,
-                    songs = songs,
-                    snapshot = pending,
-                    recentTransitions = recentTransitions,
-                    liveInstanceId = liveInstanceId,
-                    originLabel = "datastore",
+            // Push #76: one-time migration to undo the #74/#75 watermark
+            // inflation bug. On those builds the watermark was bumped with
+            // the NEW song's instId after every live transition, blocking
+            // every subsequent buffer replay because buffer entries store
+            // the PREV song's id (always <= the inflated watermark). Reset
+            // the watermark once so the next drainTransitionsBuffer can
+            // finally process the accumulated background auto-advance
+            // entries the user has been losing.
+            val migrationApplied = runCatching { container.preferences.runV76WatermarkResetIfNeeded() }
+                .getOrDefault(false)
+            if (migrationApplied) {
+                android.util.Log.i("MainActivity", "v76 migration: watermark reset to 0 — allowing buffer replay")
+                // Also sweep the legacy _task_removed + _datastore duplicate
+                // pairs out of the Taste Signal timeline. Same migration
+                // boundary — runs once, then never again.
+                val removedDupes = runCatching { container.signalTimeline.cleanLegacyDuplicates() }
+                    .getOrDefault(0)
+                container.activityLog.log(
+                    category = "engine",
+                    type = "MIGRATION_V76",
+                    message = "Watermark reset; cleaned $removedDupes legacy duplicate signals",
+                    data = mapOf("legacyDuplicatesRemoved" to removedDupes),
                 )
-                container.preferences.clearPendingEvidence()
             }
-            // Service-side SharedPreferences fallback (force-kill via task swipe).
+
+            // Service-authored durable ledger is the primary recovery path.
+            // It also reads the two legacy transition buffers and marks events
+            // processed by stable eventId so cold-start replay is idempotent.
+            container.playbackSignalProcessor.processPending(songs, reason = "cold_start", logWhenEmpty = true)
+            logLedgerState(container, "cold_start_after_drain")
+
+            // Push #74 Tier A: drain the transitions buffer first. Replays
+            // every background auto-advance the Activity-scoped
+            // PlaybackEngine missed. Updates the watermark in the same call.
+            val watermark = drainTransitionsBuffer(container, songs, recentTransitions)
+
+            // Push #74 Tier B: read both pending-evidence stores, dedupe by
+            // playbackInstanceId, gate against the watermark. Reuses the
+            // existing reconcilePending three-case logic (A/B/C) for each
+            // survivor.
             val sp = ctx.getSharedPreferences("playback_pending_evidence", android.content.Context.MODE_PRIVATE)
+            val dataStoreSnapshot = container.preferences.loadPendingEvidence()
             val svcMediaId = sp.getString("mediaId", "") ?: ""
             val svcPlayed = sp.getLong("playedMs", 0L)
             val svcDur = sp.getLong("durationMs", 0L)
             val svcInstId = sp.getLong("playbackInstanceId", 0L)
-            if (svcMediaId.isNotBlank() && svcPlayed >= 1000L && svcDur > 0L) {
+            val svcSnapshot = if (svcMediaId.isNotBlank() && svcPlayed >= 1000L && svcDur > 0L) {
+                com.isaivazhi.app.engine.AppPreferences.PendingEvidence(
+                    mediaId = svcMediaId,
+                    playedMs = svcPlayed,
+                    durationMs = svcDur,
+                    playbackInstanceId = svcInstId,
+                )
+            } else null
+
+            data class TaggedSnapshot(
+                val snapshot: com.isaivazhi.app.engine.AppPreferences.PendingEvidence,
+                val originLabel: String,
+            )
+            val toReconcile = mutableListOf<TaggedSnapshot>()
+            when {
+                dataStoreSnapshot != null && svcSnapshot != null &&
+                    dataStoreSnapshot.playbackInstanceId == svcSnapshot.playbackInstanceId &&
+                    dataStoreSnapshot.playbackInstanceId > 0L -> {
+                    // Same playback session captured by BOTH onPause AND
+                    // onTaskRemoved. Pick the one with the higher playedMs
+                    // (truer accumulator). Tag with the winner's origin.
+                    val winner = if (svcSnapshot.playedMs >= dataStoreSnapshot.playedMs) svcSnapshot else dataStoreSnapshot
+                    val winnerOrigin = if (winner === svcSnapshot) "merged_task_removed" else "merged_datastore"
+                    android.util.Log.i(
+                        "MainActivity",
+                        "pending evidence dedup: same instId=${winner.playbackInstanceId}, kept $winnerOrigin (datastorePlayed=${dataStoreSnapshot.playedMs} svcPlayed=${svcSnapshot.playedMs})"
+                    )
+                    toReconcile += TaggedSnapshot(winner, winnerOrigin)
+                }
+                else -> {
+                    if (dataStoreSnapshot != null) toReconcile += TaggedSnapshot(dataStoreSnapshot, "datastore_only")
+                    if (svcSnapshot != null) toReconcile += TaggedSnapshot(svcSnapshot, "task_removed_only")
+                }
+            }
+
+            for (tagged in toReconcile) {
+                if (tagged.snapshot.playbackInstanceId > 0L && tagged.snapshot.playbackInstanceId <= watermark) {
+                    android.util.Log.i(
+                        "MainActivity",
+                        "pending evidence skipped (covered by buffer replay): origin=${tagged.originLabel} instId=${tagged.snapshot.playbackInstanceId} watermark=$watermark"
+                    )
+                    continue
+                }
                 reconcilePending(
                     container = container,
                     songs = songs,
-                    snapshot = com.isaivazhi.app.engine.AppPreferences.PendingEvidence(
-                        mediaId = svcMediaId,
-                        playedMs = svcPlayed,
-                        durationMs = svcDur,
-                        playbackInstanceId = svcInstId,
-                    ),
+                    snapshot = tagged.snapshot,
                     recentTransitions = recentTransitions,
                     liveInstanceId = liveInstanceId,
-                    originLabel = "task_removed",
+                    originLabel = tagged.originLabel,
                 )
-                sp.edit().clear().apply()
             }
+            // Always clear both stores after handling, even when watermark
+            // skipped them — the data is no longer needed.
+            if (dataStoreSnapshot != null) container.preferences.clearPendingEvidence()
+            if (svcSnapshot != null) sp.edit().clear().apply()
         } catch (t: Throwable) {
             android.util.Log.w("MainActivity", "pending evidence reconciliation failed: ${t.message}")
         }
@@ -1919,6 +2069,7 @@ private fun AppRoot(container: AppContainer) {
                 AlbumArtRepository.trimMemory()
                 coroutineScope.launch { artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) } }
             },
+            onOpenActivityLog = { overlay = Overlay.ActivityLog },
         )
     }
 
@@ -2053,6 +2204,9 @@ private fun AppRoot(container: AppContainer) {
                     "TasteOrdered",
                 )
             },
+            // Push #74: long-press the Taste Signal header to open the
+            // Activity Log overlay.
+            onOpenActivityLog = { overlay = Overlay.ActivityLog },
         )
     }
 
@@ -2326,6 +2480,15 @@ private fun AppRoot(container: AppContainer) {
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         DebugLogsScreen(onBack = { overlay = Overlay.None })
+    }
+
+    AnimatedVisibility(visible = overlay is Overlay.ActivityLog,
+        enter = slideInVertically(initialOffsetY = { it }),
+        exit = slideOutVertically(targetOffsetY = { it })) {
+        ActivityLogScreen(
+            activityLog = container.activityLog,
+            onBack = { overlay = Overlay.None },
+        )
     }
 
     val viewAllCat = (overlay as? Overlay.ViewAll)?.category
@@ -2678,6 +2841,62 @@ private fun parseRecentTransitions(arr: org.json.JSONArray): List<RecentTransiti
 }
 
 /**
+ * Push #74: cold-start replay of every transition in the service's rolling
+ * buffer that hasn't already been credited live. Fixes the "5 background
+ * auto-advances → only the last one captured" hole: PlaybackEngine's
+ * Activity-scoped listener is dead while the service auto-advances, so the
+ * buffer is the only record of what played. Returns the watermark in effect
+ * after replay so the snapshot reconcile path can gate against it.
+ */
+private suspend fun drainTransitionsBuffer(
+    container: AppContainer,
+    songs: List<Song>,
+    recentTransitions: List<RecentTransition>,
+): Long {
+    val watermark = runCatching { container.preferences.loadIngestWatermark() }.getOrDefault(0L)
+    val unprocessed = recentTransitions.filter {
+        it.prevPlaybackInstanceId > watermark &&
+            it.prevPlaybackInstanceId > 0L &&
+            it.prevPlayedMs >= 1000L &&
+            it.prevDurationMs > 0L &&
+            it.prevFilename.isNotBlank()
+    }
+    if (unprocessed.isNotEmpty()) {
+        android.util.Log.i(
+            "MainActivity",
+            "drainTransitionsBuffer: replaying ${unprocessed.size} unprocessed transitions (watermark=$watermark, bufferSize=${recentTransitions.size})"
+        )
+        container.activityLog.log(
+            category = "engine",
+            type = "buffer_replay_start",
+            message = "Replaying ${unprocessed.size} background transitions",
+            data = mapOf(
+                "watermark" to watermark,
+                "bufferSize" to recentTransitions.size,
+                "unprocessed" to unprocessed.size,
+            ),
+        )
+    }
+    for (t in unprocessed) {
+        ingestPendingEvidence(
+            container = container,
+            songs = songs,
+            mediaId = t.prevFilename,
+            playedMs = t.prevPlayedMs,
+            durationMs = t.prevDurationMs,
+            origin = "buffer_replay_${t.action}",
+            playbackInstanceId = t.prevPlaybackInstanceId,
+        )
+    }
+    val newHigh = recentTransitions.maxOfOrNull { it.prevPlaybackInstanceId } ?: 0L
+    val finalWatermark = maxOf(watermark, newHigh)
+    if (finalWatermark > watermark) {
+        runCatching { container.preferences.saveIngestWatermark(finalWatermark) }
+    }
+    return finalWatermark
+}
+
+/**
  * Push #66 — Capacitor parity (`_recoverPendingListenIfNeeded`):
  * three-path reconciliation between a pending listen snapshot and the
  * native transitions buffer.
@@ -2698,6 +2917,17 @@ private fun reconcilePending(
             "MainActivity",
             "reconcilePending case=A (transition match) origin=$originLabel mediaId=${snapshot.mediaId} instId=${snapshot.playbackInstanceId} action=${match.action}"
         )
+        container.activityLog.log(
+            category = "engine",
+            type = "RECON_A",
+            message = "${snapshot.mediaId} — transition match (${match.action}) via $originLabel",
+            data = mapOf(
+                "mediaId" to snapshot.mediaId,
+                "instId" to snapshot.playbackInstanceId,
+                "action" to match.action,
+                "origin" to originLabel,
+            ),
+        )
         ingestPendingEvidence(
             container = container,
             songs = songs,
@@ -2716,12 +2946,34 @@ private fun reconcilePending(
             "MainActivity",
             "reconcilePending case=B (defer, same instance still live) origin=$originLabel instId=${snapshot.playbackInstanceId}"
         )
+        container.activityLog.log(
+            category = "engine",
+            type = "RECON_B",
+            message = "${snapshot.mediaId} — deferred (still playing) via $originLabel",
+            data = mapOf(
+                "mediaId" to snapshot.mediaId,
+                "instId" to snapshot.playbackInstanceId,
+                "origin" to originLabel,
+            ),
+        )
         return
     }
     // Case C: no matching transition, no live session. Use snapshot as-is.
     android.util.Log.i(
         "MainActivity",
         "reconcilePending case=C (use snapshot) origin=$originLabel mediaId=${snapshot.mediaId} played=${snapshot.playedMs}ms"
+    )
+    container.activityLog.log(
+        category = "engine",
+        type = "RECON_C",
+        message = "${snapshot.mediaId} — recovered from snapshot via $originLabel",
+        data = mapOf(
+            "mediaId" to snapshot.mediaId,
+            "playedMs" to snapshot.playedMs,
+            "durationMs" to snapshot.durationMs,
+            "instId" to snapshot.playbackInstanceId,
+            "origin" to originLabel,
+        ),
     )
     ingestPendingEvidence(
         container = container,
@@ -2754,6 +3006,21 @@ private fun ingestPendingEvidence(
     android.util.Log.i(
         "MainActivity",
         "ingestPendingEvidence origin=$origin mediaId=$mediaId played=${playedMs}ms dur=${durationMs}ms frac=${"%.3f".format(frac)} songResolved=${song != null} instId=$playbackInstanceId"
+    )
+    val ingestType = if (origin.startsWith("buffer_replay_")) "REPLAY" else "INGEST"
+    container.activityLog.log(
+        category = "engine",
+        type = ingestType,
+        message = "${song?.title?.ifBlank { mediaId } ?: mediaId} — ${(frac * 100).toInt()}% via $origin",
+        data = mapOf(
+            "mediaId" to mediaId,
+            "playedMs" to playedMs,
+            "durationMs" to durationMs,
+            "fraction" to frac,
+            "origin" to origin,
+            "instId" to playbackInstanceId,
+            "songResolved" to (song != null),
+        ),
     )
     // Push #66: source = "background_recovery" (NOT on the user-skip
     // whitelist) so partial listens recovered from background DON'T
@@ -2811,6 +3078,23 @@ private fun ingestPendingEvidence(
             }
         }
     }
+    // Push #74: bump the watermark so any subsequent cold-start replay
+    // skips this instId. drainTransitionsBuffer also updates the watermark
+    // collectively after its loop, but bumping per-ingest ensures
+    // snapshot-only ingests (Case C) also advance it.
+    if (playbackInstanceId > 0L) {
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching { container.preferences.saveIngestWatermark(playbackInstanceId) }
+        }
+    }
+    // Push #75: also record into HistoryEngine so Browse → Recently Played
+    // reflects background/cold-start listens. The live-transition path
+    // already calls history.recordEnd, but cold-start ingest bypasses that
+    // path entirely — which is why Elay Keechan never showed up in
+    // Recently Played despite playing for ~76% before the user closed the
+    // app. recordCompleted skips the pendingStartFilename guard since the
+    // cold-start record IS authoritative.
+    container.history.recordCompleted(mediaId, System.currentTimeMillis(), frac)
 }
 
 private fun buildEngineSnapshot(

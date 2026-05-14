@@ -2,8 +2,10 @@ package com.isaivazhi.app.ui.screens
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -56,6 +58,7 @@ import kotlin.math.abs
 
 private const val DEFAULT_LIMIT = 10
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun TasteScreen(
     tuning: TasteEngine.Tuning,
@@ -82,6 +85,8 @@ fun TasteScreen(
     onCopyTimelineText: (text: String) -> Unit,
     onCopyTimelineSummary: (text: String) -> Unit,
     onPlayOrderedList: (queue: List<Song>, startIndex: Int) -> Unit,
+    // Push #74: long-press the header to open the Activity Log overlay.
+    onOpenActivityLog: (() -> Unit)? = null,
 ) {
     val ctx = LocalContext.current
 
@@ -212,6 +217,12 @@ fun TasteScreen(
                         text = "Taste Signal",
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onBackground,
+                        modifier = if (onOpenActivityLog != null) {
+                            Modifier.combinedClickable(
+                                onClick = {},
+                                onLongClick = onOpenActivityLog,
+                            )
+                        } else Modifier,
                     )
                 }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)

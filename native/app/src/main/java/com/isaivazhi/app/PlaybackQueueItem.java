@@ -56,7 +56,7 @@ final class PlaybackQueueItem {
                 .setAlbumTitle(album)
                 .build();
         return new MediaItem.Builder()
-                .setMediaId(mediaId())
+                .setMediaId(fileName())
                 .setUri(Uri.fromFile(new File(filePath)))
                 .setMediaMetadata(metadata)
                 .build();
