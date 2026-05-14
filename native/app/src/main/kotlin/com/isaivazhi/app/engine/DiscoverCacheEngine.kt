@@ -27,7 +27,12 @@ import org.json.JSONObject
  * Each cache write is async; reads are one-shot during init. Invalidated
  * on Reset Engine.
  */
-class DiscoverCacheEngine(private val appContext: Context) {
+class DiscoverCacheEngine(
+    private val appContext: Context,
+    // Push #77 diagnostic: optional ActivityLog so cache load + save events
+    // surface in the in-app Activity Log. Caller passes null for unit tests.
+    private val activityLog: ActivityLogEngine? = null,
+) {
 
     data class Snapshot(
         val mostSimilarFilenames: List<String> = emptyList(),
@@ -63,14 +68,38 @@ class DiscoverCacheEngine(private val appContext: Context) {
 
     init {
         scope.launch {
+            val tStart = System.currentTimeMillis()
+            var loadError: String? = null
             try {
                 val raw = appContext.dataStoreLocal.data.first()[KEY]
                 if (raw != null) _snapshot.value = parse(raw)
             } catch (t: Throwable) {
                 android.util.Log.w("DiscoverCache", "load failed: ${t.message}")
+                loadError = t.message ?: t.javaClass.simpleName
             } finally {
                 _loaded.value = true
             }
+            val snap = _snapshot.value
+            val ageMs = if (snap.computedAt > 0L) System.currentTimeMillis() - snap.computedAt else -1L
+            activityLog?.log(
+                category = "engine",
+                type = "DISCOVER_CACHE_LOAD",
+                message = if (loadError != null) "Cache load FAILED: $loadError"
+                else if (snap.computedAt == 0L) "Cache load: no snapshot stored yet"
+                else "Cache loaded (ageMs=$ageMs mostSim=${snap.mostSimilarFilenames.size} forYou=${snap.forYouFilenames.size} byp=${snap.byp.size} unexp=${snap.unexploredFilenamesByCluster.size})",
+                data = mapOf(
+                    "loadElapsedMs" to (System.currentTimeMillis() - tStart),
+                    "loadError" to (loadError ?: ""),
+                    "computedAt" to snap.computedAt,
+                    "cacheAgeMs" to ageMs,
+                    "fingerprint" to snap.recommendationFingerprint,
+                    "mostSimilar" to snap.mostSimilarFilenames.size,
+                    "forYou" to snap.forYouFilenames.size,
+                    "bypAnchors" to snap.byp.size,
+                    "unexploredClusters" to snap.unexploredFilenamesByCluster.size,
+                    "currentMediaId" to (snap.currentMediaId ?: ""),
+                ),
+            )
         }
     }
 
@@ -88,11 +117,26 @@ class DiscoverCacheEngine(private val appContext: Context) {
         currentMediaId: String?,
         recommendationFingerprint: String = "",
     ) {
-        if (mostSimilarFilenames.isEmpty() &&
+        val allEmpty = mostSimilarFilenames.isEmpty() &&
             forYouFilenames.isEmpty() &&
             byp.all { it.recommendationFilenames.isEmpty() } &&
             unexploredFilenamesByCluster.all { it.isEmpty() }
-        ) return
+        if (allEmpty) {
+            // Push #77 diagnostic: log the no-op save so we can tell whether
+            // save was invoked but skipped (vs not invoked at all).
+            activityLog?.log(
+                category = "engine",
+                type = "DISCOVER_CACHE_SAVE_NOOP",
+                message = "Cache save skipped — all sections empty",
+                data = mapOf(
+                    "mostSimilar" to mostSimilarFilenames.size,
+                    "forYou" to forYouFilenames.size,
+                    "bypAnchors" to byp.size,
+                    "unexploredClusters" to unexploredFilenamesByCluster.size,
+                ),
+            )
+            return
+        }
         val snap = Snapshot(
             mostSimilarFilenames = mostSimilarFilenames,
             forYouFilenames = forYouFilenames,
@@ -103,6 +147,20 @@ class DiscoverCacheEngine(private val appContext: Context) {
             recommendationFingerprint = recommendationFingerprint,
         )
         _snapshot.value = snap
+        activityLog?.log(
+            category = "engine",
+            type = "DISCOVER_CACHE_SAVE",
+            message = "Cache saved (mostSim=${mostSimilarFilenames.size} forYou=${forYouFilenames.size} byp=${byp.size} unexp=${unexploredFilenamesByCluster.size})",
+            data = mapOf(
+                "mostSimilar" to mostSimilarFilenames.size,
+                "forYou" to forYouFilenames.size,
+                "bypAnchors" to byp.size,
+                "bypTotalRecs" to byp.sumOf { it.recommendationFilenames.size },
+                "unexploredClusters" to unexploredFilenamesByCluster.size,
+                "fingerprint" to recommendationFingerprint,
+                "currentMediaId" to (currentMediaId ?: ""),
+            ),
+        )
         scope.launch { persist(snap) }
     }
 

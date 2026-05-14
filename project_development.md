@@ -187,6 +187,80 @@ User confirmed latest #76 APK was installed and all four issues still persisted:
 4. Toggle favorite from notification/lockscreen, reopen the app, and check the mini-player heart. Startup reconciliation should align the Kotlin heart even if live IPC did not fire.
 5. For the previous 0% capture scenario, expand any `LEDGER`/`SKIP`/`LISTEN` Activity Log entry and confirm played/duration/fraction are non-zero when the service had prior progress.
 
+### 2026-05-14 #78 — Slider info tooltips + blend pill explanation dialog (Capacitor parity)
+
+User: "i myself dont understand what 50%/30%/20% means and no info of it anywhere really. for the 3 slider knobs in the taste page, add info toast which when clicked should show the info of what that does, its present in capacitor code."
+
+Both pieces are pure-UI additions, zero behaviour change.
+
+**Slider tooltips** (`TasteScreen.kt`).
+- New ⓘ icon (`Icons.Outlined.Info`) inserted next to each slider label in `TuningRow`. Sized 16dp inside a 28dp `IconButton` so it doesn't crowd the label.
+- Tap fires an `AlertDialog` titled with the slider name, body = the existing `description` param verbatim. Tooltip strings copied verbatim from the Capacitor build (`app-taste-ui.js:390-392`):
+  - **Adventurous**: "Higher = more diverse Up Next picks (spread across your library). Lower = stick closer to what you just played. Internally drives MMR's diversity weight (engine maps adventurous → 1−lambda so the label matches the math)."
+  - **Session weight**: "Higher = recs follow the mood of what you're playing right now. Lower = lean on long-term taste profile."
+  - **Skip strength**: "Higher = songs in your Negative list (X'd, disliked, repeat-skipped) pull recommendations farther away from their sound."
+- "Got it" button dismisses.
+
+**Blend pill explanation** (`DiscoverScreen.kt` → `DiscoverInsightsStrip`).
+- Previously the pill (`Blend X / Y / Z · mode`) was tap-to-open-Taste. Now tap opens an `AlertDialog` first that breaks down the three percentages:
+  - **This song** — how much recommendations should sound like the song playing right now.
+  - **Session** — how much recommendations should sound like what you've played since opening the app.
+  - **All-time** — how much recommendations should sound like your long-term taste profile.
+  - Each row shows the current percentage to the right of the label.
+- Current mode string (e.g., "Balanced") rendered below.
+- Footer hint: "Move the Session weight slider on the Taste page to shift the blend."
+- Dialog has two buttons: "Open Taste page" (forwards the original `onClick` so the user can jump straight to the slider) and "Close".
+- New private `BlendInfoRow` composable renders each percentage row.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/TasteScreen.kt` — import `Icons.Outlined.Info`; updated tooltip strings on the three TuningRow callers; `TuningRow` body now has `showInfo` state + AlertDialog + ⓘ IconButton.
+- `native/app/src/main/kotlin/com/isaivazhi/app/ui/screens/DiscoverScreen.kt` — import `AlertDialog`, `TextButton`; `DiscoverInsightsStrip` gains `showBlendInfo` state + AlertDialog with the three blend rows; new private `BlendInfoRow` composable.
+
+**Build:** BUILD SUCCESSFUL in 12s. APK 327 MB at `2026-05-14 21:38`.
+
+**Verification**
+1. Open Discover. Tap the blend pill at the top → dialog explains the three numbers + mode. Tap "Open Taste page" → opens Taste; tap "Close" → just dismisses.
+2. Open Taste page. Tap ⓘ next to "Adventurous" → tooltip with the long Capacitor explanation. Repeat for "Session weight" and "Skip strength".
+
+---
+
+### 2026-05-14 #77 — Discover diagnostics + activity lifecycle visibility + historyStats LE thrash fix + Path A library-load timer
+
+User's concern after pushes #74-#76 stabilized signal capture: the Discover page itself felt unreliable — "Unexplored Sounds, BYP refreshing randomly", "the cache is not working as expected", "when the app closes on its own while the song is playing and i unlock it after 20-30 seconds, the discover page is blank for 1-2 seconds and everything loads after that, its not preloaded and useable right after unlock". User asked for diagnostic logs before any fix, mirroring the Push #74 controlled-test approach.
+
+**Tier 1 — comprehensive Discover diagnostics** (`MainActivity.kt`). Every event surfaces as a category=`engine` row in the in-app Activity Log:
+- `DISCOVER_FORYOU_FIRE` / `_DONE` — wrapping the For You + BYP LE. FIRE payload captures every key value (`historyStatsSize`, `songsCount`, `embeddingsRowCount`, `adventurous`, `sessionBias`, `negativeStrength`, `forYouTick`, `forYouTickDiv5`, `rebuildPulse`, `hasEmbeddings`) so consecutive fires reveal which key changed.
+- `DISCOVER_UNEXP_FIRE` / `_DONE` — wrapping the Unexplored LE with its key payload (`songsCount`, `embeddingsRowCount`, `unexploredManualRefreshCounter`, `hasEmbeddings`).
+- `DISCOVER_HYDRATE_HIT` / `_SKIP` — fired by the cache hydration LE. SKIP variants tag the reason (`notReady`, `no snapshot yet`, `fingerprint mismatch`) with the cached vs live fingerprint and section sizes.
+- `REBUILD_PULSE` — fires inside `rebuildSignal.collect` so every fav/dislike toggle that triggers a Discover refresh shows up explicitly with the reason.
+- `DISCOVER_PULL_REFRESH` — fires inside the pull-to-refresh onRefresh callback with the new counter value.
+- `PERF_DB_START` / `_DONE` — wrapping `refreshDbStats` with rowCount, dim, vecExtLoaded, embeddedFilenames/paths sizes, and elapsedMs.
+- `PERF_RECOMMEND_DONE` — wrapping `recommender.recommendScored` in the Most Similar LE with mediaId, hasEmbeddings, embeddingsRowCount, resultCount, elapsedMs.
+
+**Tier 2 — DiscoverCacheEngine instrumentation** (`DiscoverCacheEngine.kt`, `AppContainer.kt`).
+- Constructor gains optional `activityLog: ActivityLogEngine?` param (null-safe for unit tests). AppContainer wires the real instance.
+- `init { ... }` logs `DISCOVER_CACHE_LOAD` with `loadElapsedMs`, `loadError`, `computedAt`, `cacheAgeMs`, `fingerprint`, and all section sizes — so we see whether disk read succeeded and what shape was loaded.
+- `save(...)` logs `DISCOVER_CACHE_SAVE` on every real write (with the four section sizes + fingerprint + currentMediaId). Empty-section saves still hit `DISCOVER_CACHE_SAVE_NOOP` so we can tell whether save was called but skipped vs not called at all.
+
+**Tier 3 — Activity lifecycle visibility** (`MainActivity.kt`).
+- Static `processStartedAt` + `onCreateCount` companion fields. First onCreate in a process logs `ACTIVITY_PROCESS_COLD`; subsequent onCreates in the same process log `ACTIVITY_RECREATED` with `processAgeMs` — distinguishes "OS recreated MainActivity but the song kept playing because the service is alive" from a true process restart.
+- Existing lifecycle DisposableEffect extended to log `ACTIVITY_LIFECYCLE event=ON_<STATE>` for every transition (CREATE/START/RESUME/PAUSE/STOP/DESTROY) with `serviceAlive` + `serviceIsPlaying` snapshots.
+
+**Tier 4 — Fix #1: drop `historyStats.size` from For You + BYP LE keys.**
+Controlled-test data captured at 19:24-19:41 (push #77 base build) showed `historyStatsSize` ticking on every fresh-song play (38 → 39 → 40 → 41 → 42 → 43 over 17 minutes), and each tick re-fired the For You + BYP LE — five unwanted rebuilds purely from "first listen of an unseen song", which the user perceived as "refreshing randomly". Push #70 had left `historyStats.size` in the key set as a safety net for "fresh user with no history yet" but the cold-start path is already covered by `songs.isNotEmpty()` and `embeddingsRowCount` flipping from null/empty on first boot. Removed `historyStats.size` from the LE key list. Auto-refresh now driven exclusively by `forYouTick / 5` (intentional 5-listen window) and `rebuildPulse` (favorite/dislike toggle). Post-fix log (20:00 build) confirmed: between cold-starts with `historyStatsSize: 44` and `45`, ZERO mid-playback fires.
+
+**Tier 5 — Path A library-load timing.**
+User reported a separate "Discover page blank for 1-2 seconds after Activity recreation". Push #77 diagnostic data showed the cache loads from disk in ~6-205ms (`DISCOVER_CACHE_LOAD loadElapsedMs`), but hydration is gated on `songs.isNotEmpty()` because hydrate maps cached filenames → live Song objects via `songs.associateBy { it.filename }`. New `LIBRARY_LOAD_START` / `_DONE` markers wrap `LibraryCache.loadOrScan(ctx)` to measure exactly how long the song-list load takes — that's the gate that holds Discover blank. Data path for the "blank" decision parked pending the user's next test run.
+
+**Slow-recommender mystery (logged, not fixed).** The diagnostic also surfaced two events where `recommendScored` and the For You + BYP build BOTH ran 19,450ms / 19,654ms (vs the normal 20-114ms / 248-375ms). Both happened immediately after foreground-resume bursts. Working hypothesis: `EmbeddingDbManager` single-HandlerThread queue contention during the resume flurry, but two data points isn't enough to commit to a fix. Left for future investigation when it reproduces with the timing instrumentation in place.
+
+**Files modified**
+- `native/app/src/main/kotlin/com/isaivazhi/app/MainActivity.kt` — companion-object `processStartedAt` + `onCreateCount`; `ACTIVITY_PROCESS_COLD` / `ACTIVITY_RECREATED` log in `onCreate`; `ACTIVITY_LIFECYCLE` log in the existing DisposableEffect; `DISCOVER_FORYOU_FIRE` / `_DONE` around the For You + BYP LE (key list with `historyStats.size` removed); `DISCOVER_UNEXP_FIRE` / `_DONE` around the Unexplored LE; `DISCOVER_HYDRATE_HIT` / `_SKIP` inside the hydration LE; `REBUILD_PULSE` inside `rebuildSignal.collect`; `DISCOVER_PULL_REFRESH` inside `onRefresh`; `PERF_DB_START` / `_DONE` around `refreshDbStats`; `PERF_RECOMMEND_DONE` after the Most Similar LE's `recommendScored`; `LIBRARY_LOAD_START` / `_DONE` around `LibraryCache.loadOrScan`.
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/DiscoverCacheEngine.kt` — constructor optional `activityLog`; `init` logs `DISCOVER_CACHE_LOAD`; `save` logs `DISCOVER_CACHE_SAVE` (real) or `DISCOVER_CACHE_SAVE_NOOP` (skipped).
+- `native/app/src/main/kotlin/com/isaivazhi/app/engine/AppContainer.kt` — passes `activityLog` to `DiscoverCacheEngine` constructor.
+
+---
+
 ### 2026-05-14 #76 — Watermark/instId bug that silently dropped background auto-advances + one-time migration to recover lost plays + legacy duplicate cleanup
 
 User installed push #75 and reported all three previous issues are still present: recent plays missing from Taste Signal AND Recently Played, duplicates still appearing, notification heart not syncing. Activity Log shows extensive playback (Ponni Nadhi 1%→6%→11% then 14 minutes of idle background → Hey Rama Rama at 91%) but NO `REPLAY`/`INGEST` entries fired between 10:05:28 and 10:19:42 cold-start, even though the service was playing in the background through multiple auto-advances.

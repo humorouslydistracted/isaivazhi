@@ -177,6 +177,17 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var container: AppContainer
 
+    companion object {
+        // Push #77 diagnostic: detect process-cold vs Activity-cold restarts.
+        // Static fields keep their values across Activity recreations within
+        // the same process. If onCreateCount > 1 at MainActivity.onCreate time
+        // but the field was already initialised, the Activity was recreated
+        // while the process stayed alive (the "app reloads everything but the
+        // song keeps playing" symptom).
+        private val processStartedAt: Long = System.currentTimeMillis()
+        @Volatile private var onCreateCount: Int = 0
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -186,6 +197,25 @@ class MainActivity : ComponentActivity() {
         DebugLogCapture.installCrashHandler(applicationContext)
 
         container = AppContainer(applicationContext)
+
+        // Push #77 diagnostic: log every Activity onCreate with the
+        // process-cold vs Activity-cold distinction surfaced.
+        onCreateCount++
+        val processAgeMs = System.currentTimeMillis() - processStartedAt
+        val isProcessCold = onCreateCount == 1
+        container.activityLog.log(
+            category = "engine",
+            type = if (isProcessCold) "ACTIVITY_PROCESS_COLD" else "ACTIVITY_RECREATED",
+            message = if (isProcessCold) "Activity.onCreate (process cold, onCreateCount=1)"
+            else "Activity.onCreate (process alive, onCreateCount=$onCreateCount processAgeMs=$processAgeMs)",
+            data = mapOf(
+                "onCreateCount" to onCreateCount,
+                "processAgeMs" to processAgeMs,
+                "isProcessCold" to isProcessCold,
+                "savedInstanceStateNull" to (savedInstanceState == null),
+                "serviceAlive" to (com.isaivazhi.app.Media3PlaybackService.INSTANCE != null),
+            ),
+        )
 
         CoroutineScope(Dispatchers.Default).launch {
             try { container.embeddingDb.migrateFromLegacy() }
@@ -347,6 +377,22 @@ private fun AppRoot(container: AppContainer) {
 
     DisposableEffect(lifecycleOwner, permission.granted) {
         val observer = LifecycleEventObserver { _, event ->
+            // Push #77 diagnostic: log every lifecycle transition so we can
+            // see when the Activity backgrounds / foregrounds / stops, and
+            // correlate with re-runs of the cold-start LE.
+            val svc = com.isaivazhi.app.Media3PlaybackService.INSTANCE
+            container.activityLog.log(
+                category = "engine",
+                type = "ACTIVITY_LIFECYCLE",
+                message = "Activity lifecycle: ${event.name}",
+                data = mapOf(
+                    "event" to event.name,
+                    "permissionGranted" to permission.granted,
+                    "songsCount" to latestSongs.size,
+                    "serviceAlive" to (svc != null),
+                    "serviceIsPlaying" to (svc?.let { runCatching { it.javaClass.getMethod("getCurrentMediaIdSnapshot").invoke(it) as? String }.getOrNull()?.isNotEmpty() } ?: false),
+                ),
+            )
             if (event == Lifecycle.Event.ON_RESUME && permission.granted) {
                 val currentSongs = latestSongs
                 if (currentSongs.isNotEmpty()) {
@@ -539,7 +585,30 @@ private fun AppRoot(container: AppContainer) {
     LaunchedEffect(permission.granted) {
         if (permission.granted) {
             try {
+                // Path A diagnostic — measure LibraryCache.loadOrScan timing.
+                // This is the gate that holds back DiscoverCacheEngine
+                // hydration (which requires songs.isNotEmpty() before it
+                // can map cached filenames → Song objects). User reports
+                // ~1-2s blank-Discover after Activity recreation; we want
+                // to know if it's this call or something downstream.
+                val libStartMs = System.currentTimeMillis()
+                container.activityLog.log(
+                    category = "engine",
+                    type = "LIBRARY_LOAD_START",
+                    message = "LibraryCache.loadOrScan start",
+                    data = mapOf("permissionGranted" to permission.granted),
+                )
                 songs = LibraryCache.loadOrScan(ctx)
+                val libElapsed = System.currentTimeMillis() - libStartMs
+                container.activityLog.log(
+                    category = "engine",
+                    type = "LIBRARY_LOAD_DONE",
+                    message = "LibraryCache.loadOrScan done in ${libElapsed}ms (songs=${songs.size})",
+                    data = mapOf(
+                        "songsCount" to songs.size,
+                        "elapsedMs" to libElapsed,
+                    ),
+                )
                 scanError = null
                 coroutineScope.launch(Dispatchers.IO) {
                     try { ArtPrefetch.prefetch(ctx, songs, limit = 200) }
@@ -551,10 +620,32 @@ private fun AppRoot(container: AppContainer) {
 
     LaunchedEffect(permission.granted, songs.size) {
         if (permission.granted && songs.isNotEmpty() && embeddingsRowCount == null) {
+            // Diagnostic — Discover load timing. Additive only.
+            val dbStartMs = System.currentTimeMillis()
+            container.activityLog.log(
+                category = "engine",
+                type = "PERF_DB_START",
+                message = "refreshDbStats start (songs=${songs.size})",
+                data = mapOf("songsCount" to songs.size),
+            )
             refreshDbStats(container) { rc, dim, ext, fns, fps ->
                 embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                 embeddedFilenames = fns
                 embeddedFilepaths = fps
+                val elapsed = System.currentTimeMillis() - dbStartMs
+                container.activityLog.log(
+                    category = "engine",
+                    type = "PERF_DB_DONE",
+                    message = "refreshDbStats done in ${elapsed}ms (rows=$rc dim=$dim vecExt=$ext)",
+                    data = mapOf(
+                        "rowCount" to rc,
+                        "dim" to dim,
+                        "vecExtLoaded" to ext,
+                        "embeddedFilenames" to fns.size,
+                        "embeddedFilepaths" to fps.size,
+                        "elapsedMs" to elapsed,
+                    ),
+                )
             }
             artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) }
         }
@@ -811,11 +902,26 @@ private fun AppRoot(container: AppContainer) {
         kotlinx.coroutines.delay(250)
         val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
         val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
+        // Diagnostic — Discover Most Similar recommender timing. Additive only.
+        val recStartMs = System.currentTimeMillis()
         mostSimilar = if (hasEmbeddings) {
             runCatching {
                 container.recommender.recommendScored(current, songs, k = 10, adventurous = tuning.adventurous)
             }.getOrDefault(emptyList())
         } else emptyList()
+        val recElapsed = System.currentTimeMillis() - recStartMs
+        container.activityLog.log(
+            category = "engine",
+            type = "PERF_RECOMMEND_DONE",
+            message = "Most Similar done in ${recElapsed}ms (hasEmb=$hasEmbeddings k=${mostSimilar.size})",
+            data = mapOf(
+                "mediaId" to mediaId,
+                "hasEmbeddings" to hasEmbeddings,
+                "embeddingsRowCount" to (embeddingsRowCount ?: 0),
+                "resultCount" to mostSimilar.size,
+                "elapsedMs" to recElapsed,
+            ),
+        )
     }
 
     // Discover queue (consumed by Taste's Engine Snapshot card + the auto-
@@ -867,6 +973,16 @@ private fun AppRoot(container: AppContainer) {
     LaunchedEffect(Unit) {
         container.rebuildSignal.collect { reason ->
             android.util.Log.i("MainActivity", "rebuildSignal received: $reason → triggering refresh")
+            container.activityLog.log(
+                category = "engine",
+                type = "REBUILD_PULSE",
+                message = "rebuildSignal received: $reason → triggering Discover refresh",
+                data = mapOf(
+                    "reason" to reason,
+                    "rebuildPulseBefore" to rebuildPulse,
+                    "rebuildPulseAfter" to (rebuildPulse + 1),
+                ),
+            )
             rebuildPulse++
         }
     }
@@ -949,17 +1065,42 @@ private fun AppRoot(container: AppContainer) {
 
     // Push #70 — For You + Because You Played LE (the "listen-responsive"
     // sections). Dropped `qualifyingEventCount` from the key set because
-    // it changed on every qualified listen, which thrashed the LE. We
-    // now rely on `forYouTick / 5` (intentional 5-listen window) and
-    // `historyStats.size` (which only changes when a brand-new song is
-    // added to history). `rebuildPulse` fires on favorite/dislike toggle.
+    // it changed on every qualified listen, which thrashed the LE.
+    // Push #77 — ALSO dropped `historyStats.size` from the keys. It ticks
+    // every time the user plays a song they've never played before — for
+    // a 2470-song library that is essentially every other play, which
+    // re-fired the LE 5+ times in a 17-minute session (confirmed via
+    // DISCOVER_FORYOU_FIRE diagnostic, logs.txt 19:24-19:41). Auto-refresh
+    // is now driven exclusively by `forYouTick / 5` (the intentional
+    // 5-listen window) and `rebuildPulse` (favorite/dislike). Cold-start
+    // path stays alive via `songs.isNotEmpty()` and `embeddingsRowCount`
+    // flipping from empty/null.
     LaunchedEffect(
-        historyStats.size, songs.isNotEmpty(), embeddingsRowCount,
+        songs.isNotEmpty(), embeddingsRowCount,
         tuning.adventurous, tuning.sessionBias, tuning.negativeStrength,
         forYouTick / 5,
         rebuildPulse,
     ) {
         val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
+        // Diagnostic — Discover For You + BYP fire. Captures every key value
+        // so we can see which one flipped between consecutive fires.
+        container.activityLog.log(
+            category = "engine",
+            type = "DISCOVER_FORYOU_FIRE",
+            message = "For You + BYP LE fired (hasEmb=$hasEmbeddings)",
+            data = mapOf(
+                "historyStatsSize" to historyStats.size,
+                "songsCount" to songs.size,
+                "embeddingsRowCount" to (embeddingsRowCount ?: -1),
+                "adventurous" to tuning.adventurous,
+                "sessionBias" to tuning.sessionBias,
+                "negativeStrength" to tuning.negativeStrength,
+                "forYouTick" to forYouTick,
+                "forYouTickDiv5" to (forYouTick / 5),
+                "rebuildPulse" to rebuildPulse,
+                "hasEmbeddings" to hasEmbeddings,
+            ),
+        )
         if (songs.isEmpty() || !hasEmbeddings) return@LaunchedEffect
         kotlinx.coroutines.delay(250)
         val randomize = forYouTick >= 5
@@ -1000,6 +1141,19 @@ private fun AppRoot(container: AppContainer) {
                 "BYP empty: qualifyingHistoryEvents=$qualifyingRecent — need more listened songs at >=30%"
             )
         }
+        container.activityLog.log(
+            category = "engine",
+            type = "DISCOVER_FORYOU_DONE",
+            message = "For You + BYP built in ${builtMs}ms (forYou=${forYou.size} BYP=${becauseYouPlayed.size} randomize=$randomize)",
+            data = mapOf(
+                "forYouCount" to forYou.size,
+                "bypAnchors" to becauseYouPlayed.size,
+                "bypTotalRecs" to becauseYouPlayed.sumOf { it.second.size },
+                "qualifyingRecent" to qualifyingRecent,
+                "randomize" to randomize,
+                "elapsedMs" to builtMs,
+            ),
+        )
         if (randomize) container.session.resetForYouTick()
         container.discoverCache.save(
             mostSimilarFilenames = mostSimilar.map { it.song.filename },
@@ -1026,6 +1180,21 @@ private fun AppRoot(container: AppContainer) {
     // visible "Unexplored Sounds shuffles after every song" bug.
     LaunchedEffect(songs.isNotEmpty(), embeddingsRowCount, unexploredManualRefreshCounter) {
         val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
+        // Diagnostic — Unexplored LE fired. The user reported this section
+        // refreshes "randomly", but its key set is supposed to be narrow
+        // (cold-start, embeddings landed, or pull-to-refresh only). Log
+        // every fire with the current key values so we can verify.
+        container.activityLog.log(
+            category = "engine",
+            type = "DISCOVER_UNEXP_FIRE",
+            message = "Unexplored LE fired (hasEmb=$hasEmbeddings)",
+            data = mapOf(
+                "songsCount" to songs.size,
+                "embeddingsRowCount" to (embeddingsRowCount ?: -1),
+                "unexploredManualRefreshCounter" to unexploredManualRefreshCounter,
+                "hasEmbeddings" to hasEmbeddings,
+            ),
+        )
         if (songs.isEmpty() || !hasEmbeddings) {
             android.util.Log.i(
                 "DiscoverLE",
@@ -1050,6 +1219,16 @@ private fun AppRoot(container: AppContainer) {
             "DiscoverLE",
             "Unexplored done: clusters=${unexploredClusters.size} totalSongs=${unexploredClusters.sumOf { it.size }} (took ${builtMs}ms)"
         )
+        container.activityLog.log(
+            category = "engine",
+            type = "DISCOVER_UNEXP_DONE",
+            message = "Unexplored built in ${builtMs}ms (clusters=${unexploredClusters.size})",
+            data = mapOf(
+                "clusters" to unexploredClusters.size,
+                "totalSongs" to unexploredClusters.sumOf { it.size },
+                "elapsedMs" to builtMs,
+            ),
+        )
     }
 
     // Push #64: on cold start, hydrate the Discover sections from the
@@ -1058,9 +1237,28 @@ private fun AppRoot(container: AppContainer) {
     // available. Sections still in `emptyList()` after hydration mean
     // either no cache yet or no library overlap.
     LaunchedEffect(discoverCacheLoaded, songs.isNotEmpty()) {
-        if (!discoverCacheLoaded || songs.isEmpty()) return@LaunchedEffect
+        if (!discoverCacheLoaded || songs.isEmpty()) {
+            container.activityLog.log(
+                category = "engine",
+                type = "DISCOVER_HYDRATE_SKIP",
+                message = "Cache hydrate skipped (notReady)",
+                data = mapOf(
+                    "cacheLoaded" to discoverCacheLoaded,
+                    "songsCount" to songs.size,
+                ),
+            )
+            return@LaunchedEffect
+        }
         val snap = discoverCacheState
-        if (snap.computedAt == 0L) return@LaunchedEffect
+        if (snap.computedAt == 0L) {
+            container.activityLog.log(
+                category = "engine",
+                type = "DISCOVER_HYDRATE_SKIP",
+                message = "Cache hydrate skipped (no cached snapshot yet)",
+                data = mapOf("computedAt" to 0L),
+            )
+            return@LaunchedEffect
+        }
         // Push #68: validate cache freshness via fingerprint comparison.
         // If the recommendation policy has materially shifted since the
         // cache was written (top ±30 reshuffled, hard-block set changed),
@@ -1073,10 +1271,28 @@ private fun AppRoot(container: AppContainer) {
                 "MainActivity",
                 "Discover cache fingerprint mismatch — skipping hydration cached=${snap.recommendationFingerprint} live=$liveFingerprint"
             )
+            container.activityLog.log(
+                category = "engine",
+                type = "DISCOVER_HYDRATE_SKIP",
+                message = "Cache hydrate skipped (fingerprint mismatch)",
+                data = mapOf(
+                    "cachedFingerprint" to snap.recommendationFingerprint,
+                    "liveFingerprint" to liveFingerprint,
+                    "cacheAgeMs" to (System.currentTimeMillis() - snap.computedAt),
+                    "cacheMostSimilar" to snap.mostSimilarFilenames.size,
+                    "cacheForYou" to snap.forYouFilenames.size,
+                    "cacheBypAnchors" to snap.byp.size,
+                    "cacheUnexploredClusters" to snap.unexploredFilenamesByCluster.size,
+                ),
+            )
             return@LaunchedEffect
         }
         val byFn = songs.associateBy { it.filename }
         fun hydrate(fns: List<String>): List<Song> = fns.mapNotNull { byFn[it] }
+        val msBeforeMostSim = mostSimilar.size
+        val msBeforeForYou = forYou.size
+        val msBeforeByp = becauseYouPlayed.size
+        val msBeforeUnexp = unexploredClusters.size
         if (mostSimilar.isEmpty()) {
             mostSimilar = hydrate(snap.mostSimilarFilenames).map {
                 com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
@@ -1100,6 +1316,23 @@ private fun AppRoot(container: AppContainer) {
             unexploredClusters = snap.unexploredFilenamesByCluster.map { hydrate(it) }
                 .filter { it.isNotEmpty() }
         }
+        container.activityLog.log(
+            category = "engine",
+            type = "DISCOVER_HYDRATE_HIT",
+            message = "Cache hydrated (mostSim=${mostSimilar.size} forYou=${forYou.size} byp=${becauseYouPlayed.size} unexp=${unexploredClusters.size})",
+            data = mapOf(
+                "fingerprint" to liveFingerprint,
+                "cacheAgeMs" to (System.currentTimeMillis() - snap.computedAt),
+                "mostSimilarBefore" to msBeforeMostSim,
+                "mostSimilarAfter" to mostSimilar.size,
+                "forYouBefore" to msBeforeForYou,
+                "forYouAfter" to forYou.size,
+                "bypBefore" to msBeforeByp,
+                "bypAfter" to becauseYouPlayed.size,
+                "unexpBefore" to msBeforeUnexp,
+                "unexpAfter" to unexploredClusters.size,
+            ),
+        )
     }
 
     val currentSongFilePath: String? = playbackState.currentMediaId?.let { mediaId ->
@@ -1762,6 +1995,15 @@ private fun AppRoot(container: AppContainer) {
                                     android.util.Log.i(
                                         "DiscoverLE",
                                         "Pull-to-refresh: tick Unexplored counter → $unexploredManualRefreshCounter"
+                                    )
+                                    container.activityLog.log(
+                                        category = "ui",
+                                        type = "DISCOVER_PULL_REFRESH",
+                                        message = "User pulled to refresh Discover",
+                                        data = mapOf(
+                                            "unexploredManualRefreshCounter" to unexploredManualRefreshCounter,
+                                            "currentMediaId" to (playbackState.currentMediaId ?: ""),
+                                        ),
                                     )
                                     // Pull-to-refresh resets the auto-refresh window.
                                     container.session.resetForYouTick()

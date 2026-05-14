@@ -18,10 +18,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshState
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
@@ -300,13 +302,72 @@ private fun NoEmbeddingPlaceholder(onOpenAiPage: () -> Unit) {
  */
 @Composable
 private fun DiscoverInsightsStrip(snapshot: EngineSnapshot, onClick: () -> Unit) {
+    // Push #78: tap the pill to open a dialog that explains what the
+    // three percentages mean. Capacitor parity (engine-session-ui.js
+    // labels: "This song / Session / All-time"). The dialog also offers a
+    // "Tune in Taste page" button which delegates to the existing onClick
+    // so users can jump straight to the Session-weight slider.
+    var showBlendInfo by remember { mutableStateOf(false) }
+    if (showBlendInfo) {
+        AlertDialog(
+            onDismissRequest = { showBlendInfo = false },
+            title = { Text("Recommendation blend") },
+            text = {
+                Column {
+                    Text(
+                        "Up Next picks are a mix of three signals. The three numbers tell you how much each one is contributing right now.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    BlendInfoRow(
+                        label = "This song",
+                        percent = snapshot.blendCurrent,
+                        description = "How much recommendations should sound like the song playing right now.",
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    BlendInfoRow(
+                        label = "Session",
+                        percent = snapshot.blendSession,
+                        description = "How much recommendations should sound like what you've played since opening the app.",
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    BlendInfoRow(
+                        label = "All-time",
+                        percent = snapshot.blendProfile,
+                        description = "How much recommendations should sound like your long-term taste profile (top-played tracks).",
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "Mode: ${snapshot.blendMode}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Move the \"Session weight\" slider on the Taste page to shift the blend.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBlendInfo = false
+                    onClick()
+                }) { Text("Open Taste page") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBlendInfo = false }) { Text("Close") }
+            },
+        )
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 6.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .clickable(onClick = onClick)
+            .clickable { showBlendInfo = true }
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -334,6 +395,30 @@ private fun DiscoverInsightsStrip(snapshot: EngineSnapshot, onClick: () -> Unit)
             text = "Up Next: ${snapshot.queueSize} ${snapshot.queueMode}",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+@Composable
+private fun BlendInfoRow(label: String, percent: String, description: String) {
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = percent,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Text(
+            text = description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }

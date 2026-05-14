@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
@@ -255,7 +256,11 @@ fun TasteScreen(
                 TuningRow(
                     label = "Adventurous",
                     value = tuning.adventurous,
-                    description = "Higher = more diverse picks (spread across library). Lower = stick close to current song.",
+                    // Push #78: tooltip text copied verbatim from the
+                    // Capacitor build (`app-taste-ui.js:390`) so the user
+                    // gets the same explanation they saw in the working
+                    // baseline. Surfaced via the info ⓘ icon in TuningRow.
+                    description = "Higher = more diverse Up Next picks (spread across your library). Lower = stick closer to what you just played. Internally drives MMR's diversity weight (engine maps adventurous → 1−lambda so the label matches the math).",
                     onChange = onAdventurousChange,
                     onReset = onAdventurousReset,
                 )
@@ -264,7 +269,7 @@ fun TasteScreen(
                 TuningRow(
                     label = "Session weight",
                     value = tuning.sessionBias,
-                    description = "Higher = follow current-session mood. Lower = lean on long-term taste profile.",
+                    description = "Higher = recs follow the mood of what you're playing right now. Lower = lean on long-term taste profile.",
                     onChange = onSessionBiasChange,
                     onReset = onSessionBiasReset,
                 )
@@ -273,7 +278,7 @@ fun TasteScreen(
                 TuningRow(
                     label = "Skip strength",
                     value = tuning.negativeStrength,
-                    description = "Higher = songs you skip pull recommendations farther from their sound.",
+                    description = "Higher = songs in your Negative list (X'd, disliked, repeat-skipped) pull recommendations farther away from their sound.",
                     onChange = onNegativeStrengthChange,
                     onReset = onNegativeStrengthReset,
                 )
@@ -545,6 +550,19 @@ private fun TuningRow(
     var drag by remember(value) { mutableStateOf<Float?>(null) }
     val displayed = drag ?: value
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    // Push #78: tooltip dialog (Capacitor parity). Tap the ⓘ icon to see
+    // what this slider does without leaving the page.
+    var showInfo by remember { mutableStateOf(false) }
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            title = { Text(label) },
+            text = { Text(description) },
+            confirmButton = {
+                TextButton(onClick = { showInfo = false }) { Text("Got it") }
+            },
+        )
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -559,6 +577,17 @@ private fun TuningRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        IconButton(
+            onClick = { showInfo = true },
+            modifier = Modifier.size(28.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Info,
+                contentDescription = "About $label",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+        }
         Slider(
             value = displayed,
             onValueChange = { drag = it },

@@ -169,7 +169,7 @@ class AppContainer(private val appContext: Context) {
     // Push #64: persistent Discover snapshot so cold start renders the
     // page from cache instantly while fresh data overlays in the
     // background. Capacitor parity: `lastProfile` cache.
-    val discoverCache: DiscoverCacheEngine by lazy { DiscoverCacheEngine(appContext) }
+    val discoverCache: DiscoverCacheEngine by lazy { DiscoverCacheEngine(appContext, activityLog) }
 
     // Push #69: app-wide activity log for non-playback events. Capacitor
     // parity: `engine.activity` separate from SignalTimeline.
