@@ -187,6 +187,16 @@ User confirmed latest #76 APK was installed and all four issues still persisted:
 4. Toggle favorite from notification/lockscreen, reopen the app, and check the mini-player heart. Startup reconciliation should align the Kotlin heart even if live IPC did not fire.
 5. For the previous 0% capture scenario, expand any `LEDGER`/`SKIP`/`LISTEN` Activity Log entry and confirm played/duration/fraction are non-zero when the service had prior progress.
 
+### 2026-05-14 #79 — App display name rename: "IsaiVazhi (Kotlin)" → "IsaiVazhi"
+
+User decided to retire the Capacitor build (`com.isaivazhi.app`) and let the Kotlin port use the plain "IsaiVazhi" label going forward. Single-line change in `native/app/src/main/res/values/strings.xml` (`app_name`). `applicationId` remains `com.isaivazhi.app.kt` so existing data + installed state are preserved — only the home-screen label changes.
+
+Install path: `adb uninstall com.isaivazhi.app` (removes the Capacitor build to free the icon name), then `adb install -r app-debug.apk` (installs the renamed Kotlin build).
+
+**Build:** BUILD SUCCESSFUL in 8s. APK 328 MB at `2026-05-14 21:50`.
+
+---
+
 ### 2026-05-14 #78 — Slider info tooltips + blend pill explanation dialog (Capacitor parity)
 
 User: "i myself dont understand what 50%/30%/20% means and no info of it anywhere really. for the 3 slider knobs in the taste page, add info toast which when clicked should show the info of what that does, its present in capacitor code."
