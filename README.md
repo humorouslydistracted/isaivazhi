@@ -1,90 +1,141 @@
 # IsaiVazhi
 
-An offline-first Android music player that learns from how you actually listen — no accounts, no streaming, no tracking.
+IsaiVazhi is an offline-first Android music player that learns from local
+listening behavior. It combines native playback, durable background signal
+capture, and CLAP audio embeddings to recommend music without accounts,
+streaming, tracking, or a server.
 
-**v2.x (current): full Kotlin / Jetpack Compose rewrite.** UI, recommender, signal capture, and persistence are all native Kotlin. Playback runs on Media3 `MediaSessionService` + `ExoPlayer`. The pre-rewrite Capacitor build (HTML/CSS/JS UI on top of the same Media3 stack) lived through v1.x and is archived in [`capasitor_legacy.md`](capasitor_legacy.md). Application id: `com.isaivazhi.app.kt` (the legacy Capacitor build used `com.isaivazhi.app`, so both can coexist on one device).
+Current release: `v3.1.2`
 
----
+<p align="center">
+  <img src="docs/screenshots/discover.png" width="23%" alt="Discover recommendations">
+  <img src="docs/screenshots/library.png" width="23%" alt="Songs library">
+  <img src="docs/screenshots/now-playing.png" width="23%" alt="Now playing">
+  <img src="docs/screenshots/song-actions.png" width="23%" alt="Song actions">
+</p>
 
-## Features
+## Why It Exists
 
-- **Local library scan** from MediaStore — no server, no account, no tracking.
-- **Native Android playback** with proper lockscreen / notification controls, audio focus, Bluetooth / head-unit media metadata, custom favorite / close actions.
-- **AI recommender** that blends:
-  - direct playback signals (plays, skips, completions, favorites, dislikes) with Capacitor-parity scoring formulas
-  - CLAP audio-embedding similarity (top-10 neighbor cascading boost on every playback / favorite / dislike / queue-remove)
-  - recency decay (`0.5^(daysSince/30)` half-life), favorite / dislike priors that fade with plays
-  - strongly-negative songs hard-blocked from Up Next (top 18% by negative strength, floor ≥ 1.5)
-- **Discover surfaces**: Most Similar (similarity-only, supports Freeze), For You, Because You Played, Unexplored Sounds.
-- **Taste Signal page** with chip-rich per-song rows (Favorite / Disliked / Mixed / X N / Similarity ±N / Top ±30 / Short-listened / Rec blocked / Neutral), tunable knobs (Adventurous / Session weight / Skip strength), engine snapshot, per-event audit timeline with copyable logs.
-- **Playlists, Albums, Up Next** with drag-reorder, swipe-remove, album long-press menu (Play / Shuffle / Delete).
-- **Robust signal capture** at the service level — accumulator survives Activity destruction, Doze, and seeks.
-- **Built-in embedding manager** (AI page): scan, embed, retry, dedupe (filepath + audio-identical groups), purge stale rows.
+Most music apps optimize for streaming catalogs. IsaiVazhi is built for people
+with personal music libraries who still want recommendation behavior that feels
+adaptive. The app keeps the music, embeddings, listening history, favorites,
+dislikes, playlists, and recommendation state on the device.
 
-## Install (easy path)
+## Highlights
 
-Download `app-debug.apk` from the [latest release](../../releases/latest) and install on Android (sideload — you'll need to allow "Install unknown apps" for your browser / file manager).
+- Native Android player built with Kotlin, Jetpack Compose, Media3, and ExoPlayer.
+- Offline recommendation engine that blends current song, session taste,
+  long-term taste, explicit feedback, skip behavior, and CLAP similarity.
+- Background-safe playback signal capture through a Media3 `MediaSessionService`.
+- Discover surfaces for "For You", "Because You Played", similar tracks, and
+  underexplored parts of the library.
+- Taste Signal page with audit-style playback evidence, tuning controls, and
+  visible positive/negative signals.
+- Playlist, album, Up Next, favorites, disliked songs, search, and batch delete
+  flows for local libraries.
+- AI management page for importing embeddings, scanning coverage, retrying
+  failures, detecting duplicates, and cleaning stale rows.
+- Kaggle, Colab, and local scripts for precomputing CLAP embeddings.
 
-Then generate embeddings for your music — see **Embeddings pipeline** below.
+## Tech Stack
 
-## Build from source
+| Area | Choices |
+| --- | --- |
+| App | Kotlin, Jetpack Compose, Material 3 |
+| Playback | Media3 `MediaSessionService`, ExoPlayer, Android media notification controls |
+| Persistence | DataStore Preferences, SQLite, sqlite-vec |
+| Recommendations | CLAP audio embeddings, vector similarity, session/taste scoring, recency decay |
+| Native acceleration | C++ / NEON vector dot-product path |
+| Tooling | Gradle, Android SDK 36, Python embedding scripts for Kaggle/Colab/local GPU |
+
+## Repository Layout
+
+```text
+.
+|-- native/                  # Android app source
+|   |-- app/src/main/kotlin/ # Compose UI and Kotlin engines
+|   |-- app/src/main/java/   # Media3 service and embedding database bridge
+|   |-- app/src/main/cpp/    # Native vector acceleration
+|   `-- gradle/              # Gradle wrapper
+|-- tools/embeddings/        # Kaggle, Colab, local, and merge tools
+|-- docs/
+|   |-- architecture.md
+|   `-- screenshots/
+|-- LICENSE
+`-- README.md
+```
+
+See [docs/architecture.md](docs/architecture.md) for a deeper overview.
+
+## Install
+
+Download the APK from the latest GitHub release and sideload it on Android.
+Because the app is not installed from the Play Store, Android will ask you to
+allow installs from your browser or file manager.
+
+## Build From Source
 
 Requirements:
-- Android Studio (latest stable) with NDK installed.
-- JDK 17+ — easiest is the JBR that ships with Android Studio (`/path/to/Android Studio/jbr`).
-- Android SDK API level 36+.
+
+- Android Studio with Android SDK API 36+
+- JDK 17 or newer. The JBR bundled with Android Studio works well.
+- Android NDK for the native acceleration target
 
 ```bash
 git clone https://github.com/humorouslydistracted/isaivazhi.git
 cd isaivazhi
+
+# Point this at your local Android SDK.
 echo "sdk.dir=/path/to/Android/Sdk" > native/local.properties
-# Point JAVA_HOME at the Android Studio JBR (path varies per OS):
+
+# Point JAVA_HOME at Android Studio's bundled JBR or any compatible JDK 17+.
 export JAVA_HOME="/path/to/Android Studio/jbr"
-cd native && ./gradlew :app:assembleDebug
-# APK: native/app/build/outputs/apk/debug/app-debug.apk
+
+cd native
+./gradlew :app:assembleDebug
 ```
 
-The optional CLAP ONNX encoder (`clap_audio_encoder.onnx` + `.data`, ~272 MB) is intentionally not bundled — the on-device inference path is unused. Embeddings are precomputed in Colab / locally and copied into the SQLite store (see below).
+Debug APK:
 
-## Embeddings pipeline
-
-The recommender's similarity arm needs precomputed CLAP embeddings of your library, stored in the app's SQLite database. Two workflows:
-
-1. **Colab (free, slow)**: open `colab_embedding_generator.py`, upload your music, run cells. Produces a `.pkl` file → use the in-app **Import** flow in the AI page.
-2. **Local (faster, requires GPU)**: `python local_embedding_generator.py /path/to/music`. Same output.
-3. (Optional) `merge_local_embeddings.py` if you generate in batches.
-
-The app's **AI page** handles import, dedupe, scan, retry-failed, and a per-song / per-album manager.
-
-## Project layout
-
+```text
+native/app/build/outputs/apk/debug/app-debug.apk
 ```
-.
-├── native/                       # Kotlin/Compose Android project (the app)
-│   ├── app/
-│   │   ├── build.gradle.kts
-│   │   ├── proguard-rules.pro
-│   │   └── src/main/
-│   │       ├── AndroidManifest.xml
-│   │       ├── kotlin/com/isaivazhi/app/        # UI + engines (~30 .kt files)
-│   │       ├── java/com/isaivazhi/app/          # Media3 service, embedding DB (legacy Java)
-│   │       ├── cpp/                              # NEON SIMD dot-product accelerator
-│   │       ├── jniLibs/                          # sqlite-vec prebuilt .so per ABI
-│   │       └── res/                              # icons, themes, strings
-│   ├── build.gradle.kts
-│   ├── settings.gradle.kts
-│   ├── gradle.properties
-│   └── gradle/wrapper/
-├── colab_embedding_generator.py
-├── local_embedding_generator.py
-├── merge_local_embeddings.py
-├── project_development.md        # full per-push development log
-├── capasitor_legacy.md           # archived Capacitor-era history (pushes #1–#21)
-├── AGENTS_1.md                   # agent-mode operating notes
-├── CLAUDE_1.md                   # Claude Code project notes
-└── LICENSE
-```
+
+## Embeddings
+
+The player works as a local music player without precomputed embeddings. The
+recommendation engine becomes much more useful after importing CLAP embeddings
+for the library.
+
+Use the scripts in [tools/embeddings](tools/embeddings):
+
+- Kaggle GPU workflow: `kaggle_embedding_generator.py`
+- Google Colab workflow: `colab_embedding_generator.py`
+- Local CUDA/CPU workflow: `local_embedding_generator.py`
+- Strict merge/validation: `merge_local_embeddings.py`
+
+The generated `local_embeddings.json` can be imported from the app's AI page.
+
+## Privacy
+
+IsaiVazhi is designed around local ownership:
+
+- no account
+- no analytics service
+- no streaming backend
+- no cloud recommendation API
+- playback evidence and taste profile stay on device
+
+Kaggle, Colab, or a local GPU machine are optional tools for precomputing
+embeddings. They are not required for normal playback.
+
+## Status
+
+This is an active personal/open-source project. The current codebase is the
+native Kotlin/Compose app in `native/`; older Capacitor-era development notes
+were removed from the public tree to keep the repository focused on the current
+implementation.
 
 ## License
 
-See [LICENSE](LICENSE).
+[MIT](LICENSE)

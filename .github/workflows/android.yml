@@ -1,0 +1,35 @@
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Assemble debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Configure local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > native/local.properties
+
+      - name: Make Gradle executable
+        run: chmod +x native/gradlew
+
+      - name: Build
+        working-directory: native
+        run: ./gradlew :app:assembleDebug

@@ -1,5 +1,5 @@
 # =============================================================================
-# CLAP Embedding Generator for IsaiVazhi — Local / Laptop Version
+# CLAP Embedding Generator for IsaiVazhi - Local / Laptop Version
 # Runs on Windows with NVIDIA GPU (CUDA) or falls back to CPU.
 #
 # Requirements (install once in your virtual environment):
@@ -8,8 +8,9 @@
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #
 # Generates local_embeddings.json compatible with the mobile app.
-# Copy the output file to your phone's app-private folder:
-#   /storage/emulated/0/Android/data/com.isaivazhi.app/files/
+# Import the output file from the app's AI management page.
+# Advanced/manual app-private folder:
+#   /storage/emulated/0/Android/data/com.isaivazhi.app.kt/files/
 # =============================================================================
 
 import os
@@ -309,8 +310,8 @@ print(f"Total embeddings in file: {total}")
 print(f"Time: {elapsed/60:.1f} minutes ({elapsed/max(processed, 1):.1f}s per song)")
 print(f"\nSaved to: {output_path}")
 print(f"\nNext steps:")
-print(f"1. Copy local_embeddings.json to your phone:")
-print(f"   /storage/emulated/0/Android/data/com.isaivazhi.app/files/")
-print(f"2. If local_embeddings.bin and local_embeddings_meta.json already exist there, delete both so the app rebuilds from JSON.")
-print(f"3. Open the app - embeddings will be loaded automatically")
+print(f"1. Copy local_embeddings.json to your phone.")
+print(f"2. Import it from the IsaiVazhi AI page.")
+print(f"3. Advanced/manual app-private folder:")
+print(f"   /storage/emulated/0/Android/data/com.isaivazhi.app.kt/files/")
 print(f"{'='*60}")

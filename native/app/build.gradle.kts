@@ -9,15 +9,13 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        // Distinct applicationId so the Kotlin port installs alongside the
-        // existing Capacitor build (com.isaivazhi.app) on the same device.
-        // Cutover later by switching this back to "com.isaivazhi.app" and
-        // uninstalling the kt variant.
+        // Keep the Kotlin application id stable so existing installs retain
+        // their local library, playback, and recommendation state.
         applicationId = "com.isaivazhi.app.kt"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0-kt"
+        versionCode = 312
+        versionName = "3.1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

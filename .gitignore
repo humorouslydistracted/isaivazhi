@@ -33,6 +33,9 @@ emulator_logcat*.txt
 releases/
 app-debug.apk
 *.pkl
+local_embeddings*.json
+music_audioset_epoch_15_esc_90.14.pt
+*.pt
 
 # CLAP ONNX model — not bundled. The on-device inference path is unused
 # (embeddings are produced via the Colab/local scripts and copied to the
