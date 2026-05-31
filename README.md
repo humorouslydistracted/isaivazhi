@@ -8,7 +8,7 @@
 
 - **Table-based ordering** — Tap a table → browse menu → add items → complete order
 - **Thermal printing** — Customer receipt + Kitchen order via Bluetooth (ESC/POS)
-- **Configurable receipts** — Per-field font size (Normal/Large/Double) + bold, header/footer fields, live preview
+- **Configurable receipts** — Per-field font size (Normal/Large/Double) + bold, header/footer fields, live preview, bold order items toggle
 - **Kitchen receipt config** — Separate header/footer/item-size settings for kitchen slips
 - **Payment mode** — GPay / Cash / custom label on every order, printed on receipt
 - **Admin panel** — Manage tables, menu items, categories, receipt settings, inclusions
@@ -221,4 +221,4 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
 ---
 
-**Made with ❤️ for small eateries** · *Last updated: May 29, 2026*
+**Made with ❤️ for small eateries** · *Last updated: May 31, 2026*
