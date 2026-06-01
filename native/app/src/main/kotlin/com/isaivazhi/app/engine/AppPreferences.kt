@@ -63,6 +63,27 @@ class AppPreferences(private val appContext: Context) {
         // replay. Clearing it once on the first #76 boot lets the
         // accumulated background auto-advance entries flow through.
         val MIGRATION_V76_WATERMARK_RESET = booleanPreferencesKey("migration_v76_watermark_reset")
+        // 2026-06-01 startup-perf fix: cache the last-known embedding row count
+        // so the UI can publish a non-zero embeddingsRowCount immediately on
+        // cold start (unblocking AI Discover) while the actual DB stats() call
+        // still runs in background to reconcile. Without this, the UI gates
+        // AI Discover behind the first DB worker call which pays the full
+        // sqlite-vec/Room init cost (~18s on the user's device).
+        val CACHED_EMBED_ROW_COUNT = longPreferencesKey("cached_embed_row_count_v1")
+        val CACHED_EMBED_DIM = longPreferencesKey("cached_embed_dim_v1")
+        val CACHED_VEC_EXT = booleanPreferencesKey("cached_vec_ext_v1")
+        // 2026-06-01 optimistic MiniPlayer: persist current song's display
+        // metadata so PlaybackEngine.preWarm() can hydrate _state.value
+        // immediately on cold start (MiniPlayer renders in <500ms instead
+        // of waiting ~1.9s for service prepareForResume to complete).
+        val LAST_TITLE = stringPreferencesKey("last_title_v1")
+        val LAST_ARTIST = stringPreferencesKey("last_artist_v1")
+        val LAST_ALBUM = stringPreferencesKey("last_album_v1")
+        // Phase 4 (2026-06-01): persist the bottom-nav tab the user last
+        // viewed. Restored on cold start so the app re-opens where they
+        // left off. Empty string on first-ever launch → caller picks the
+        // default (Songs).
+        val LAST_TAB = stringPreferencesKey("last_tab_v1")
     }
 
     val recMode: kotlinx.coroutines.flow.Flow<Boolean> =
@@ -95,6 +116,9 @@ class AppPreferences(private val appContext: Context) {
             queueFilenames = prefs[Keys.QUEUE_FILENAMES]
                 ?.split('\n')?.filter { it.isNotBlank() } ?: emptyList(),
             queueIndex = (prefs[Keys.QUEUE_INDEX] ?: 0L).toInt(),
+            title = prefs[Keys.LAST_TITLE] ?: "",
+            artist = prefs[Keys.LAST_ARTIST] ?: "",
+            album = prefs[Keys.LAST_ALBUM] ?: "",
         )
     }
 
@@ -103,9 +127,18 @@ class AppPreferences(private val appContext: Context) {
         val positionMs: Long,
         val queueFilenames: List<String>,
         val queueIndex: Int,
+        val title: String = "",
+        val artist: String = "",
+        val album: String = "",
     )
 
-    suspend fun saveCurrent(mediaId: String?, positionMs: Long) {
+    suspend fun saveCurrent(
+        mediaId: String?,
+        positionMs: Long,
+        title: String? = null,
+        artist: String? = null,
+        album: String? = null,
+    ) {
         appContext.dataStore.edit { prefs ->
             if (mediaId == null) {
                 prefs.remove(Keys.CURRENT_MEDIA_ID)
@@ -113,7 +146,45 @@ class AppPreferences(private val appContext: Context) {
                 prefs[Keys.CURRENT_MEDIA_ID] = mediaId
             }
             prefs[Keys.CURRENT_POSITION_MS] = positionMs.coerceAtLeast(0L)
+            // Only overwrite display metadata when caller supplies it — preserves
+            // the previously persisted values during fast position-only updates.
+            title?.let { prefs[Keys.LAST_TITLE] = it }
+            artist?.let { prefs[Keys.LAST_ARTIST] = it }
+            album?.let { prefs[Keys.LAST_ALBUM] = it }
         }
+    }
+
+    /** Cached embedding row count snapshot read at cold start (non-blocking). */
+    suspend fun cachedEmbedStats(): CachedEmbedStats {
+        val prefs = appContext.dataStore.data.first()
+        return CachedEmbedStats(
+            rowCount = (prefs[Keys.CACHED_EMBED_ROW_COUNT] ?: 0L).toInt(),
+            dim = (prefs[Keys.CACHED_EMBED_DIM] ?: 0L).toInt(),
+            vecExt = prefs[Keys.CACHED_VEC_EXT] ?: false,
+        )
+    }
+
+    suspend fun saveCachedEmbedStats(rowCount: Int, dim: Int, vecExt: Boolean) {
+        appContext.dataStore.edit { prefs ->
+            prefs[Keys.CACHED_EMBED_ROW_COUNT] = rowCount.coerceAtLeast(0).toLong()
+            prefs[Keys.CACHED_EMBED_DIM] = dim.coerceAtLeast(0).toLong()
+            prefs[Keys.CACHED_VEC_EXT] = vecExt
+        }
+    }
+
+    data class CachedEmbedStats(
+        val rowCount: Int,
+        val dim: Int,
+        val vecExt: Boolean,
+    )
+
+    /** Phase 4 (2026-06-01): last bottom-nav tab name, or empty on first launch. */
+    suspend fun loadLastTab(): String {
+        return appContext.dataStore.data.first()[Keys.LAST_TAB] ?: ""
+    }
+
+    suspend fun saveLastTab(tabName: String) {
+        appContext.dataStore.edit { it[Keys.LAST_TAB] = tabName }
     }
 
     suspend fun saveQueue(filenames: List<String>, index: Int) {

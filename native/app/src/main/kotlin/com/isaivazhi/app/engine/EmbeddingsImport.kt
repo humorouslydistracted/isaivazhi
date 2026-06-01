@@ -1,6 +1,7 @@
 package com.isaivazhi.app.engine
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -33,20 +34,33 @@ object EmbeddingsImport {
     suspend fun importFromUri(ctx: Context, uri: Uri): ImportResult = withContext(Dispatchers.IO) {
         val target = targetFile(ctx)
         try {
+            try {
+                ctx.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (_: SecurityException) {
+                // One-shot read access is still valid for this session.
+            }
             val tmp = File(target.parentFile, "$TARGET_FILENAME.tmp")
             var bytes = 0L
-            ctx.contentResolver.openInputStream(uri)?.use { input ->
+            val input = ctx.contentResolver.openInputStream(uri)
+                ?: return@withContext ImportResult(false, 0L, target.absolutePath, "cannot open file — try copying the JSON into Downloads and pick it again")
+            input.use { stream ->
                 FileOutputStream(tmp).use { output ->
                     val buf = ByteArray(64 * 1024)
                     while (true) {
-                        val n = input.read(buf)
+                        val n = stream.read(buf)
                         if (n < 0) break
                         output.write(buf, 0, n)
                         bytes += n
                     }
                     output.fd.sync()
                 }
-            } ?: return@withContext ImportResult(false, 0L, target.absolutePath, "cannot open URI")
+            }
+            if (bytes <= 0L) {
+                return@withContext ImportResult(false, 0L, target.absolutePath, "file is empty")
+            }
             if (target.exists()) target.delete()
             if (!tmp.renameTo(target)) {
                 return@withContext ImportResult(false, bytes, target.absolutePath, "rename failed")
@@ -58,7 +72,37 @@ object EmbeddingsImport {
         }
     }
 
-    fun hasPreviousImport(ctx: Context): Boolean = targetFile(ctx).exists() && targetFile(ctx).length() > 0
+    fun hasPreviousImport(ctx: Context): Boolean = backupFile(ctx).exists() && backupFile(ctx).length() > 0
+
+    /** App-private path where exportLegacyMirror writes the portable backup. */
+    fun backupFile(ctx: Context): File = targetFile(ctx)
+
+    data class CopyResult(val ok: Boolean, val bytesCopied: Long, val error: String? = null)
+
+    /** Copy the on-device backup to a user-picked location (Save as). */
+    suspend fun copyBackupToUri(ctx: Context, uri: Uri): CopyResult = withContext(Dispatchers.IO) {
+        val source = backupFile(ctx)
+        if (!source.exists() || source.length() <= 0L) {
+            return@withContext CopyResult(false, 0L, "no backup file — export first")
+        }
+        try {
+            var bytes = 0L
+            ctx.contentResolver.openOutputStream(uri)?.use { output ->
+                source.inputStream().use { input ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        bytes += n
+                    }
+                }
+            } ?: return@withContext CopyResult(false, 0L, "cannot write to chosen location")
+            CopyResult(true, bytes, null)
+        } catch (t: Throwable) {
+            CopyResult(false, 0L, t.message ?: t.javaClass.simpleName)
+        }
+    }
 
     private fun targetFile(ctx: Context): File {
         val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir

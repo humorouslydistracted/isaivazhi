@@ -34,7 +34,6 @@ import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BugReport
-import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.QueueMusic
@@ -73,6 +72,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.isaivazhi.app.engine.ActivityLogEngine
 import com.isaivazhi.app.engine.AlbumArtRepository
 import com.isaivazhi.app.engine.AppContainer
 import com.isaivazhi.app.engine.ArtPrefetch
@@ -85,20 +85,22 @@ import com.isaivazhi.app.engine.signedDirectScore
 import com.isaivazhi.app.ui.rememberAudioPermissionGate
 import com.isaivazhi.app.ui.rememberDeleteSongHelper
 import com.isaivazhi.app.ui.rememberNotificationsPermissionGate
-import com.isaivazhi.app.ui.screens.ActivityLogScreen
 import com.isaivazhi.app.ui.screens.AiManagementScreen
 import com.isaivazhi.app.ui.screens.AlbumsScreen
 import com.isaivazhi.app.ui.screens.BrowseCategory
 import com.isaivazhi.app.ui.screens.BrowseScreen
-import com.isaivazhi.app.ui.screens.DebugLogsScreen
-import com.isaivazhi.app.ui.screens.DiscoverScreen
-import com.isaivazhi.app.ui.screens.DiscoverSectionRef
-import com.isaivazhi.app.ui.screens.EmbeddingStatusBanner
+import com.isaivazhi.app.ui.screens.LogsScreen
+import com.isaivazhi.app.ui.screens.LogsTab
+// Phase 4 (2026-06-01): DiscoverScreen / DiscoverSectionRef / EmbeddingStatusBanner
+// imports removed alongside the deleted Discover tab. The Similar-to-current
+// row in NowPlayingScreen now covers the only valued surface from Discover.
+// EmbeddingStatusBanner is still used by AiManagementScreen.
 import com.isaivazhi.app.ui.screens.EngineSnapshot
 import com.isaivazhi.app.ui.screens.FavoritesScreen
 import com.isaivazhi.app.ui.screens.HistoryScreen
 import com.isaivazhi.app.ui.screens.MiniPlayer
 import com.isaivazhi.app.ui.screens.NowPlayingScreen
+import com.isaivazhi.app.ui.screens.EmbeddingsImportDialog
 import com.isaivazhi.app.ui.screens.OnboardingScreen
 import com.isaivazhi.app.ui.screens.PlaylistDetailScreen
 import com.isaivazhi.app.ui.screens.PlaylistsScreen
@@ -120,7 +122,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 private enum class Tab(val title: String) {
-    Discover("Discover"),
+    // Phase 4 (2026-06-01): Discover tab removed. AI recommendations
+    // now surface only as the Similar row inside NowPlayingScreen and as
+    // the Refresh button on the player. The remaining tabs behave like a
+    // standard offline music player.
     Songs("Songs"),
     Albums("Albums"),
     UpNext("Up Next"),
@@ -137,12 +142,11 @@ private sealed class Overlay {
     data object History : Overlay()
     data object Taste : Overlay()
     data object Ai : Overlay()
-    data object Debug : Overlay()
-    data object ActivityLog : Overlay()
+    data class Logs(val initialTab: LogsTab = LogsTab.Activity) : Overlay()
     data class PlaylistDetail(val playlistId: String) : Overlay()
     data class ViewAll(val category: BrowseCategory) : Overlay()
-    /** Generic "View all" overlay for a Discover section. */
-    data class SectionViewAll(val title: String, val songs: List<Song>) : Overlay()
+    // Phase 4 (2026-06-01): SectionViewAll removed with the Discover page.
+    // Browse-tab ViewAll uses the dedicated Overlay.ViewAll(category) above.
 }
 
 private fun logLedgerState(container: AppContainer, reason: String) {
@@ -196,7 +200,14 @@ class MainActivity : ComponentActivity() {
         // lands in the persisted Debug Logs file before the process dies.
         DebugLogCapture.installCrashHandler(applicationContext)
 
-        container = AppContainer(applicationContext)
+        // Bugfix 2026-06-01c: reuse the Application-scoped AppContainer
+        // so the eager DB warm done in IsaiVazhiApp.onCreate is visible
+        // to MainActivity. Creating a fresh AppContainer here would have
+        // re-instantiated `embeddingDb` (a `by lazy` field) and undone
+        // the warm. Fallback to a new container only if (in tests or
+        // some edge teardown path) the app instance isn't IsaiVazhiApp.
+        container = (application as? IsaiVazhiApp)?.container
+            ?: AppContainer(applicationContext)
 
         // Push #77 diagnostic: log every Activity onCreate with the
         // process-cold vs Activity-cold distinction surfaced.
@@ -218,8 +229,46 @@ class MainActivity : ComponentActivity() {
         )
 
         CoroutineScope(Dispatchers.Default).launch {
-            try { container.embeddingDb.migrateFromLegacy() }
+            // Bugfix 2026-06-01c: skip migrate when the DataStore cache
+            // proves the DB is already populated. The migrate call is a
+            // no-op in that case (reason="db_already_populated") but the
+            // FIRST DB call after activity recreate still pays ~22s of
+            // sqlite-vec/Room re-init cost on the single
+            // EmbeddingDbWorker thread. Skipping it here keeps the worker
+            // free for the recommend pipeline triggered by lockscreen
+            // Refresh taps. The Application class (IsaiVazhiApp) warms
+            // the DB eagerly once per process via a stats() call.
+            val cached = try { container.preferences.cachedEmbedStats() } catch (_: Throwable) { null }
+            if (cached != null && cached.rowCount > 0) {
+                container.activityLog.log(
+                    category = "engine",
+                    type = "PERF_MIGRATE_SKIPPED",
+                    message = "skip migrateFromLegacy (cached rowCount=${cached.rowCount})",
+                    data = mapOf("cachedRowCount" to cached.rowCount),
+                )
+                return@launch
+            }
+            val migStart = System.currentTimeMillis()
+            container.activityLog.log(
+                category = "engine",
+                type = "PERF_MIGRATE_START",
+                message = "embeddingDb.migrateFromLegacy start",
+            )
+            var migrateResult: org.json.JSONObject? = null
+            try { migrateResult = container.embeddingDb.migrateFromLegacy() }
             catch (t: Throwable) { android.util.Log.w("MainActivity", "embDb migrate failed: ${t.message}") }
+            val migElapsed = System.currentTimeMillis() - migStart
+            container.activityLog.log(
+                category = "engine",
+                type = "PERF_MIGRATE_DONE",
+                message = "embeddingDb.migrateFromLegacy done in ${migElapsed}ms",
+                data = mapOf(
+                    "elapsedMs" to migElapsed,
+                    "migrated" to (migrateResult?.optBoolean("migrated", false) ?: false),
+                    "reason" to (migrateResult?.optString("reason", "") ?: ""),
+                    "rowCount" to (migrateResult?.optInt("rowCount", -1) ?: -1),
+                ),
+            )
         }
 
         container.playback.preWarm()
@@ -344,8 +393,35 @@ private fun AppRoot(container: AppContainer) {
     val notificationsPermission = rememberNotificationsPermissionGate(ctx)
     var notifGateDismissed by remember { mutableStateOf(false) }
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
+    // Bugfix 2026-06-01d: mirror songs to the process-lifetime container
+    // so engines that run outside the Activity (RecommendationCache) can
+    // see the library. Covers every reload site — invalidate-on-import,
+    // settings rescan, library-changed broadcast — without sprinkling
+    // assignments through each callsite.
+    LaunchedEffect(songs) {
+        if (songs.isNotEmpty()) container.library.value = songs
+    }
     var scanError by remember { mutableStateOf<String?>(null) }
+    // Phase 4 (2026-06-01): pager starts on Songs (index 0 after Discover
+    // removal). A LaunchedEffect below restores the persisted last tab on
+    // cold start, and another collector saves the user's current tab on
+    // every change so the app re-opens where they left off.
     val pagerState = rememberPagerState(pageCount = { Tab.entries.size })
+    LaunchedEffect(Unit) {
+        val saved = runCatching { container.preferences.loadLastTab() }.getOrNull()
+        if (saved.isNullOrBlank()) return@LaunchedEffect
+        val target = Tab.entries.indexOfFirst { it.name == saved }
+        if (target >= 0 && target != pagerState.currentPage) {
+            runCatching { pagerState.scrollToPage(target) }
+        }
+    }
+    LaunchedEffect(pagerState) {
+        androidx.compose.runtime.snapshotFlow { pagerState.currentPage }
+            .collect { page ->
+                val name = Tab.entries.getOrNull(page)?.name ?: return@collect
+                runCatching { container.preferences.saveLastTab(name) }
+            }
+    }
     var embeddingsRowCount by remember { mutableStateOf<Int?>(null) }
     var embeddingsDim by remember { mutableStateOf(0) }
     var vecExtLoaded by remember { mutableStateOf(false) }
@@ -357,7 +433,9 @@ private fun AppRoot(container: AppContainer) {
     var artCacheBytes by remember { mutableStateOf(0L) }
     var onboardingDismissed by remember { mutableStateOf(false) }
     var importMessage by remember { mutableStateOf<String?>(null) }
-    var discoverQueue by remember { mutableStateOf<List<Song>>(emptyList()) }
+    var importInProgress by remember { mutableStateOf(false) }
+    var exportBackupInProgress by remember { mutableStateOf(false) }
+    var exportBackupStatus by remember { mutableStateOf<String?>(null) }
     var overlay by remember { mutableStateOf<Overlay>(Overlay.None) }
     var libraryMenuOpen by remember { mutableStateOf(false) }
     var menuSong by remember { mutableStateOf<Song?>(null) }
@@ -408,6 +486,17 @@ private fun AppRoot(container: AppContainer) {
                     }
                 }
             }
+            // Bugfix 2026-06-01g: fire a precompute the moment the Activity
+            // moves to background. mmap pages are still hot at this instant
+            // (eviction starts ~1-2s later). This guarantees the cache is
+            // freshly populated when the user taps Refresh on the lockscreen,
+            // and the subsequent pop_refill runs against the still-warm pages
+            // kept alive by the 30s keepWarmRunnable in Media3PlaybackService.
+            if (event == Lifecycle.Event.ON_STOP && permission.granted) {
+                runCatching {
+                    container.recommendationCache.precomputeNow(reason = "on_stop")
+                }
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -452,11 +541,27 @@ private fun AppRoot(container: AppContainer) {
     val historyStats by container.history.stats.collectAsState()
     val tuning by container.taste.tuning.collectAsState()
     val tasteSignals by container.taste.signals.collectAsState()
-    // Push #63: decorated signals (chips + hard-block set). Recommender
-    // call sites pass `hardBlockedFilenames` so strongly-negative songs
-    // (top 18%, floor 1.5) never land in Up Next or Discover sections.
+    // Push #63: decorated signals (chips + display hard-block set at full guard).
     val decoratedSignals by container.taste.decoratedSignals.collectAsState()
-    val hardBlockedFilenames = decoratedSignals.hardBlockedFilenames
+    val upNextHardBlocked = remember(tuning.negativeStrength, tasteSignals, decoratedSignals) {
+        container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
+    }
+    val upNextSoftExcluded = remember(tuning.negativeStrength, tasteSignals, decoratedSignals) {
+        container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength)
+    }
+    val upNextPolicyExcludes = remember(
+        tuning.negativeStrength,
+        tasteSignals,
+        decoratedSignals,
+        dislikedSet,
+    ) {
+        com.isaivazhi.app.engine.RecommendationPolicy.unionExcludes(
+            upNextHardBlocked,
+            upNextSoftExcluded,
+            dislikedSet,
+        )
+    }
+    var lastBlendInfo by remember { mutableStateOf<LastBlendInfo?>(null) }
     val timelineEvents by container.signalTimeline.events.collectAsState()
     // Push #57: filepaths the user marked "skip embedding" for. The AI
     // page's Pending list excludes these.
@@ -549,35 +654,121 @@ private fun AppRoot(container: AppContainer) {
     }
     val recModeFlow = container.preferences.recMode
     val recMode by recModeFlow.collectAsState(initial = true)
+    val hasEmbeddingsInLibrary = (embeddingsRowCount ?: 0) > 0
+    val effectiveRecMode = recMode && hasEmbeddingsInLibrary
 
-    var mostSimilar by remember { mutableStateOf<List<com.isaivazhi.app.engine.Recommender.ScoredSong>>(emptyList()) }
-    var forYou by remember { mutableStateOf<List<com.isaivazhi.app.engine.Recommender.ScoredSong>>(emptyList()) }
-    var becauseYouPlayed by remember { mutableStateOf<List<Pair<Song, List<com.isaivazhi.app.engine.Recommender.ScoredSong>>>>(emptyList()) }
-    var unexploredClusters by remember { mutableStateOf<List<List<Song>>>(emptyList()) }
-    var freezeMostSimilar by remember { mutableStateOf(false) }
-    var frozenMostSimilar by remember { mutableStateOf<List<com.isaivazhi.app.engine.Recommender.ScoredSong>>(emptyList()) }
+    LaunchedEffect(embeddingsRowCount) {
+        val count = embeddingsRowCount ?: return@LaunchedEffect
+        if (count == 0 && recMode) {
+            container.preferences.setRecMode(false)
+        }
+    }
+
+    // Phase 4 (2026-06-01): mostSimilar / forYou / becauseYouPlayed /
+    // unexploredClusters / freezeMostSimilar state removed alongside the
+    // Discover tab. NowPlayingScreen owns its own "Similar" state
+    // (`similarToCurrent`) populated directly from Recommender.
 
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        if (uri == null) {
+            container.toaster.show("Import cancelled")
+            return@rememberLauncherForActivityResult
+        }
         coroutineScope.launch {
-            importMessage = "Importing…"
-            val result = EmbeddingsImport.importFromUri(ctx, uri)
-            if (!result.ok) { importMessage = "Import failed: ${result.error}"; return@launch }
-            importMessage = "Imported ${result.bytesCopied / 1024} KB. Ingesting…"
+            importInProgress = true
+            importMessage = "Copying file…"
+            container.activityLog.log("engine", "embed_import", "Import started")
+            container.embedding.logBuffer.append("import", "started from file picker")
             try {
-                val migrated = container.embeddingDb.migrateFromLegacy()
-                val rows = migrated?.optInt("rowCount", 0) ?: 0
+                val result = EmbeddingsImport.importFromUri(ctx, uri)
+                if (!result.ok) {
+                    val err = result.error ?: "unknown error"
+                    importMessage = "Import failed: $err"
+                    container.activityLog.log(
+                        "engine", "embed_import_failed", err,
+                        level = ActivityLogEngine.Level.ERROR,
+                    )
+                    container.embedding.logBuffer.append("import", "FAILED copy: $err")
+                    return@launch
+                }
+                importMessage = "Ingesting ${result.bytesCopied / 1024} KB — may take 1–2 min…"
+                val reimport = container.embeddingDb.forceReimportLegacyJson()
+                val rows = reimport?.optInt("rowCount", 0) ?: 0
+                val relink = container.embeddingDb.relinkLibraryPaths(songs)
+                val relinked = relink?.optInt("relinked", 0) ?: 0
+                val hashMap = container.embeddingDb.contentHashByFilepath()
+                songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                container.library.value = songs
+                container.embeddingDb.prewarmFromLibrary(songs)
                 refreshDbStats(container) { rc, dim, ext, fns, fps ->
                     embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                     embeddedFilenames = fns
                     embeddedFilepaths = fps
                 }
-                importMessage = "Loaded $rows embeddings."
+                dupesRefreshTick++
+                val doneMessage = when {
+                    rows <= 0 -> "Import saved but no embeddings found in that file."
+                    relinked > 0 -> "Loaded $rows embeddings. Matched $relinked songs."
+                    else -> "Loaded $rows embeddings."
+                }
+                importMessage = doneMessage
                 onboardingDismissed = true
+                container.activityLog.log(
+                    "engine", "embed_import_done", doneMessage,
+                    data = mapOf("rows" to rows, "relinked" to relinked),
+                )
+                container.embedding.logBuffer.append("import", "done — $doneMessage")
             } catch (t: Throwable) {
-                importMessage = "Ingest failed: ${t.message}"
+                val err = t.message ?: t.javaClass.simpleName
+                importMessage = "Import failed: $err"
+                container.activityLog.log(
+                    "engine", "embed_import_failed", err,
+                    level = ActivityLogEngine.Level.ERROR,
+                )
+                container.embedding.logBuffer.append("import", "FAILED: $err")
+                android.util.Log.e("MainActivity", "embeddings import failed", t)
+            } finally {
+                importInProgress = false
+            }
+        }
+    }
+
+    val exportSaveLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        coroutineScope.launch {
+            try {
+                if (uri == null) {
+                    exportBackupStatus = "Save cancelled"
+                    container.toaster.show(
+                        "Save cancelled — backup remains in app storage only"
+                    )
+                    return@launch
+                }
+                exportBackupStatus = "Writing to chosen location…"
+                container.toaster.show("Saving backup…")
+                val copy = EmbeddingsImport.copyBackupToUri(ctx, uri)
+                if (copy.ok) {
+                    val mb = copy.bytesCopied / 1024.0 / 1024.0
+                    val msg = "Saved local_embeddings.json (${"%.1f".format(mb)} MB)"
+                    exportBackupStatus = msg
+                    container.toaster.show(msg)
+                    container.embedding.logBuffer.append(
+                        "backup",
+                        "saved to user location: ${copy.bytesCopied} bytes",
+                    )
+                } else {
+                    exportBackupStatus = "Save failed: ${copy.error ?: "unknown"}"
+                    container.toaster.show("Save failed: ${copy.error ?: "unknown"}")
+                    container.embedding.logBuffer.append("backup", "save to user location FAILED: ${copy.error}")
+                }
+            } finally {
+                exportBackupInProgress = false
+                // Keep status visible briefly so user sees result after picker closes
+                kotlinx.coroutines.delay(2500)
+                exportBackupStatus = null
             }
         }
     }
@@ -599,6 +790,13 @@ private fun AppRoot(container: AppContainer) {
                     data = mapOf("permissionGranted" to permission.granted),
                 )
                 songs = LibraryCache.loadOrScan(ctx)
+                if (songs.isEmpty()) {
+                    songs = LibraryCache.loadOrScan(ctx, force = true)
+                }
+                // Bugfix 2026-06-01d: publish to container so the
+                // process-lifetime RecommendationCache can see the
+                // library even after the Activity is destroyed.
+                container.library.value = songs
                 val libElapsed = System.currentTimeMillis() - libStartMs
                 container.activityLog.log(
                     category = "engine",
@@ -620,31 +818,112 @@ private fun AppRoot(container: AppContainer) {
 
     LaunchedEffect(permission.granted, songs.size) {
         if (permission.granted && songs.isNotEmpty() && embeddingsRowCount == null) {
+            // Phase B (2026-06-01): hydrate embeddingsRowCount from the
+            // DataStore cache IMMEDIATELY so AI Discover unblocks without
+            // waiting for the DB worker. On every previous cold start we
+            // saved the rowCount; reading it back is ~milliseconds, vs
+            // ~18s for the first real stats() call (which pays the full
+            // sqlite-vec/Room init cost).
+            val cached = container.preferences.cachedEmbedStats()
+            if (cached.rowCount > 0 && embeddingsRowCount == null) {
+                embeddingsRowCount = cached.rowCount
+                embeddingsDim = cached.dim
+                vecExtLoaded = cached.vecExt
+                container.activityLog.log(
+                    category = "engine",
+                    type = "PERF_DB_CACHE_HIT",
+                    message = "hydrated rowCount=${cached.rowCount} from cache (UI unblocked optimistically)",
+                    data = mapOf(
+                        "rowCount" to cached.rowCount,
+                        "dim" to cached.dim,
+                        "vecExtLoaded" to cached.vecExt,
+                    ),
+                )
+            }
+
             // Diagnostic — Discover load timing. Additive only.
             val dbStartMs = System.currentTimeMillis()
             container.activityLog.log(
                 category = "engine",
                 type = "PERF_DB_START",
-                message = "refreshDbStats start (songs=${songs.size})",
-                data = mapOf("songsCount" to songs.size),
+                message = "refreshDbStats start (songs=${songs.size}, cachedHit=${cached.rowCount > 0})",
+                data = mapOf("songsCount" to songs.size, "cachedHit" to (cached.rowCount > 0)),
             )
-            refreshDbStats(container) { rc, dim, ext, fns, fps ->
-                embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
-                embeddedFilenames = fns
-                embeddedFilepaths = fps
-                val elapsed = System.currentTimeMillis() - dbStartMs
+            // Phase B: stage 1 — quick stats-only fetch reconciles any drift
+            // between the cached count and the live DB count.
+            refreshEmbeddingRowCount(container) { rc, dim, ext ->
+                embeddingsRowCount = rc
+                embeddingsDim = dim
+                vecExtLoaded = ext
+            }
+            // Bugfix 2026-06-01c: stage 2 (full refreshDbStats with
+            // allFilenames + allFilepaths) is HEAVY — 3 sequential queries
+            // on the single EmbeddingDbWorker thread, ~20s when cold.
+            // It blocks the recommend pipeline behind it. The filename /
+            // filepath sets are ONLY used by the AI management page; we
+            // can lazy-load them when that page actually opens. Skip the
+            // call here when cache hit; cold first launch (no cache) still
+            // runs it to populate sets for the initial AI page render.
+            if (cached.rowCount <= 0) {
+                try {
+                    container.embeddingDb.relinkLibraryPaths(songs)
+                    val hashMap = container.embeddingDb.contentHashByFilepath()
+                    songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                    container.library.value = songs
+                    container.embeddingDb.prewarmFromLibrary(songs)
+                } catch (t: Throwable) {
+                    android.util.Log.w("MainActivity", "startup relink failed: ${t.message}")
+                }
+                refreshDbStats(container) { rc, dim, ext, fns, fps ->
+                    embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
+                    embeddedFilenames = fns
+                    embeddedFilepaths = fps
+                    val elapsed = System.currentTimeMillis() - dbStartMs
+                    container.activityLog.log(
+                        category = "engine",
+                        type = "PERF_DB_DONE",
+                        message = "refreshDbStats done in ${elapsed}ms (rows=$rc dim=$dim vecExt=$ext)",
+                        data = mapOf(
+                            "rowCount" to rc,
+                            "dim" to dim,
+                            "vecExtLoaded" to ext,
+                            "embeddedFilenames" to fns.size,
+                            "embeddedFilepaths" to fps.size,
+                            "elapsedMs" to elapsed,
+                        ),
+                    )
+                }
+            } else {
+                // Cached row count skipped the heavy filepath fetch — but
+                // imported backups often have stale paths. Relink + load sets.
+                try {
+                    container.embeddingDb.relinkLibraryPaths(songs)
+                    val hashMap = container.embeddingDb.contentHashByFilepath()
+                    songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                    container.library.value = songs
+                    container.embeddingDb.prewarmFromLibrary(songs)
+                } catch (t: Throwable) {
+                    android.util.Log.w("MainActivity", "startup relink failed: ${t.message}")
+                }
+                refreshDbStats(container) { rc, dim, ext, fns, fps ->
+                    embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
+                    embeddedFilenames = fns
+                    embeddedFilepaths = fps
+                    container.activityLog.log(
+                        category = "engine",
+                        type = "PERF_DB_DONE",
+                        message = "refreshDbStats after cache-hit relink (rows=$rc filepaths=${fps.size})",
+                        data = mapOf(
+                            "rowCount" to rc,
+                            "embeddedFilepaths" to fps.size,
+                        ),
+                    )
+                }
                 container.activityLog.log(
                     category = "engine",
-                    type = "PERF_DB_DONE",
-                    message = "refreshDbStats done in ${elapsed}ms (rows=$rc dim=$dim vecExt=$ext)",
-                    data = mapOf(
-                        "rowCount" to rc,
-                        "dim" to dim,
-                        "vecExtLoaded" to ext,
-                        "embeddedFilenames" to fns.size,
-                        "embeddedFilepaths" to fps.size,
-                        "elapsedMs" to elapsed,
-                    ),
+                    type = "PERF_DB_STATS_DEFERRED",
+                    message = "cache-hit startup: relinked paths then loaded filepath sets",
+                    data = mapOf("cachedRowCount" to cached.rowCount),
                 )
             }
             artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) }
@@ -693,7 +972,10 @@ private fun AppRoot(container: AppContainer) {
         container.history.awaitReady()
         container.activityLog.awaitReady()
         container.favorites.awaitReady()
+        container.disliked.awaitReady()
         container.reconcileNotificationFavoriteStorage()
+        container.reconcileCapacitorDislikedStorage()
+        container.reconcileManualTasteFlags()
         logLedgerState(container, "cold_start_before_drain")
         // Push #65/#66/#74: ingest pending playback evidence BEFORE preparing
         // resume playback. Three sources, each covering a different failure
@@ -877,115 +1159,20 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
-    // Most Similar tracks the CURRENT song's neighbors. Render layer picks
-    // frozen vs live based on freezeMostSimilar. Separate effect from the
-    // discoverQueue rebuild so a slow KNN query for the queue doesn't block
-    // a fast similar-songs refresh on song change, AND so tuning.adventurous
-    // moves (which DON'T affect this call) don't re-fire it unnecessarily.
-    //
-    // Critical: do NOT clear mostSimilar on transient null mediaId between
-    // Media3 transitions — that caused the "vanish + come back" flicker
-    // reported after push #34. Only legitimate state changes (empty library,
-    // or a successful recommender result) update the variable.
-    // Push #42 Tier 1C: keyed on tuning.adventurous so the Most Similar
-    // section re-sorts when the user changes the slider. Was hardcoded
-    // 0.1f — slider movement had no effect on this section.
-    LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, tuning.adventurous) {
-        val mediaId = playbackState.currentMediaId ?: return@LaunchedEffect
-        if (songs.isEmpty()) {
-            mostSimilar = emptyList()
-            return@LaunchedEffect
-        }
-        // Push #39: debounce so rapid skip-next / skip-prev presses don't
-        // fire the sqlite-vec query on every transition. The previous
-        // result remains on screen for up to 250 ms before being replaced.
-        kotlinx.coroutines.delay(250)
-        val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
-        val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
-        // Diagnostic — Discover Most Similar recommender timing. Additive only.
-        val recStartMs = System.currentTimeMillis()
-        mostSimilar = if (hasEmbeddings) {
-            runCatching {
-                container.recommender.recommendScored(current, songs, k = 10, adventurous = tuning.adventurous)
-            }.getOrDefault(emptyList())
-        } else emptyList()
-        val recElapsed = System.currentTimeMillis() - recStartMs
-        container.activityLog.log(
-            category = "engine",
-            type = "PERF_RECOMMEND_DONE",
-            message = "Most Similar done in ${recElapsed}ms (hasEmb=$hasEmbeddings k=${mostSimilar.size})",
-            data = mapOf(
-                "mediaId" to mediaId,
-                "hasEmbeddings" to hasEmbeddings,
-                "embeddingsRowCount" to (embeddingsRowCount ?: 0),
-                "resultCount" to mostSimilar.size,
-                "elapsedMs" to recElapsed,
-            ),
-        )
-    }
-
-    // Discover queue (consumed by Taste's Engine Snapshot card + the auto-
-    // build path). Separate effect so adventurous changes here don't drag
-    // mostSimilar along.
-    LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, tuning.adventurous) {
-        val mediaId = playbackState.currentMediaId
-        if (mediaId == null || songs.isEmpty()) {
-            discoverQueue = emptyList()
-            return@LaunchedEffect
-        }
-        // Same 250 ms debounce — buildPlayQueue is even heavier than
-        // recommendScored (MMR diversity over the top-3K candidates).
-        kotlinx.coroutines.delay(250)
-        val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
-        val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
-        discoverQueue = if (hasEmbeddings) {
-            try { container.recommender.buildPlayQueue(
-                current, songs, k = 50, adventurous = tuning.adventurous,
-                hardBlockedFilenames = hardBlockedFilenames,
-            ) }
-            catch (t: Throwable) { fallbackShuffleQueue(songs, current, k = 50) }
-        } else fallbackShuffleQueue(songs, current, k = 50)
-    }
+    // Phase 4 (2026-06-01): the standalone Most Similar LE and discoverQueue
+    // LE have been deleted. The Similar-to-current row in NowPlayingScreen
+    // owns its own debounced LaunchedEffect (see `similarToCurrent` below);
+    // it calls Recommender.recommendScored on each song change. The
+    // discoverQueue was only consumed by the deleted Discover page.
 
     // For You / Because You Played / Unexplored populate from the first
     // available data. We re-trigger on `qualifyingEventCount` (number of
-    // history events with fractionPlayed ≥ 0.3f) rather than raw .size so
-    // a fresh user sees BYP show up immediately after their first
-    // qualifying listen. The `.isEmpty()` guards prevent clobbering an
-    // already-populated section — once a section has content it only
-    // refreshes via pull-to-refresh on Discover.
-    val qualifyingEventCount = remember(historyEvents) {
-        historyEvents.count { it.fractionPlayed >= 0.3f }
-    }
-    // Push #42 Tier 1C: keyed on all 3 tuning knobs + drop the .isEmpty()
-    // gates so each slider change re-runs the recommender for these
-    // sections. Result: sessionBias + negativeStrength are no longer
-    // dormant — moving any slider visibly re-sorts Discover sections.
-    // 250 ms debounce prevents thrashing during slider drags.
-    // Push #64: subscribe to the session "qualified listens" counter so
-    // we can auto-refresh For You after every 5 non-skip listens within
-    // the current session. Capacitor parity (`tickForYouListenWindow`).
-    val forYouTick by container.session.forYouTick.collectAsState()
-    // Push #67: immediate rebuild trigger on favorite/dislike toggle.
-    // SharedFlow emits a reason string; LaunchedEffect re-fires the
-    // Discover builders and prepends fresh recommendations to Up Next.
-    var rebuildPulse by remember { mutableStateOf(0) }
-    LaunchedEffect(Unit) {
-        container.rebuildSignal.collect { reason ->
-            android.util.Log.i("MainActivity", "rebuildSignal received: $reason → triggering refresh")
-            container.activityLog.log(
-                category = "engine",
-                type = "REBUILD_PULSE",
-                message = "rebuildSignal received: $reason → triggering Discover refresh",
-                data = mapOf(
-                    "reason" to reason,
-                    "rebuildPulseBefore" to rebuildPulse,
-                    "rebuildPulseAfter" to (rebuildPulse + 1),
-                ),
-            )
-            rebuildPulse++
-        }
-    }
+    // Phase 4 (2026-06-01): the For You / BYP / Unexplored / Discover-cache
+    // section state and their auto-refresh plumbing (forYouTick, rebuildPulse,
+    // qualifyingEventCount, unexploredManualRefreshCounter, discoverCache
+    // hydrate, pull-to-refresh) have all been removed alongside the Discover
+    // tab. The Recommender still drives Up Next via `refreshUpcomingWithAI`
+    // and the Similar-to-current row in NowPlayingScreen.
 
     // Push #68: profileVec cache. Loaded from disk on cold start for
     // instant blended-query availability; recomputed and persisted when
@@ -1002,7 +1189,7 @@ private fun AppRoot(container: AppContainer) {
     // recompute via forYouByProfileVector helper (which already builds
     // the centroid internally) — but we need the raw vec, so use a
     // dedicated helper. For now we compute inline.
-    LaunchedEffect(historyStats.size, embeddingsRowCount, rebuildPulse) {
+    LaunchedEffect(historyStats.size, embeddingsRowCount) {
         if (songs.isEmpty()) return@LaunchedEffect
         if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(300)
@@ -1011,7 +1198,7 @@ private fun AppRoot(container: AppContainer) {
             .asSequence()
             .filter { it.value.plays > 0 && it.value.avgFraction >= 0.3f }
             .filter { it.key !in dislikedSet }
-            .filter { it.key !in hardBlockedFilenames }
+            .filter { it.key !in upNextHardBlocked }
             .sortedByDescending { it.value.plays * it.value.avgFraction }
             .take(30)
             .toList()
@@ -1045,295 +1232,13 @@ private fun AppRoot(container: AppContainer) {
         runCatching { container.preferences.saveProfileVec(pv, fingerprint) }
         android.util.Log.i("MainActivity", "profileVec rebuilt dim=$dim anchors=${anchorSongs.size} fp=$fingerprint")
     }
-    val discoverCacheState by container.discoverCache.snapshot.collectAsState()
-    val discoverCacheLoaded by container.discoverCache.loaded.collectAsState()
-    // Push #42 Tier 1C: keyed on all 3 tuning knobs + drop the .isEmpty()
-    // gates so each slider change re-runs the recommender for these
-    // sections. Result: sessionBias + negativeStrength are no longer
-    // dormant — moving any slider visibly re-sorts Discover sections.
-    // 250 ms debounce prevents thrashing during slider drags.
-    //
-    // Push #64: forYouTick / 5 → integer division ramps each time the
-    // user crosses a 5-listen boundary; including it in the key list
-    // triggers an auto-refresh of For You (and the cluster pages too,
-    // cheap). The session.resetForYouTick() call closes the window so
-    // the next 5 listens start a new one.
-    // Push #70: manual refresh trigger for Unexplored Sounds. Incremented
-    // only by pull-to-refresh in DiscoverScreen.onRefresh. The Unexplored
-    // LE keys on this so it does NOT recompute on every qualified listen.
-    var unexploredManualRefreshCounter by remember { mutableStateOf(0) }
+    // Phase 4 (2026-06-01): the Discover-cache snapshot state, the For You +
+    // BYP LE, the Unexplored LE, and the cache hydrate LE that lived here
+    // have all been removed. The remaining Recommender helpers used by
+    // refreshUpcomingWithAI run on demand only.
 
-    // Push #70 — For You + Because You Played LE (the "listen-responsive"
-    // sections). Dropped `qualifyingEventCount` from the key set because
-    // it changed on every qualified listen, which thrashed the LE.
-    // Push #77 — ALSO dropped `historyStats.size` from the keys. It ticks
-    // every time the user plays a song they've never played before — for
-    // a 2470-song library that is essentially every other play, which
-    // re-fired the LE 5+ times in a 17-minute session (confirmed via
-    // DISCOVER_FORYOU_FIRE diagnostic, logs.txt 19:24-19:41). Auto-refresh
-    // is now driven exclusively by `forYouTick / 5` (the intentional
-    // 5-listen window) and `rebuildPulse` (favorite/dislike). Cold-start
-    // path stays alive via `songs.isNotEmpty()` and `embeddingsRowCount`
-    // flipping from empty/null.
-    LaunchedEffect(
-        songs.isNotEmpty(), embeddingsRowCount,
-        tuning.adventurous, tuning.sessionBias, tuning.negativeStrength,
-        forYouTick / 5,
-        rebuildPulse,
-    ) {
-        val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
-        // Diagnostic — Discover For You + BYP fire. Captures every key value
-        // so we can see which one flipped between consecutive fires.
-        container.activityLog.log(
-            category = "engine",
-            type = "DISCOVER_FORYOU_FIRE",
-            message = "For You + BYP LE fired (hasEmb=$hasEmbeddings)",
-            data = mapOf(
-                "historyStatsSize" to historyStats.size,
-                "songsCount" to songs.size,
-                "embeddingsRowCount" to (embeddingsRowCount ?: -1),
-                "adventurous" to tuning.adventurous,
-                "sessionBias" to tuning.sessionBias,
-                "negativeStrength" to tuning.negativeStrength,
-                "forYouTick" to forYouTick,
-                "forYouTickDiv5" to (forYouTick / 5),
-                "rebuildPulse" to rebuildPulse,
-                "hasEmbeddings" to hasEmbeddings,
-            ),
-        )
-        if (songs.isEmpty() || !hasEmbeddings) return@LaunchedEffect
-        kotlinx.coroutines.delay(250)
-        val randomize = forYouTick >= 5
-        val tStart = android.os.SystemClock.elapsedRealtime()
-        android.util.Log.i(
-            "DiscoverLE",
-            "ForYou+BYP fire: historyStats=${historyStats.size} forYouTick=$forYouTick(/5=${forYouTick / 5}) rebuildPulse=$rebuildPulse randomize=$randomize"
-        )
-        forYou = runCatching {
-            val pv = container.recommender.forYouByProfileVector(
-                songs, historyStats, embeddedFilepaths, dislikedSet,
-                hardBlockedFilenames = hardBlockedFilenames,
-                k = 12, randomize = randomize,
-            )
-            if (pv.isNotEmpty()) pv
-            else container.recommender.forYou(
-                songs, historyStats, tuning, dislikedSet,
-                hardBlockedFilenames = hardBlockedFilenames, k = 12, randomize = randomize,
-            )
-        }.getOrDefault(forYou)
-        val qualifyingRecent = historyEvents.count { it.fractionPlayed >= 0.3f }
-        becauseYouPlayed = runCatching {
-            container.recommender.becauseYouPlayed(
-                songs, historyEvents, tuning, dislikedSet,
-                hardBlockedFilenames = hardBlockedFilenames,
-                statsFallback = historyStats, kPerSource = 8, sourceCount = 3,
-                randomize = randomize,
-            )
-        }.getOrDefault(becauseYouPlayed)
-        val builtMs = android.os.SystemClock.elapsedRealtime() - tStart
-        android.util.Log.i(
-            "DiscoverLE",
-            "ForYou+BYP done: forYou=${forYou.size} BYP=${becauseYouPlayed.size}/${becauseYouPlayed.sumOf { it.second.size }} qualifyingRecent=$qualifyingRecent (took ${builtMs}ms)"
-        )
-        if (becauseYouPlayed.isEmpty()) {
-            android.util.Log.w(
-                "DiscoverLE",
-                "BYP empty: qualifyingHistoryEvents=$qualifyingRecent — need more listened songs at >=30%"
-            )
-        }
-        container.activityLog.log(
-            category = "engine",
-            type = "DISCOVER_FORYOU_DONE",
-            message = "For You + BYP built in ${builtMs}ms (forYou=${forYou.size} BYP=${becauseYouPlayed.size} randomize=$randomize)",
-            data = mapOf(
-                "forYouCount" to forYou.size,
-                "bypAnchors" to becauseYouPlayed.size,
-                "bypTotalRecs" to becauseYouPlayed.sumOf { it.second.size },
-                "qualifyingRecent" to qualifyingRecent,
-                "randomize" to randomize,
-                "elapsedMs" to builtMs,
-            ),
-        )
-        if (randomize) container.session.resetForYouTick()
-        container.discoverCache.save(
-            mostSimilarFilenames = mostSimilar.map { it.song.filename },
-            forYouFilenames = forYou.map { it.song.filename },
-            byp = becauseYouPlayed.map { (src, sims) ->
-                com.isaivazhi.app.engine.DiscoverCacheEngine.BypEntry(
-                    anchorFilename = src.filename,
-                    anchorTitle = src.title.ifBlank { src.filename },
-                    recommendationFilenames = sims.map { it.song.filename },
-                )
-            },
-            unexploredFilenamesByCluster = unexploredClusters.map { cl -> cl.map { it.filename } },
-            currentMediaId = playbackState.currentMediaId,
-            recommendationFingerprint = container.taste.recommendationFingerprint(),
-        )
-    }
-
-    // Push #70 — Unexplored Clusters LE (separate, narrower keys). Only
-    // recomputes on:
-    //   • Cold start (songs.isNotEmpty() becomes true)
-    //   • New embeddings landed (embeddingsRowCount changes)
-    //   • User pulls to refresh (unexploredManualRefreshCounter ticks)
-    // Does NOT recompute after every qualified listen, which was the
-    // visible "Unexplored Sounds shuffles after every song" bug.
-    LaunchedEffect(songs.isNotEmpty(), embeddingsRowCount, unexploredManualRefreshCounter) {
-        val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
-        // Diagnostic — Unexplored LE fired. The user reported this section
-        // refreshes "randomly", but its key set is supposed to be narrow
-        // (cold-start, embeddings landed, or pull-to-refresh only). Log
-        // every fire with the current key values so we can verify.
-        container.activityLog.log(
-            category = "engine",
-            type = "DISCOVER_UNEXP_FIRE",
-            message = "Unexplored LE fired (hasEmb=$hasEmbeddings)",
-            data = mapOf(
-                "songsCount" to songs.size,
-                "embeddingsRowCount" to (embeddingsRowCount ?: -1),
-                "unexploredManualRefreshCounter" to unexploredManualRefreshCounter,
-                "hasEmbeddings" to hasEmbeddings,
-            ),
-        )
-        if (songs.isEmpty() || !hasEmbeddings) {
-            android.util.Log.i(
-                "DiscoverLE",
-                "Unexplored SKIP: songs=${songs.size} hasEmbeddings=$hasEmbeddings"
-            )
-            return@LaunchedEffect
-        }
-        kotlinx.coroutines.delay(250)
-        val tStart = android.os.SystemClock.elapsedRealtime()
-        android.util.Log.i(
-            "DiscoverLE",
-            "Unexplored fire: embeddingsRowCount=$embeddingsRowCount manualRefresh=$unexploredManualRefreshCounter"
-        )
-        unexploredClusters = runCatching {
-            container.recommender.unexploredClustersKMeans(
-                songs, historyStats, historyStats.keys, embeddedFilepaths,
-                kPerCluster = 8, displayClusters = 3,
-            )
-        }.getOrDefault(unexploredClusters)
-        val builtMs = android.os.SystemClock.elapsedRealtime() - tStart
-        android.util.Log.i(
-            "DiscoverLE",
-            "Unexplored done: clusters=${unexploredClusters.size} totalSongs=${unexploredClusters.sumOf { it.size }} (took ${builtMs}ms)"
-        )
-        container.activityLog.log(
-            category = "engine",
-            type = "DISCOVER_UNEXP_DONE",
-            message = "Unexplored built in ${builtMs}ms (clusters=${unexploredClusters.size})",
-            data = mapOf(
-                "clusters" to unexploredClusters.size,
-                "totalSongs" to unexploredClusters.sumOf { it.size },
-                "elapsedMs" to builtMs,
-            ),
-        )
-    }
-
-    // Push #64: on cold start, hydrate the Discover sections from the
-    // persisted cache BEFORE the heavy LaunchedEffect above kicks in.
-    // Runs once when the cache finishes loading and the library is
-    // available. Sections still in `emptyList()` after hydration mean
-    // either no cache yet or no library overlap.
-    LaunchedEffect(discoverCacheLoaded, songs.isNotEmpty()) {
-        if (!discoverCacheLoaded || songs.isEmpty()) {
-            container.activityLog.log(
-                category = "engine",
-                type = "DISCOVER_HYDRATE_SKIP",
-                message = "Cache hydrate skipped (notReady)",
-                data = mapOf(
-                    "cacheLoaded" to discoverCacheLoaded,
-                    "songsCount" to songs.size,
-                ),
-            )
-            return@LaunchedEffect
-        }
-        val snap = discoverCacheState
-        if (snap.computedAt == 0L) {
-            container.activityLog.log(
-                category = "engine",
-                type = "DISCOVER_HYDRATE_SKIP",
-                message = "Cache hydrate skipped (no cached snapshot yet)",
-                data = mapOf("computedAt" to 0L),
-            )
-            return@LaunchedEffect
-        }
-        // Push #68: validate cache freshness via fingerprint comparison.
-        // If the recommendation policy has materially shifted since the
-        // cache was written (top ±30 reshuffled, hard-block set changed),
-        // skip hydration and wait for the LE to recompute.
-        val liveFingerprint = container.taste.recommendationFingerprint()
-        if (snap.recommendationFingerprint.isNotBlank() &&
-            snap.recommendationFingerprint != liveFingerprint
-        ) {
-            android.util.Log.i(
-                "MainActivity",
-                "Discover cache fingerprint mismatch — skipping hydration cached=${snap.recommendationFingerprint} live=$liveFingerprint"
-            )
-            container.activityLog.log(
-                category = "engine",
-                type = "DISCOVER_HYDRATE_SKIP",
-                message = "Cache hydrate skipped (fingerprint mismatch)",
-                data = mapOf(
-                    "cachedFingerprint" to snap.recommendationFingerprint,
-                    "liveFingerprint" to liveFingerprint,
-                    "cacheAgeMs" to (System.currentTimeMillis() - snap.computedAt),
-                    "cacheMostSimilar" to snap.mostSimilarFilenames.size,
-                    "cacheForYou" to snap.forYouFilenames.size,
-                    "cacheBypAnchors" to snap.byp.size,
-                    "cacheUnexploredClusters" to snap.unexploredFilenamesByCluster.size,
-                ),
-            )
-            return@LaunchedEffect
-        }
-        val byFn = songs.associateBy { it.filename }
-        fun hydrate(fns: List<String>): List<Song> = fns.mapNotNull { byFn[it] }
-        val msBeforeMostSim = mostSimilar.size
-        val msBeforeForYou = forYou.size
-        val msBeforeByp = becauseYouPlayed.size
-        val msBeforeUnexp = unexploredClusters.size
-        if (mostSimilar.isEmpty()) {
-            mostSimilar = hydrate(snap.mostSimilarFilenames).map {
-                com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
-            }
-        }
-        if (forYou.isEmpty()) {
-            forYou = hydrate(snap.forYouFilenames).map {
-                com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
-            }
-        }
-        if (becauseYouPlayed.isEmpty()) {
-            becauseYouPlayed = snap.byp.mapNotNull { e ->
-                val src = byFn[e.anchorFilename] ?: return@mapNotNull null
-                val sims = hydrate(e.recommendationFilenames).map {
-                    com.isaivazhi.app.engine.Recommender.ScoredSong(it, 0f)
-                }
-                if (sims.isEmpty()) null else src to sims
-            }
-        }
-        if (unexploredClusters.isEmpty()) {
-            unexploredClusters = snap.unexploredFilenamesByCluster.map { hydrate(it) }
-                .filter { it.isNotEmpty() }
-        }
-        container.activityLog.log(
-            category = "engine",
-            type = "DISCOVER_HYDRATE_HIT",
-            message = "Cache hydrated (mostSim=${mostSimilar.size} forYou=${forYou.size} byp=${becauseYouPlayed.size} unexp=${unexploredClusters.size})",
-            data = mapOf(
-                "fingerprint" to liveFingerprint,
-                "cacheAgeMs" to (System.currentTimeMillis() - snap.computedAt),
-                "mostSimilarBefore" to msBeforeMostSim,
-                "mostSimilarAfter" to mostSimilar.size,
-                "forYouBefore" to msBeforeForYou,
-                "forYouAfter" to forYou.size,
-                "bypBefore" to msBeforeByp,
-                "bypAfter" to becauseYouPlayed.size,
-                "unexpBefore" to msBeforeUnexp,
-                "unexpAfter" to unexploredClusters.size,
-            ),
-        )
-    }
+    // Phase 4 (2026-06-01): For You + BYP, Unexplored Clusters, and
+    // Discover cache hydration LEs deleted with the Discover tab.
 
     val currentSongFilePath: String? = playbackState.currentMediaId?.let { mediaId ->
         songs.firstOrNull { it.filename == mediaId }?.filePath
@@ -1369,6 +1274,231 @@ private fun AppRoot(container: AppContainer) {
     }
 
     /**
+     * Phase E (2026-06-01): shared "refresh Up Next with AI" lambda used by
+     * both the UpNext screen's Refresh button AND the new MiniPlayer /
+     * lockscreen / NowPlaying Refresh buttons. Rebuilds the upcoming tail
+     * while preserving any Play Next songs the user explicitly queued.
+     * Capacitor parity for `_doRefresh('manual')`.
+     */
+    // Phase 1 (2026-06-01): Similar-to-current row for the NowPlaying
+    // overlay. Replaces the old Discover page's "Most Similar" section.
+    // Recomputed whenever the playing track changes; debounced 250 ms so
+    // rapid skips don't thrash the embedding DB.
+    var similarToCurrent by remember { mutableStateOf<List<Song>>(emptyList()) }
+    var similarLoading by remember { mutableStateOf(false) }
+    var similarFrozen by remember { mutableStateOf(false) }
+    var similarSeedMediaId by remember { mutableStateOf<String?>(null) }
+    val similarSeedTitle = similarSeedMediaId?.let { id ->
+        songs.firstOrNull { it.filename == id }?.title?.takeIf { it.isNotBlank() } ?: id
+    }
+    val refreshInProgress by container.playback.refreshBusy.collectAsState()
+    LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, songs.size, similarFrozen) {
+        val mediaId = playbackState.currentMediaId
+        if (mediaId == null || songs.isEmpty() || (embeddingsRowCount ?: 0) == 0) {
+            similarToCurrent = emptyList()
+            similarLoading = false
+            return@LaunchedEffect
+        }
+        if (similarFrozen && similarSeedMediaId != null && mediaId != similarSeedMediaId) {
+            return@LaunchedEffect
+        }
+        val current = songs.firstOrNull { it.filename == mediaId } ?: run {
+            similarToCurrent = emptyList()
+            similarLoading = false
+            return@LaunchedEffect
+        }
+        similarLoading = true
+        kotlinx.coroutines.delay(250)
+        val results = runCatching {
+            container.recommender.recommendScored(
+                currentSong = current,
+                library = songs,
+                k = 10,
+                adventurous = tuning.adventurous,
+            )
+        }.getOrDefault(emptyList())
+        similarToCurrent = results.map { it.song }
+        similarSeedMediaId = mediaId
+        similarLoading = false
+    }
+
+    val queueAllSimilarAfterCurrent: () -> Unit = {
+        val mediaId = playbackState.currentMediaId
+        val toQueue = similarToCurrent.filter {
+            it.filePath != null && it.filename != mediaId
+        }
+        if (toQueue.isEmpty()) {
+            container.toaster.show("No similar songs to queue")
+        } else {
+            container.playback.playNextMany(toQueue)
+            container.toaster.show("Added ${toQueue.size} similar songs after current")
+        }
+    }
+
+    val refreshUpcomingWithAI: () -> Unit = refreshUpcomingWithAI@ {
+        val mediaId = playbackState.currentMediaId ?: return@refreshUpcomingWithAI
+        val current = songs.firstOrNull { it.filename == mediaId } ?: return@refreshUpcomingWithAI
+        // Phase 2 (2026-06-01): re-entrancy guard + busy state. Flips the
+        // Refresh icon to a spinner across MiniPlayer / NowPlaying /
+        // lockscreen until the queue rebuild completes. Context-aware
+        // pre-toast lets the user know when embeddings are still indexing
+        // so the result reflects only what's ready so far.
+        if (container.playback.refreshBusy.value) return@refreshUpcomingWithAI
+        container.playback.setRefreshBusy(true)
+
+        // Bugfix 2026-06-01d: cache-pop fast path. RecommendationCache
+        // continuously precomputes a tail as the current song changes
+        // (process-lifetime, so it works even when MainActivity has been
+        // destroyed during a long lockscreen). If a tail is ready we
+        // serve it instantly — no sqlite-vec mmap reload, no Recommender
+        // call. Falls through to the live-compute path only on cache miss.
+        val cachedTail = container.recommendationCache.popTail()
+        if (cachedTail != null && cachedTail.isNotEmpty()) {
+            val playNextSet = playbackState.playNextFilenames
+            val byFn = songs.associateBy { it.filename }
+            val playNextSongs = playNextSet.mapNotNull { byFn[it] }
+            val policyFilteredTail = com.isaivazhi.app.engine.RecommendationPolicy.filterSongsForUpNext(
+                cachedTail,
+                upNextPolicyExcludes,
+            )
+            val finalUpcoming = playNextSongs + policyFilteredTail.filter {
+                it.filename !in playNextSet && it.filename != mediaId
+            }
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_CACHE_HIT",
+                message = "Served upcoming from RecommendationCache (size=${cachedTail.size}, afterPolicy=${policyFilteredTail.size})",
+                data = mapOf(
+                    "tailSize" to cachedTail.size,
+                    "policyFilteredSize" to policyFilteredTail.size,
+                    "mediaId" to mediaId,
+                ),
+            )
+            container.toaster.show("Up Next refreshed")
+            if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
+                newUpcoming = finalUpcoming,
+                newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+            )
+            container.playback.setRefreshBusy(false)
+            return@refreshUpcomingWithAI
+        }
+
+        val embStatus = container.embedding.status.value
+        if (embStatus.inProgress && embStatus.total > 0) {
+            container.toaster.show(
+                "AI is still indexing (${embStatus.processed}/${embStatus.total}) — " +
+                    "refresh uses what's ready."
+            )
+        }
+        // Bugfix 2026-06-01b: dispatch on Dispatchers.Default, NOT the
+        // default Compose rememberCoroutineScope dispatcher
+        // (AndroidUiDispatcher.Main). That dispatcher runs via Choreographer
+        // frame callbacks; while the activity is STOPPED (screen locked) no
+        // frames tick, so a launch body queued there does not execute until
+        // the user unlocks. Lockscreen Refresh taps were appearing to take
+        // 10s–60s because the recommend work was deferred until unlock.
+        // Running on Dispatchers.Default decouples the recommend pipeline
+        // from the UI lifecycle.
+        val dispatchStartedAt = android.os.SystemClock.elapsedRealtime()
+        coroutineScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val dispatchLatencyMs = android.os.SystemClock.elapsedRealtime() - dispatchStartedAt
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_DISPATCH_START",
+                message = "refreshUpcomingWithAI body dispatched",
+                data = mapOf(
+                    "dispatchLatencyMs" to dispatchLatencyMs,
+                    "mediaId" to mediaId,
+                ),
+            )
+            val recommendStartedAt = android.os.SystemClock.elapsedRealtime()
+            try {
+            val playNextSet = playbackState.playNextFilenames
+            val byFn = songs.associateBy { it.filename }
+            val playNextSongs = playNextSet.mapNotNull { byFn[it] }
+            val excludeFns = playNextSet + mediaId
+            val blendedTriple = runCatching {
+                container.recommender.buildBlendedVec(
+                    currentSongHash = current.contentHash,
+                    sessionListened = container.session.listened.value,
+                    profileVec = cachedProfileVec,
+                    library = songs,
+                    mode = "refresh",
+                    sessionBias = tuning.sessionBias,
+                )
+            }.getOrNull()
+            blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
+            val blendedVec = blendedTriple?.first
+            val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
+                runCatching {
+                    container.recommender.recommendUpcoming(
+                        current, songs, k = 50,
+                        adventurous = tuning.adventurous,
+                        extraExcludeFilenames = excludeFns,
+                        hardBlockedFilenames = upNextHardBlocked,
+                        dislikedFilenames = dislikedSet,
+                        softExcludedFilenames = upNextSoftExcluded,
+                        blendedQueryVec = blendedVec,
+                    )
+                }.getOrDefault(emptyList())
+            } else {
+                songs.filter { it.filePath != null && it.filename !in excludeFns }
+                    .shuffled().take(50)
+            }
+            val recommendElapsedMs = android.os.SystemClock.elapsedRealtime() - recommendStartedAt
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_RECOMMEND_DONE",
+                message = "recommendUpcoming returned ${newTail.size} tracks",
+                data = mapOf(
+                    "elapsedMs" to recommendElapsedMs,
+                    "tailSize" to newTail.size,
+                    "blend" to (blendedTriple?.third ?: "n/a"),
+                ),
+            )
+            container.toaster.show("Up Next refreshed (blend=${blendedTriple?.third ?: "current"})")
+            val finalUpcoming = playNextSongs + newTail
+            android.util.Log.i(
+                "QueueOp",
+                "Refresh: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
+            )
+            val replaceStartedAt = android.os.SystemClock.elapsedRealtime()
+            if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
+                newUpcoming = finalUpcoming,
+                newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+            )
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_REPLACE_DONE",
+                message = "replaceUpcoming done",
+                data = mapOf(
+                    "elapsedMs" to (android.os.SystemClock.elapsedRealtime() - replaceStartedAt),
+                    "finalUpcomingSize" to finalUpcoming.size,
+                ),
+            )
+            } finally {
+                container.playback.setRefreshBusy(false)
+            }
+        }
+    }
+
+    // Phase E (2026-06-01): bridge the lockscreen Refresh button into the
+    // shared lambda above. PlaybackEngine emits on refreshRequests when the
+    // service forwards EVT_MEDIA_ACTION action="refresh_queue" from the
+    // notification CommandButton tap. We keep all recommender state in this
+    // UI process; the service is intentionally state-free for the AI side.
+    LaunchedEffect(Unit) {
+        container.playback.refreshRequests.collect {
+            container.activityLog.log(
+                category = "notification",
+                type = "LOCKSCREEN_REFRESH_TAP",
+                message = "Lockscreen/notification Refresh tap received by UI",
+            )
+            refreshUpcomingWithAI()
+        }
+    }
+
+    /**
      * Auto-build queue helper for single-song taps. Mirrors the Capacitor
      * app's `_doRefresh('manual')` — tapping a card plays that song AND
      * fills Up Next with 50 AI-blended recommendations (or shuffled tail
@@ -1389,6 +1519,12 @@ private fun AppRoot(container: AppContainer) {
         // tail. Context = LIBRARY so the queue-exhaust LE knows it's
         // allowed to keep appending fresh recs if the queue runs low.
         android.util.Log.i("CardTap", "playFromTap song=${song.filename} → LIBRARY single-song + AI tail")
+        container.playback.clearPlayNextMarker(song.filename)
+        // Phase D (2026-06-01): force LOOP=OFF on AI-eligible queue starts
+        // so the queue-exhaust LE can append fresh recommendations. Without
+        // this, a user who once enabled REPEAT_ALL/ONE silently loops the
+        // same ~10 songs forever — the AI never blends in.
+        container.playback.setRepeatMode(androidx.media3.common.Player.REPEAT_MODE_OFF)
         container.playback.playQueue(
             songs = listOf(song),
             startIndex = 0,
@@ -1421,6 +1557,7 @@ private fun AppRoot(container: AppContainer) {
                     sessionBias = tuning.sessionBias,
                 )
             }.getOrNull()
+            blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
             val tail: List<Song> = if (recMode && hasEmbeddings) {
                 runCatching {
@@ -1429,7 +1566,9 @@ private fun AppRoot(container: AppContainer) {
                         library = songs,
                         k = 50,
                         adventurous = tuning.adventurous,
-                        hardBlockedFilenames = hardBlockedFilenames,
+                        hardBlockedFilenames = upNextHardBlocked,
+                        dislikedFilenames = dislikedSet,
+                        softExcludedFilenames = upNextSoftExcluded,
                         blendedQueryVec = blendedVec,
                     ).drop(1)   // drop the current song; replaceUpcoming dedupes anyway
                 }.getOrElse {
@@ -1500,6 +1639,16 @@ private fun AppRoot(container: AppContainer) {
             "playFromSection label=$sectionLabel ctx=$queueContext tapped=${tappedSong.filename} " +
                 "idx=$tappedIndex sectionSize=${playable.size} shuffleOn=$shuffleOn"
         )
+        // Phase D (2026-06-01): force LOOP=OFF when starting an AI-eligible
+        // queue context, so the queue-exhaust LE can append fresh AI tail.
+        // Album / Browse contexts keep whatever loop mode the user chose
+        // — those are finite by design.
+        if (queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION ||
+            queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.LIBRARY ||
+            queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED
+        ) {
+            container.playback.setRepeatMode(androidx.media3.common.Player.REPEAT_MODE_OFF)
+        }
         container.playback.playQueue(
             songs = queueSongs,
             startIndex = startIdx,
@@ -1521,18 +1670,12 @@ private fun AppRoot(container: AppContainer) {
     // NEXT build (next tap, next pull-to-refresh, queue-exhaust append).
     // Never an already-active queue.
 
-    // Push #45 perf: REMOVED the push #42 Tier 3L soft-refresh
-    // LaunchedEffect. It mutated the queue (`replaceUpcoming`) on every
-    // qualified-listen transition, triggering a recomposition cascade
-    // (Discover sections, Up Next, MiniPlayer all re-collected). Even
-    // for non-qualifying skips (the common case in logs.txt: rapid
-    // neutral_skip with frac=0), the LE still fired, allocated state,
-    // and re-ran on the next transition. Plus, the replaceUpcoming it
-    // triggered did an `associateBy` over the 2500-song library each
-    // time. The user's preferred queue-stability model is "queue is
-    // sacred between explicit user actions"; soft refresh contradicts
-    // that. The pull-to-refresh button still gives fresh recommendations
-    // on demand (push #44 randomized anchors).
+    // Push #67: soft-refresh of the Up Next tail is active again (see
+    // LaunchedEffect on sessionListened below). Push #45 had removed an
+    // older, overly aggressive version that ran on every transition;
+    // the current one debounces, requires 2+ session listens, and only
+    // runs when the upcoming queue has more than 5 tracks. Explicit
+    // Refresh still replaces the tail on demand.
 
     // Push #42 Tier 2G: queue-exhaust recommender append. When the
     // current song is the LAST one in the queue AND repeat mode is OFF
@@ -1546,9 +1689,11 @@ private fun AppRoot(container: AppContainer) {
         // Only fire when we're on the LAST item of the queue.
         val curIdx = playbackState.queueIndex
         if (curIdx < queueSize - 1) {
-            android.util.Log.i(
-                "QueueExhaust",
-                "skip: not on last item (curIdx=$curIdx of $queueSize, ctx=${playbackState.queueContext})"
+            container.activityLog.log(
+                category = "engine",
+                type = "QUEUE_EXHAUST_SKIP",
+                message = "not on last item (curIdx=$curIdx of $queueSize, ctx=${playbackState.queueContext})",
+                data = mapOf("reason" to "not_last", "curIdx" to curIdx, "queueSize" to queueSize),
             )
             return@LaunchedEffect
         }
@@ -1559,24 +1704,33 @@ private fun AppRoot(container: AppContainer) {
         if (ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM ||
             ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION
         ) {
-            android.util.Log.i(
-                "QueueExhaust",
-                "skip AI append: section context $ctx (no AI ever)"
+            container.activityLog.log(
+                category = "engine",
+                type = "QUEUE_EXHAUST_SKIP",
+                message = "section context $ctx (no AI ever)",
+                data = mapOf("reason" to "finite_section", "ctx" to ctx.name),
             )
             return@LaunchedEffect
         }
         // Respect repeat modes: ALL loops the section; ONE loops the song.
         // Both = no append. Only OFF gets the recommender tail.
         if (playbackState.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
-            android.util.Log.i(
-                "QueueExhaust",
-                "skip AI append: repeat=${playbackState.repeatMode} (OFF=0 ONE=1 ALL=2)"
+            container.activityLog.log(
+                category = "engine",
+                type = "QUEUE_EXHAUST_SKIP",
+                message = "repeat=${playbackState.repeatMode} (OFF=0 ONE=1 ALL=2)",
+                data = mapOf("reason" to "loop_on", "repeatMode" to playbackState.repeatMode),
             )
             return@LaunchedEffect
         }
         val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
         if ((embeddingsRowCount ?: 0) == 0) {
-            android.util.Log.i("QueueExhaust", "skip AI append: no embeddings")
+            container.activityLog.log(
+                category = "engine",
+                type = "QUEUE_EXHAUST_SKIP",
+                message = "no embeddings (rowCount=0)",
+                data = mapOf("reason" to "no_embeddings"),
+            )
             return@LaunchedEffect
         }
         // Debounce + check that we're still on the last item after the delay
@@ -1603,6 +1757,7 @@ private fun AppRoot(container: AppContainer) {
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
+        blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
         val blendedVec = blendedTriple?.first
         val tail = runCatching {
             container.recommender.recommendUpcoming(
@@ -1611,7 +1766,9 @@ private fun AppRoot(container: AppContainer) {
                 k = 50,
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = excludeFns,
-                hardBlockedFilenames = hardBlockedFilenames,
+                hardBlockedFilenames = upNextHardBlocked,
+                dislikedFilenames = dislikedSet,
+                softExcludedFilenames = upNextSoftExcluded,
                 blendedQueryVec = blendedVec,
             )
         }.getOrDefault(emptyList())
@@ -1653,6 +1810,7 @@ private fun AppRoot(container: AppContainer) {
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
+        blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
         val blendedVec = blendedTriple?.first ?: return@LaunchedEffect
         val newTail = runCatching {
             container.recommender.softRefreshUpcomingTail(
@@ -1662,7 +1820,9 @@ private fun AppRoot(container: AppContainer) {
                 blendedQueryVec = blendedVec,
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = upcomingFilenames.toSet(),
-                hardBlockedFilenames = hardBlockedFilenames,
+                hardBlockedFilenames = upNextHardBlocked,
+                dislikedFilenames = dislikedSet,
+                softExcludedFilenames = upNextSoftExcluded,
             )
         }.getOrDefault(emptyList())
         if (newTail.isNotEmpty() && newTail != upcomingSongs) {
@@ -1676,7 +1836,11 @@ private fun AppRoot(container: AppContainer) {
     val isMenuSongFavorite = menuSong?.filename?.let { it in favoritesSet } ?: false
     val isMenuSongDisliked = menuSong?.filename?.let { it in dislikedSet } ?: false
     // Push #59: filepath-based embedding membership check (was filename).
-    val isMenuSongEmbedded = menuSong?.filePath?.let { it in embeddedFilepaths } ?: false
+    val isMenuSongEmbedded = com.isaivazhi.app.ui.songHasEmbedding(
+        filePath = menuSong?.filePath,
+        embeddingsRowCount = embeddingsRowCount,
+        embeddedFilepaths = embeddedFilepaths,
+    )
     val menuSongStats = menuSong?.filename?.let { historyStats[it] }
 
     BackHandler(enabled = overlay !is Overlay.None) {
@@ -1729,12 +1893,12 @@ private fun AppRoot(container: AppContainer) {
                             DropdownMenuItem(text = { Text("Taste") },
                                 leadingIcon = { Icon(Icons.Filled.Tune, contentDescription = null) },
                                 onClick = { libraryMenuOpen = false; overlay = Overlay.Taste })
-                            DropdownMenuItem(text = { Text("AI / Embeddings") },
+                            DropdownMenuItem(text = { Text("AI & Library") },
                                 leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
                                 onClick = { libraryMenuOpen = false; overlay = Overlay.Ai })
-                            DropdownMenuItem(text = { Text("Debug Logs") },
+                            DropdownMenuItem(text = { Text("Diagnostics") },
                                 leadingIcon = { Icon(Icons.Filled.BugReport, contentDescription = null) },
-                                onClick = { libraryMenuOpen = false; overlay = Overlay.Debug })
+                                onClick = { libraryMenuOpen = false; overlay = Overlay.Logs() })
                             DropdownMenuItem(text = { Text("Settings") },
                                 leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                                 onClick = { libraryMenuOpen = false; overlay = Overlay.Settings })
@@ -1758,15 +1922,13 @@ private fun AppRoot(container: AppContainer) {
                         currentSongFilePath = currentSongFilePath,
                         isFavorite = isCurrentFavorite,
                         isDisliked = isCurrentDisliked,
-                        aiMode = recMode,
-                        // Push #60: include the empty-set guard so the MiniPlayer
-                        // doesn't briefly flash a red dot for every song during
-                        // the app-start window where the DB hasn't loaded yet
-                        // (embeddedFilepaths starts empty). Matches the same
-                        // guard used by SongsScreen / AlbumsScreen / Discover.
-                        hasEmbedding = currentSongFilePath?.let {
-                            embeddedFilepaths.isEmpty() || it in embeddedFilepaths
-                        } ?: true,
+                        aiMode = effectiveRecMode,
+                        hasEmbeddingsInLibrary = hasEmbeddingsInLibrary,
+                        hasEmbedding = com.isaivazhi.app.ui.songHasEmbedding(
+                            filePath = currentSongFilePath,
+                            embeddingsRowCount = embeddingsRowCount,
+                            embeddedFilepaths = embeddedFilepaths,
+                        ),
                         onToggleFavorite = {
                             playbackState.currentMediaId?.let { fn ->
                                 val wasFav = fn in favoritesSet
@@ -1803,6 +1965,10 @@ private fun AppRoot(container: AppContainer) {
                         onCycleRepeat = { container.playback.cycleRepeat() },
                         onToggleShuffle = { container.playback.toggleShuffle() },
                         onSeek = { container.playback.seekTo(it) },
+                        onRefresh = refreshUpcomingWithAI,
+                        refreshEnabled = playbackState.currentMediaId != null &&
+                            effectiveRecMode,
+                        refreshInProgress = refreshInProgress,
                     )
                     NavigationBar {
                         Tab.entries.forEachIndexed { idx, tab ->
@@ -1814,7 +1980,6 @@ private fun AppRoot(container: AppContainer) {
                                 icon = {
                                     Icon(
                                         imageVector = when (tab) {
-                                            Tab.Discover -> Icons.Filled.Explore
                                             Tab.Songs -> Icons.Filled.LibraryMusic
                                             Tab.Albums -> Icons.Filled.Album
                                             Tab.UpNext -> Icons.Filled.QueueMusic
@@ -1837,7 +2002,15 @@ private fun AppRoot(container: AppContainer) {
                 embeddingsRowCount == 0 &&
                 !onboardingDismissed
             when {
-                !permission.granted -> PermissionGateUi(onRequest = permission.request)
+                !permission.granted -> PermissionGateUi(
+                    onRequest = permission.request,
+                    onOpenSettings = {
+                        val intent = android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        ).setData(android.net.Uri.parse("package:${ctx.packageName}"))
+                        runCatching { ctx.startActivity(intent) }
+                    },
+                )
                 // Push #55: explicit notification permission step. Falls
                 // between audio permission and onboarding so the user has
                 // already committed to "yes, I'm setting this app up"
@@ -1863,19 +2036,21 @@ private fun AppRoot(container: AppContainer) {
                     OnboardingScreen(
                         songCount = songs.size,
                         estimatedEmbedTimeSec = estimateEmbedTime(songs.size, embeddingStatus.activeBackend),
-                        onImportEmbeddings = { importLauncher.launch(arrayOf("application/json", "*/*")) },
+                        importInProgress = importInProgress,
+                        importStatus = importMessage,
+                        onImportEmbeddings = {
+                            if (!importInProgress) {
+                                importLauncher.launch(arrayOf("application/json", "*/*"))
+                            }
+                        },
                         onEmbedInBackground = {
                             container.embedding.embedSongs(songs); onboardingDismissed = true
                         },
-                        onContinueWithoutEmbeddings = { onboardingDismissed = true },
+                        onContinueWithoutEmbeddings = {
+                            onboardingDismissed = true
+                            coroutineScope.launch { container.preferences.setRecMode(false) }
+                        },
                     )
-                    if (importMessage != null) {
-                        Box(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                            Text(text = importMessage!!,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
                 }
                 else -> HorizontalPager(
                     state = pagerState,
@@ -1886,156 +2061,12 @@ private fun AppRoot(container: AppContainer) {
                     beyondViewportPageCount = 1,
                 ) { page ->
                     when (Tab.entries[page]) {
-                        Tab.Discover -> Column(modifier = Modifier.fillMaxSize()) {
-                            EmbeddingStatusBanner(status = embeddingStatus, onStop = { container.embedding.stop() })
-                            DiscoverScreen(
-                                mostSimilar = if (freezeMostSimilar) frozenMostSimilar else mostSimilar,
-                                forYou = forYou,
-                                becauseYouPlayed = becauseYouPlayed,
-                                unexploredClusters = unexploredClusters,
-                                freezeMostSimilar = freezeMostSimilar,
-                                onToggleFreeze = {
-                                    if (freezeMostSimilar) freezeMostSimilar = false
-                                    else { frozenMostSimilar = mostSimilar; freezeMostSimilar = true }
-                                },
-                                embeddingProgress = if (embeddingStatus.inProgress)
-                                    "Embedding ${embeddingStatus.processed}/${embeddingStatus.total} " +
-                                    (if (embeddingStatus.activeBackend.isNotBlank()) "• ${embeddingStatus.activeBackend} " else "") +
-                                    (embeddingStatus.etaSeconds?.let { "• ~${it}s left" } ?: "")
-                                else null,
-                                currentMediaId = playbackState.currentMediaId,
-                                embeddedFilepaths = embeddedFilepaths,
-                                currentSongHasEmbedding = currentSongFilePath?.let {
-                                    embeddedFilepaths.isEmpty() || it in embeddedFilepaths
-                                } ?: true,
-                                // Push #64: pass the same EngineSnapshot the
-                                // Taste page uses so the Discover strip stays
-                                // in sync with it. Tap → opens Taste.
-                                engineSnapshot = buildEngineSnapshot(
-                                    tuning = tuning,
-                                    discoverQueueSize = playbackState.queueFilenames.size,
-                                    aiMode = recMode,
-                                    embeddingsCovered = embeddedFilepaths.size,
-                                    embeddingsTotal = songs.count { it.filePath != null },
-                                    nowPlayingTitle = playbackState.title,
-                                    nowPlayingArtist = playbackState.artist,
-                                ),
-                                onOpenTaste = { overlay = Overlay.Taste },
-                                onOpenAiPage = { overlay = Overlay.Ai },
-                                // Push #42 Tier 2F: Discover card tap is a SECTION tap
-                                // — find which section the tapped song belongs to and
-                                // play that section (linearly from tapped, or shuffled
-                                // if shuffle is on). Recommender appends a tail when
-                                // the section exhausts (Tier 2G LE below).
-                                onCardTap = { song ->
-                                    val mostSimSongs = (if (freezeMostSimilar) frozenMostSimilar else mostSimilar).map { it.song }
-                                    val fySongs = forYou.map { it.song }
-                                    val bypMatch = becauseYouPlayed.firstOrNull { pair ->
-                                        pair.second.any { it.song.filename == song.filename }
-                                    }
-                                    val unexploredCluster = unexploredClusters.firstOrNull { cluster ->
-                                        cluster.any { it.filename == song.filename }
-                                    }
-                                    val (sectionSongs, idx, label) = when {
-                                        mostSimSongs.any { it.filename == song.filename } ->
-                                            Triple(mostSimSongs, mostSimSongs.indexOfFirst { it.filename == song.filename }, "MostSimilar")
-                                        fySongs.any { it.filename == song.filename } ->
-                                            Triple(fySongs, fySongs.indexOfFirst { it.filename == song.filename }, "ForYou")
-                                        bypMatch != null -> {
-                                            val bypSongs = bypMatch.second.map { it.song }
-                                            Triple(bypSongs, bypSongs.indexOfFirst { it.filename == song.filename }, "BYP:${bypMatch.first.filename}")
-                                        }
-                                        unexploredCluster != null ->
-                                            Triple(unexploredCluster, unexploredCluster.indexOfFirst { it.filename == song.filename }, "Unexplored")
-                                        else -> Triple(listOf(song), 0, "Single")
-                                    }
-                                    playFromSection(
-                                        sectionSongs, idx,
-                                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION,
-                                        label,
-                                    )
-                                },
-                                onSongLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
-                                onRefresh = {
-                                    val mediaId = playbackState.currentMediaId
-                                    if (mediaId != null && (embeddingsRowCount ?: 0) > 0) {
-                                        val current = songs.firstOrNull { it.filename == mediaId }
-                                        if (current != null) {
-                                            mostSimilar = runCatching {
-                                                container.recommender.recommendScored(current, songs, k = 10, adventurous = tuning.adventurous)
-                                            }.getOrElse { mostSimilar }
-                                        }
-                                    }
-                                    // Push #44: randomize = true so pull-to-refresh
-                                    // visibly shuffles the anchor pool. Previously
-                                    // forYou + BYP were deterministic and returned
-                                    // identical results every pull, making the
-                                    // refresh look broken. .getOrElse keeps the
-                                    // existing list on transient errors instead of
-                                    // hiding the section.
-                                    forYou = runCatching {
-                                        // Push #64: profile-vector path with fallback.
-                                        val pv = container.recommender.forYouByProfileVector(
-                                            songs, historyStats, embeddedFilepaths, dislikedSet,
-                                            hardBlockedFilenames = hardBlockedFilenames,
-                                            k = 12, randomize = true,
-                                        )
-                                        if (pv.isNotEmpty()) pv
-                                        else container.recommender.forYou(songs, historyStats, tuning, dislikedSet, hardBlockedFilenames = hardBlockedFilenames, k = 12, randomize = true)
-                                    }.getOrElse { forYou }
-                                    becauseYouPlayed = runCatching {
-                                        container.recommender.becauseYouPlayed(songs, historyEvents, tuning, dislikedSet, hardBlockedFilenames = hardBlockedFilenames, statsFallback = historyStats, kPerSource = 8, sourceCount = 3, randomize = true)
-                                    }.getOrElse { becauseYouPlayed }
-                                    // Push #70: pull-to-refresh is the ONLY trigger
-                                    // for Unexplored Sounds. Bumping the counter
-                                    // re-fires the dedicated Unexplored LE which
-                                    // now lives separately from the listen-driven
-                                    // For You + BYP refresh.
-                                    unexploredManualRefreshCounter++
-                                    android.util.Log.i(
-                                        "DiscoverLE",
-                                        "Pull-to-refresh: tick Unexplored counter → $unexploredManualRefreshCounter"
-                                    )
-                                    container.activityLog.log(
-                                        category = "ui",
-                                        type = "DISCOVER_PULL_REFRESH",
-                                        message = "User pulled to refresh Discover",
-                                        data = mapOf(
-                                            "unexploredManualRefreshCounter" to unexploredManualRefreshCounter,
-                                            "currentMediaId" to (playbackState.currentMediaId ?: ""),
-                                        ),
-                                    )
-                                    // Pull-to-refresh resets the auto-refresh window.
-                                    container.session.resetForYouTick()
-                                    container.toaster.show("Recommendations refreshed")
-                                },
-                                onOpenSection = { ref ->
-                                    val frozenOrLive = if (freezeMostSimilar) frozenMostSimilar else mostSimilar
-                                    val (title, songsForSection) = when (ref) {
-                                        DiscoverSectionRef.MostSimilar ->
-                                            "Most Similar" to frozenOrLive.map { it.song }
-                                        DiscoverSectionRef.ForYou ->
-                                            "For You" to forYou.map { it.song }
-                                        is DiscoverSectionRef.BecauseYouPlayed -> {
-                                            val sims = becauseYouPlayed.firstOrNull { it.first.id == ref.sourceId }?.second.orEmpty()
-                                            "Because you played ${ref.sourceTitle}" to sims.map { it.song }
-                                        }
-                                        is DiscoverSectionRef.Unexplored -> {
-                                            val cluster = unexploredClusters.getOrNull(ref.clusterIndex).orEmpty()
-                                            ref.label to cluster
-                                        }
-                                    }
-                                    if (songsForSection.isNotEmpty()) {
-                                        overlay = Overlay.SectionViewAll(title, songsForSection)
-                                    }
-                                },
-                                contentPadding = PaddingValues(bottom = 8.dp),
-                            )
-                        }
                         Tab.Songs -> SongsScreen(
                             songs = songs,
                             currentMediaId = playbackState.currentMediaId,
+                            permissionGranted = permission.granted,
                             embeddedFilepaths = embeddedFilepaths,
+                            embeddingsRowCount = embeddingsRowCount,
                             // Push #37: tap a song from Songs tab → same
                             // behaviour as Discover card (plays this song +
                             // AI builds 50 recommended songs behind it).
@@ -2058,6 +2089,7 @@ private fun AppRoot(container: AppContainer) {
                             songs = songs,
                             currentMediaId = playbackState.currentMediaId,
                             embeddedFilepaths = embeddedFilepaths,
+                            embeddingsRowCount = embeddingsRowCount,
                             initialExpandedAlbum = albumToExpand.also { albumToExpand = null },
                             // Push #42 Tier 2F: Album tap = SECTION tap. Queue
                             // becomes [tappedTrack..lastTrack] of the album (or
@@ -2083,7 +2115,8 @@ private fun AppRoot(container: AppContainer) {
                             queue = fullQueueSongs,
                             currentMediaId = playbackState.currentMediaId,
                             currentIndex = playbackState.queueIndex,
-                            aiMode = recMode,
+                            aiMode = effectiveRecMode,
+                            aiModeEnabled = hasEmbeddingsInLibrary,
                             onToggleMode = { aiMode ->
                                 coroutineScope.launch { container.preferences.setRecMode(aiMode) }
                                 val mediaId = playbackState.currentMediaId ?: return@UpNextScreen
@@ -2108,6 +2141,7 @@ private fun AppRoot(container: AppContainer) {
                                             sessionBias = tuning.sessionBias,
                                         )
                                     }.getOrNull()
+                                    blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
                                     val blendedVec = blendedTriple?.first
                                     val newTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
@@ -2115,7 +2149,9 @@ private fun AppRoot(container: AppContainer) {
                                                 current, songs, k = 50,
                                                 adventurous = tuning.adventurous,
                                                 extraExcludeFilenames = excludeFns,
-                                                hardBlockedFilenames = hardBlockedFilenames,
+                                                hardBlockedFilenames = upNextHardBlocked,
+                                                dislikedFilenames = dislikedSet,
+                                                softExcludedFilenames = upNextSoftExcluded,
                                                 blendedQueryVec = blendedVec,
                                             )
                                         }.getOrDefault(emptyList())
@@ -2138,60 +2174,7 @@ private fun AppRoot(container: AppContainer) {
                             onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
                             onRemove = { idx -> container.playback.removeFromQueue(idx) },
                             onMove = { from, to -> container.playback.moveQueueItem(from, to) },
-                            onRefresh = {
-                                val mediaId = playbackState.currentMediaId ?: return@UpNextScreen
-                                val current = songs.firstOrNull { it.filename == mediaId } ?: return@UpNextScreen
-                                coroutineScope.launch {
-                                    // Push #70: refresh button rebuilds AI tail
-                                    // but PRESERVES Play Next songs at the front
-                                    // of the new upcoming list. Reset queue
-                                    // context to AI_RECOMMENDED.
-                                    // Push #72: use blended query vec with
-                                    // mode="refresh" so recommendations respect
-                                    // current+session+profile blend, not just
-                                    // current-song neighbors. Capacitor parity
-                                    // for `_doRefresh('manual')`.
-                                    val playNextSet = playbackState.playNextFilenames
-                                    val byFn = songs.associateBy { it.filename }
-                                    val playNextSongs = playNextSet.mapNotNull { byFn[it] }
-                                    val excludeFns = playNextSet + mediaId
-                                    val blendedTriple = runCatching {
-                                        container.recommender.buildBlendedVec(
-                                            currentSongHash = current.contentHash,
-                                            sessionListened = container.session.listened.value,
-                                            profileVec = cachedProfileVec,
-                                            library = songs,
-                                            mode = "refresh",
-                                            sessionBias = tuning.sessionBias,
-                                        )
-                                    }.getOrNull()
-                                    val blendedVec = blendedTriple?.first
-                                    val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
-                                        runCatching {
-                                            container.recommender.recommendUpcoming(
-                                                current, songs, k = 50,
-                                                adventurous = tuning.adventurous,
-                                                extraExcludeFilenames = excludeFns,
-                                                hardBlockedFilenames = hardBlockedFilenames,
-                                                blendedQueryVec = blendedVec,
-                                            )
-                                        }.getOrDefault(emptyList())
-                                    } else {
-                                        songs.filter { it.filePath != null && it.filename !in excludeFns }
-                                            .shuffled().take(50)
-                                    }
-                                    container.toaster.show("Up Next refreshed (blend=${blendedTriple?.third ?: "current"})")
-                                    val finalUpcoming = playNextSongs + newTail
-                                    android.util.Log.i(
-                                        "QueueOp",
-                                        "Refresh button: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
-                                    )
-                                    if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
-                                        newUpcoming = finalUpcoming,
-                                        newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
-                                    )
-                                }
-                            },
+                            onRefresh = { refreshUpcomingWithAI() },
                             contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
                         )
                         Tab.Browse -> {
@@ -2274,6 +2257,33 @@ private fun AppRoot(container: AppContainer) {
             onSkipPrev = { container.playback.skipPrev() },
             onSkipNext = { container.playback.skipNext(neutral = true) },
             onSeek = { container.playback.seekTo(it) },
+            onRefresh = refreshUpcomingWithAI,
+            refreshEnabled = playbackState.currentMediaId != null && effectiveRecMode,
+            refreshInProgress = refreshInProgress,
+            similarSongs = similarToCurrent,
+            similarLoading = similarLoading,
+            similarFrozen = similarFrozen,
+            similarSeedTitle = similarSeedTitle,
+            queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
+            onSimilarTap = { song -> playFromTap(song) },
+            onSimilarPlayNext = { song ->
+                container.playback.playNext(song)
+                container.toaster.show("Playing next")
+            },
+            onSimilarLongPress = { song ->
+                menuPlaylistContext = null
+                menuSongsTabIndex = null
+                menuSong = song
+            },
+            onQueueAllSimilar = queueAllSimilarAfterCurrent,
+            onToggleSimilarFrozen = {
+                if (similarFrozen) {
+                    similarFrozen = false
+                } else {
+                    similarFrozen = true
+                    similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
+                }
+            },
         )
     }
 
@@ -2294,24 +2304,22 @@ private fun AppRoot(container: AppContainer) {
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         SettingsScreen(
-            songCount = songs.size,
-            embeddingRows = embeddingsRowCount ?: 0,
-            embeddingDimText = if (embeddingsDim > 0) "${embeddingsDim}-D" else "empty",
-            vecExtensionLoaded = vecExtLoaded,
             artCacheBytes = artCacheBytes,
+            importInProgress = importInProgress,
+            importStatus = importMessage,
             onBack = { overlay = Overlay.None },
-            onReimportEmbeddings = { importLauncher.launch(arrayOf("application/json", "*/*")) },
-            onEmbedAllNow = { container.embedding.embedSongs(songs); overlay = Overlay.None },
-            onRescanLibrary = {
-                coroutineScope.launch { songs = LibraryCache.invalidate(ctx) }
-                overlay = Overlay.None
+            onReimportEmbeddings = {
+                if (!importInProgress) {
+                    importLauncher.launch(arrayOf("application/json", "*/*"))
+                }
             },
             onClearArtCache = {
                 AlbumArtRepository.clearDiskCache(ctx)
                 AlbumArtRepository.trimMemory()
                 coroutineScope.launch { artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) } }
             },
-            onOpenActivityLog = { overlay = Overlay.ActivityLog },
+            onOpenAiLibrary = { overlay = Overlay.Ai },
+            onOpenLogs = { overlay = Overlay.Logs() },
         )
     }
 
@@ -2392,11 +2400,17 @@ private fun AppRoot(container: AppContainer) {
             stats = historyStats,
             signals = tasteSignals,
             decoratedSignals = decoratedSignals,
+            upNextHardBlockedCount = upNextHardBlocked.size,
+            upNextSoftExcludedCount = upNextSoftExcluded.size,
+            upNextExcludedFilenames = upNextPolicyExcludes,
+            favoritesSet = favoritesSet,
+            dislikedSet = dislikedSet,
             timelineEvents = timelineEvents,
             engineSnapshot = buildEngineSnapshot(
                 tuning = tuning,
-                discoverQueueSize = discoverQueue.size,
-                aiMode = recMode,
+                lastBlend = lastBlendInfo,
+                queueSize = playbackState.queueFilenames.size,
+                aiMode = effectiveRecMode,
                 embeddingsCovered = embeddedFilenames.size,
                 embeddingsTotal = songs.count { it.filePath != null },
                 nowPlayingTitle = playbackState.title,
@@ -2413,7 +2427,7 @@ private fun AppRoot(container: AppContainer) {
             },
             onNegativeStrengthChange = {
                 container.taste.setNegativeStrength(it)
-                container.toaster.show("Skip strength: ${(it * 100).toInt()}%")
+                container.toaster.show("Negative guard: ${(it * 100).toInt()}%")
             },
             onAdventurousReset = {
                 container.taste.resetAdventurous()
@@ -2425,7 +2439,7 @@ private fun AppRoot(container: AppContainer) {
             },
             onNegativeStrengthReset = {
                 container.taste.resetNegativeStrength()
-                container.toaster.show("Skip strength reset to ${(TasteEngine.DEFAULT_NEGATIVE_STRENGTH * 100).toInt()}%")
+                container.toaster.show("Negative guard reset to ${(TasteEngine.DEFAULT_NEGATIVE_STRENGTH * 100).toInt()}%")
             },
             onResetSongStats = { fn ->
                 container.history.resetStatsForSong(fn)
@@ -2448,7 +2462,7 @@ private fun AppRoot(container: AppContainer) {
             },
             // Push #74: long-press the Taste Signal header to open the
             // Activity Log overlay.
-            onOpenActivityLog = { overlay = Overlay.ActivityLog },
+            onOpenActivityLog = { overlay = Overlay.Logs(LogsTab.Activity) },
         )
     }
 
@@ -2469,6 +2483,15 @@ private fun AppRoot(container: AppContainer) {
     // be bumped from inside that callback.
     LaunchedEffect(overlay, dupesRefreshTick) {
         if (overlay is Overlay.Ai) {
+            try {
+                container.embeddingDb.relinkLibraryPaths(songs)
+                val hashMap = container.embeddingDb.contentHashByFilepath()
+                songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                container.library.value = songs
+                container.embeddingDb.prewarmFromLibrary(songs)
+            } catch (t: Throwable) {
+                android.util.Log.w("MainActivity", "AI-page relink failed: ${t.message}")
+            }
             refreshDbStats(container) { rc, dim, ext, fns, fps ->
                 embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                 embeddedFilenames = fns
@@ -2552,7 +2575,6 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Re-added to pending")
                 container.embedding.logBuffer.append("skip", "user un-skipped: $filepath")
             },
-            logLines = embeddingLogs,
             staleFilenames = staleFilenames,
             onRemoveStale = { fns ->
                 container.embedding.removeStaleEmbeddings(fns) { _ ->
@@ -2599,7 +2621,7 @@ private fun AppRoot(container: AppContainer) {
                 // line so the user can tell what rescan actually did.
                 val beforeSongs = songs.size
                 val beforeEmbedded = embeddedFilenames.size
-                container.toaster.show("Rescanning library…")
+                container.toaster.show("Scanning library…")
                 container.embedding.logBuffer.append("rescan", "started (library=$beforeSongs, embedded=$beforeEmbedded)")
                 coroutineScope.launch {
                     songs = LibraryCache.invalidate(ctx)
@@ -2620,7 +2642,7 @@ private fun AppRoot(container: AppContainer) {
                         songDelta < 0 -> "${-songDelta} removed"
                         else -> "no change"
                     }
-                    val msg = "Rescan: $beforeSongs → $afterSongs songs ($deltaText)"
+                    val msg = "Scan: $beforeSongs → $afterSongs songs ($deltaText)"
                     container.toaster.show(msg)
                     container.embedding.logBuffer.append("rescan", "done — $msg")
                     // Refresh duplicates view too, in case rescan
@@ -2633,36 +2655,54 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Embedding stopped")
                 container.embedding.logBuffer.append("stop", "user stopped embedding")
             },
-            onClearLog = {
-                container.embedding.logBuffer.clear()
-                container.toaster.show("Logs cleared")
-            },
             // Push #46: manual one-shot export of the SQLite embeddings
             // into a portable `local_embeddings.json` mirror file. Useful
             // right before a reinstall — copy the JSON off the device,
             // install the fresh APK, drop the JSON back, app's
             // migrateFromLegacyIfNeeded() ingests it on first launch.
             onExportBackup = {
-                container.toaster.show("Exporting embeddings backup…")
+                if (exportBackupInProgress) {
+                    container.toaster.show("Export already in progress…")
+                } else {
+                exportBackupInProgress = true
+                val rowHint = embeddingsRowCount ?: 0
+                exportBackupStatus = "Preparing backup — reading $rowHint embeddings (may take 1–2 min)…"
                 container.embedding.logBuffer.append("backup", "manual export started")
-                coroutineScope.launch(Dispatchers.IO) {
-                    val res = runCatching { container.embeddingDb.exportLegacyMirror() }.getOrNull()
-                    val rows = res?.optInt("rowCount", 0) ?: 0
-                    val bytes = res?.optLong("bytes", 0L) ?: 0L
-                    val mb = bytes / 1024.0 / 1024.0
-                    val mbStr = "%.1f".format(mb)
-                    if (res != null) {
-                        container.toaster.show("Backup ready — $rows rows, $mbStr MB")
+                coroutineScope.launch {
+                    try {
+                        val res = runCatching { container.embeddingDb.exportLegacyMirror() }.getOrNull()
+                        val rows = res?.optInt("rowCount", 0) ?: 0
+                        val bytes = res?.optLong("bytes", 0L) ?: 0L
+                        val mbStr = "%.1f".format(bytes / 1024.0 / 1024.0)
+                        if (res == null || rows <= 0) {
+                            exportBackupStatus = "Export failed — no embeddings in database"
+                            container.toaster.show("Backup failed — no embeddings to export")
+                            container.embedding.logBuffer.append("backup", "manual export FAILED")
+                            exportBackupInProgress = false
+                            kotlinx.coroutines.delay(3000)
+                            exportBackupStatus = null
+                            return@launch
+                        }
                         container.embedding.logBuffer.append(
                             "backup",
-                            "manual export complete — $rows rows, $bytes bytes ($mbStr MB)"
+                            "manual export complete — $rows rows, $bytes bytes ($mbStr MB)",
                         )
-                    } else {
-                        container.toaster.show("Backup failed")
-                        container.embedding.logBuffer.append("backup", "manual export FAILED")
+                        exportBackupStatus = "Ready — choose where to save ($rows songs, $mbStr MB)"
+                        exportSaveLauncher.launch("local_embeddings.json")
+                    } catch (t: Throwable) {
+                        val err = t.message ?: t.javaClass.simpleName
+                        exportBackupStatus = "Export failed: $err"
+                        container.toaster.show("Export failed: $err")
+                        container.embedding.logBuffer.append("backup", "manual export FAILED: $err")
+                        exportBackupInProgress = false
+                        kotlinx.coroutines.delay(3000)
+                        exportBackupStatus = null
                     }
                 }
+                }
             },
+            exportBackupInProgress = exportBackupInProgress,
+            exportBackupStatus = exportBackupStatus,
             // Push #51: Duplicates section wiring. Grouping is now
             // filepath-based (push #51 SQL change), play lookup goes
             // strictly through filepath — no filename fallback (the
@@ -2718,19 +2758,33 @@ private fun AppRoot(container: AppContainer) {
         )
     }
 
-    AnimatedVisibility(visible = overlay is Overlay.Debug,
-        enter = slideInVertically(initialOffsetY = { it }),
-        exit = slideOutVertically(targetOffsetY = { it })) {
-        DebugLogsScreen(onBack = { overlay = Overlay.None })
-    }
+    val showOnboardingImportUi = permission.granted &&
+        songs.isNotEmpty() &&
+        (embeddingsRowCount ?: 0) == 0 &&
+        !onboardingDismissed
+    EmbeddingsImportDialog(
+        visible = (importInProgress || !importMessage.isNullOrBlank()) && !showOnboardingImportUi,
+        inProgress = importInProgress,
+        statusMessage = importMessage,
+        onDismiss = { importMessage = null },
+    )
 
-    AnimatedVisibility(visible = overlay is Overlay.ActivityLog,
+    val logsOverlay = overlay as? Overlay.Logs
+    AnimatedVisibility(visible = logsOverlay != null,
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
-        ActivityLogScreen(
-            activityLog = container.activityLog,
-            onBack = { overlay = Overlay.None },
-        )
+        if (logsOverlay != null) {
+            LogsScreen(
+                activityLog = container.activityLog,
+                embeddingLogLines = embeddingLogs,
+                onClearEmbeddingLog = {
+                    container.embedding.logBuffer.clear()
+                    container.toaster.show("Embedding log cleared")
+                },
+                initialTab = logsOverlay.initialTab,
+                onBack = { overlay = Overlay.None },
+            )
+        }
     }
 
     val viewAllCat = (overlay as? Overlay.ViewAll)?.category
@@ -2765,29 +2819,9 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
-    val sectionViewAll = overlay as? Overlay.SectionViewAll
-    AnimatedVisibility(visible = sectionViewAll != null,
-        enter = slideInVertically(initialOffsetY = { it }),
-        exit = slideOutVertically(targetOffsetY = { it })) {
-        if (sectionViewAll != null) {
-            ViewAllScreen(
-                title = sectionViewAll.title,
-                songs = sectionViewAll.songs,
-                currentMediaId = playbackState.currentMediaId,
-                onBack = { overlay = Overlay.None },
-                // Push #70: Discover section "View all" = DISCOVER_SECTION
-                // context. AI tail appends on queue exhaust.
-                onPlay = { q, idx ->
-                    playFromSection(
-                        q, idx,
-                        com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION,
-                        sectionViewAll.title,
-                    )
-                },
-                onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
-            )
-        }
-    }
+    // Phase 4 (2026-06-01): Overlay.SectionViewAll renderer removed alongside
+    // the Discover page. Browse-tab ViewAll continues to render via the
+    // Overlay.ViewAll(category) branch above.
 
     // Long-press song menu
     val sheetSong = menuSong
@@ -2805,7 +2839,10 @@ private fun AppRoot(container: AppContainer) {
             playlists = playlistsList,
             onDismiss = { menuSong = null; menuPlaylistContext = null },
             onPlayOnly = { container.playback.playOnly(sheetSong) },
-            onPlayNext = { container.playback.playNext(sheetSong) },
+            onPlayNext = {
+                container.playback.playNext(sheetSong)
+                container.toaster.show("Added to play next")
+            },
             onToggleFavorite = {
                 val fn = sheetSong.filename
                 val wasFav = fn in favoritesSet
@@ -3339,28 +3376,51 @@ private fun ingestPendingEvidence(
     container.history.recordCompleted(mediaId, System.currentTimeMillis(), frac)
 }
 
+private data class LastBlendInfo(
+    val weights: com.isaivazhi.app.engine.Recommender.BlendWeights,
+    val label: String,
+)
+
 private fun buildEngineSnapshot(
     tuning: com.isaivazhi.app.engine.TasteEngine.Tuning,
-    discoverQueueSize: Int,
+    lastBlend: LastBlendInfo?,
+    queueSize: Int,
     aiMode: Boolean,
     embeddingsCovered: Int,
     embeddingsTotal: Int,
     nowPlayingTitle: String,
     nowPlayingArtist: String,
 ): EngineSnapshot {
-    // Multi-timescale blend ratios. Same shape as the Capacitor app's getInsights():
-    //   currentSong portion = 1 - sessionBias (when sessionBias=0 you're 100% current)
-    //   session portion     = sessionBias * 0.7
-    //   profile portion     = sessionBias * 0.3
-    val currentPortion = (1f - tuning.sessionBias).coerceIn(0f, 1f)
-    val sessionPortion = (tuning.sessionBias * 0.7f).coerceIn(0f, 1f)
-    val profilePortion = (tuning.sessionBias * 0.3f).coerceIn(0f, 1f)
-    val mode = when {
-        tuning.sessionBias < 0.2f -> "Current-song heavy"
-        tuning.sessionBias > 0.7f -> "Strong session blend"
-        else -> "Balanced"
-    }
     val pct: (Float) -> String = { v -> "${(v * 100).toInt()}%" }
+    val currentPortion: Float
+    val sessionPortion: Float
+    val profilePortion: Float
+    val mode: String
+    val lastRefreshLabel: String?
+    if (lastBlend != null) {
+        val w = lastBlend.weights
+        val total = (w.wCurrent + w.wSession + w.wProfile).coerceAtLeast(0.001f)
+        currentPortion = w.wCurrent / total
+        sessionPortion = w.wSession / total
+        profilePortion = w.wProfile / total
+        mode = when {
+            currentPortion >= 0.55f -> "Current-song heavy"
+            sessionPortion >= 0.45f -> "Strong session blend"
+            profilePortion >= 0.45f -> "Profile heavy"
+            else -> "Balanced"
+        }
+        lastRefreshLabel = "Last refresh: ${lastBlend.label} (${pct(currentPortion)} / ${pct(sessionPortion)} / ${pct(profilePortion)})"
+    } else {
+        currentPortion = (1f - tuning.sessionBias).coerceIn(0f, 1f)
+        sessionPortion = (tuning.sessionBias * 0.7f).coerceIn(0f, 1f)
+        profilePortion = (tuning.sessionBias * 0.3f).coerceIn(0f, 1f)
+        mode = when {
+            tuning.sessionBias < 0.2f -> "Current-song heavy"
+            tuning.sessionBias > 0.7f -> "Strong session blend"
+            else -> "Balanced (no Up Next refresh yet)"
+        }
+        lastRefreshLabel = null
+    }
     val coveragePct = if (embeddingsTotal > 0) (embeddingsCovered * 100 / embeddingsTotal).toString() + "%"
     else "0%"
     return EngineSnapshot(
@@ -3368,7 +3428,8 @@ private fun buildEngineSnapshot(
         blendSession = pct(sessionPortion),
         blendProfile = pct(profilePortion),
         blendMode = mode,
-        queueSize = discoverQueueSize,
+        lastRefreshLabel = lastRefreshLabel,
+        queueSize = queueSize,
         queueMode = if (aiMode) "AI" else "Shuffle",
         embeddingsCovered = embeddingsCovered,
         embeddingsTotal = embeddingsTotal,
@@ -3386,16 +3447,75 @@ private fun refreshDbStats(
     onResult: (rowCount: Int, dim: Int, vecExt: Boolean, embeddedFilenames: Set<String>, embeddedFilepaths: Set<String>) -> Unit,
 ) {
     CoroutineScope(Dispatchers.IO).launch {
+        // Phase A per-step timing (2026-06-01): instrument each DB call
+        // independently so we can pinpoint whether the cold-start wait is
+        // the first stats() (Room/sqlite-vec init) or the larger list
+        // fetches (allFilenames / allFilepaths over ~2.4k rows).
+        val t0 = System.currentTimeMillis()
         val stats = container.embeddingDb.stats()
+        val tStats = System.currentTimeMillis()
         val filenames = container.embeddingDb.allFilenames()
+        val tFilenames = System.currentTimeMillis()
         val filepaths = container.embeddingDb.allFilepaths()
-        onResult(
-            stats?.optInt("count", 0) ?: 0,
-            stats?.optInt("dim", 0) ?: 0,
-            stats?.optBoolean("vecExtensionLoaded", false) ?: false,
-            filenames,
-            filepaths,
+        val tFilepaths = System.currentTimeMillis()
+        val rc = stats?.optInt("count", 0) ?: 0
+        val dim = stats?.optInt("dim", 0) ?: 0
+        val vecExt = stats?.optBoolean("vecExtensionLoaded", false) ?: false
+        container.activityLog.log(
+            category = "engine",
+            type = "PERF_DB_BREAKDOWN",
+            message = "stats=${tStats - t0}ms allFilenames=${tFilenames - tStats}ms allFilepaths=${tFilepaths - tFilenames}ms",
+            data = mapOf(
+                "statsMs" to (tStats - t0),
+                "filenamesMs" to (tFilenames - tStats),
+                "filepathsMs" to (tFilepaths - tFilenames),
+                "rowCount" to rc,
+            ),
         )
+        // Phase B (2026-06-01): cache the rowCount so the NEXT cold start
+        // can publish it instantly and unblock AI Discover without waiting
+        // for the DB worker (saves ~18s on the user's device where the
+        // first DB call pays the full sqlite-vec init cost).
+        runCatching { container.preferences.saveCachedEmbedStats(rc, dim, vecExt) }
+        kotlinx.coroutines.withContext(Dispatchers.Main) {
+            onResult(rc, dim, vecExt, filenames, filepaths)
+        }
+    }
+}
+
+/**
+ * Phase B (2026-06-01): lightweight startup-only helper. Calls only stats()
+ * (no allFilenames/allFilepaths) so the FIRST DB worker turn returns the
+ * row count as fast as possible. UI gates AI Discover on this value.
+ * The heavier file-set fetch (`refreshDbStats`) runs later, lazily, when
+ * the AI page actually needs the filename/filepath sets.
+ */
+private fun refreshEmbeddingRowCount(
+    container: AppContainer,
+    onResult: (rowCount: Int, dim: Int, vecExt: Boolean) -> Unit,
+) {
+    CoroutineScope(Dispatchers.IO).launch {
+        val t0 = System.currentTimeMillis()
+        val stats = container.embeddingDb.stats()
+        val rc = stats?.optInt("count", 0) ?: 0
+        val dim = stats?.optInt("dim", 0) ?: 0
+        val vecExt = stats?.optBoolean("vecExtensionLoaded", false) ?: false
+        val elapsed = System.currentTimeMillis() - t0
+        container.activityLog.log(
+            category = "engine",
+            type = "PERF_DB_STATS_ONLY",
+            message = "stats-only fetch ${elapsed}ms (rows=$rc dim=$dim vecExt=$vecExt)",
+            data = mapOf(
+                "elapsedMs" to elapsed,
+                "rowCount" to rc,
+                "dim" to dim,
+                "vecExtLoaded" to vecExt,
+            ),
+        )
+        runCatching { container.preferences.saveCachedEmbedStats(rc, dim, vecExt) }
+        kotlinx.coroutines.withContext(Dispatchers.Main) {
+            onResult(rc, dim, vecExt)
+        }
     }
 }
 
@@ -3418,7 +3538,7 @@ private fun fallbackShuffleQueue(library: List<Song>, current: Song, k: Int): Li
 }
 
 @Composable
-private fun PermissionGateUi(onRequest: () -> Unit) {
+private fun PermissionGateUi(onRequest: () -> Unit, onOpenSettings: () -> Unit) {
     Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
@@ -3432,6 +3552,10 @@ private fun PermissionGateUi(onRequest: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(20.dp))
             Button(onClick = onRequest) { Text("Grant access") }
+            Spacer(Modifier.height(8.dp))
+            androidx.compose.material3.TextButton(onClick = onOpenSettings) {
+                Text("Open app settings")
+            }
         }
     }
 }

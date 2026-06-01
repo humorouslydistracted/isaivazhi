@@ -132,9 +132,9 @@ fun SongMenuSheet(
             Spacer(Modifier.height(8.dp))
 
             MenuItem(icon = Icons.Filled.PlayArrow, label = "Play only (keep queue)",
-                onClick = { onPlayOnly(); onDismiss() })
+                onClick = { onDismiss(); onPlayOnly() })
             MenuItem(icon = Icons.Filled.SkipNext, label = "Play Next",
-                onClick = { onPlayNext(); onDismiss() })
+                onClick = { onDismiss(); onPlayNext() })
             // Push #42 Tier 2I: "Play in order" — Songs tab tap defaults to
             // recommendation mode (50-song AI tail). This entry lets the
             // user opt into linear playback from the tapped position.

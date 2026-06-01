@@ -813,6 +813,22 @@ public final class EmbeddingDbManager {
     }
 
     /**
+     * Bugfix 2026-06-01k: bulk-load every embedding row into the supplied
+     * heap maps via a single Cursor on the worker thread. See
+     * EmbeddingDb.loadAllVecsIntoHeap. Callback returns rows loaded.
+     */
+    public void loadAllVecsIntoHeap(
+            java.util.Map<String, float[]> vecOut,
+            java.util.Map<String, String> hashToFilenameOut,
+            java.util.Map<String, String> hashToFilepathOut,
+            java.util.Map<String, String> filenameToHashOut,
+            Callback<Integer> cb
+    ) {
+        run(() -> db.loadAllVecsIntoHeap(vecOut, hashToFilenameOut,
+                hashToFilepathOut, filenameToHashOut), cb);
+    }
+
+    /**
      * Batch fetch of vec bytes by content hash. Returns a JSONObject of
      * {hash: base64-encoded little-endian Float32 bytes}. The Kotlin
      * recommender decodes these for MMR redundancy scoring.
@@ -885,10 +901,17 @@ public final class EmbeddingDbManager {
             File tmp = new File(dir, LEGACY_JSON + ".tmp");
             File dst = new File(dir, LEGACY_JSON);
             FileOutputStream fos = new FileOutputStream(tmp);
-            fos.write(root.toString().getBytes(StandardCharsets.UTF_8));
-            fos.close();
+            try {
+                fos.write(root.toString().getBytes(StandardCharsets.UTF_8));
+                fos.flush();
+                fos.getFD().sync();
+            } finally {
+                fos.close();
+            }
             if (dst.exists()) dst.delete();
-            tmp.renameTo(dst);
+            if (!tmp.renameTo(dst)) {
+                throw new IOException("rename failed for legacy JSON export");
+            }
 
             JSONObject out = new JSONObject();
             out.put("rowCount", rows.size());
@@ -904,6 +927,211 @@ public final class EmbeddingDbManager {
             out.put((double) bb.getFloat());
         }
         return out;
+    }
+
+    /**
+     * Re-ingest local_embeddings.json even when SQLite already has rows.
+     * Used after the user picks a backup file — migrateFromLegacyIfNeeded
+     * would otherwise no-op with reason db_already_populated.
+     */
+    public void forceReimportLegacyJson(Callback<JSONObject> cb) {
+        run(() -> {
+            JSONObject result = new JSONObject();
+            File jsonFile = new File(getDataDir(), LEGACY_JSON);
+            if (!jsonFile.exists()) {
+                result.put("reimported", false);
+                result.put("reason", "no_json_file");
+                result.put("rowCount", db.count());
+                return result;
+            }
+            int inserted = ingestLegacyJson(jsonFile);
+            result.put("reimported", true);
+            result.put("source", "legacy_json");
+            result.put("rowCount", inserted);
+            return result;
+        }, cb);
+    }
+
+    /**
+     * Map every current library filepath to an existing embedding row by
+     * matching basename / filename / artist+album. Fixes imported backups
+     * whose stored paths differ from this install's MediaStore paths.
+     *
+     * Input: JSONArray of { filepath, filename, artist, album }.
+     */
+    public void relinkLibraryPaths(JSONArray librarySongs, Callback<JSONObject> cb) {
+        run(() -> {
+            JSONObject result = new JSONObject();
+            if (librarySongs == null || librarySongs.length() == 0) {
+                result.put("relinked", 0);
+                result.put("alreadyLinked", 0);
+                result.put("unmatched", 0);
+                return result;
+            }
+
+            java.util.Set<String> embeddedPaths = db.getAllFilepaths();
+            List<EmbeddingEntity> allEmb = db.getAll();
+            List<EmbeddingPathIndexEntity> allPaths = db.getAllPaths();
+
+            java.util.Map<String, List<RelinkCandidate>> byKey = new java.util.HashMap<>();
+            java.util.Map<String, RelinkCandidate> byHash = new java.util.HashMap<>();
+
+            for (EmbeddingEntity e : allEmb) {
+                if (e.contentHash == null || e.contentHash.isEmpty()) continue;
+                RelinkCandidate c = new RelinkCandidate();
+                c.contentHash = e.contentHash;
+                c.filename = e.filename != null ? e.filename : "";
+                c.artist = e.artist != null ? e.artist : "";
+                c.album = e.album != null ? e.album : "";
+                byHash.put(c.contentHash, c);
+                addRelinkCandidate(byKey, baseName(e.filepath), c);
+                addRelinkCandidate(byKey, normName(e.filename), c);
+            }
+            for (EmbeddingPathIndexEntity p : allPaths) {
+                if (p.filepath == null || p.filepath.isEmpty()) continue;
+                if (p.contentHash == null || p.contentHash.isEmpty()) continue;
+                RelinkCandidate c = byHash.get(p.contentHash);
+                if (c == null) {
+                    c = new RelinkCandidate();
+                    c.contentHash = p.contentHash;
+                    byHash.put(c.contentHash, c);
+                }
+                addRelinkCandidate(byKey, baseName(p.filepath), c);
+            }
+
+            List<EmbeddingPathIndexEntity> toUpsert = new ArrayList<>();
+            int alreadyLinked = 0;
+            int relinked = 0;
+            int unmatched = 0;
+
+            for (int i = 0; i < librarySongs.length(); i++) {
+                JSONObject row = librarySongs.optJSONObject(i);
+                if (row == null) continue;
+                String fp = row.optString("filepath", "");
+                if (fp.isEmpty()) continue;
+                if (embeddedPaths.contains(fp)) {
+                    alreadyLinked++;
+                    continue;
+                }
+
+                String artist = row.optString("artist", "");
+                String album = row.optString("album", "");
+                String filename = row.optString("filename", "");
+
+                List<RelinkCandidate> cands = byKey.get(baseName(fp));
+                if (cands == null || cands.isEmpty()) {
+                    cands = byKey.get(normName(filename));
+                }
+                if (cands == null || cands.isEmpty()) {
+                    unmatched++;
+                    continue;
+                }
+
+                RelinkCandidate best = pickRelinkCandidate(cands, artist, album, filename);
+                if (best == null) {
+                    unmatched++;
+                    continue;
+                }
+
+                EmbeddingPathIndexEntity p = new EmbeddingPathIndexEntity();
+                p.filepath = fp;
+                p.contentHash = best.contentHash;
+                toUpsert.add(p);
+                embeddedPaths.add(fp);
+                relinked++;
+            }
+
+            int upserted = db.upsertPaths(toUpsert);
+            result.put("relinked", relinked);
+            result.put("upserted", upserted);
+            result.put("alreadyLinked", alreadyLinked);
+            result.put("unmatched", unmatched);
+            Log.i(TAG, "relinkLibraryPaths: relinked=" + relinked
+                    + " alreadyLinked=" + alreadyLinked + " unmatched=" + unmatched);
+            return result;
+        }, cb);
+    }
+
+    /** filepath → content_hash for every indexed row (T_PATH + T_EMB.filepath). */
+    public void getPathIndexMap(Callback<JSONObject> cb) {
+        run(() -> {
+            JSONObject paths = new JSONObject();
+            for (EmbeddingPathIndexEntity p : db.getAllPaths()) {
+                if (p.filepath != null && !p.filepath.isEmpty()
+                        && p.contentHash != null && !p.contentHash.isEmpty()) {
+                    paths.put(p.filepath, p.contentHash);
+                }
+            }
+            for (EmbeddingEntity e : db.getAll()) {
+                if (e.filepath != null && !e.filepath.isEmpty()
+                        && e.contentHash != null && !e.contentHash.isEmpty()) {
+                    paths.put(e.filepath, e.contentHash);
+                }
+            }
+            JSONObject out = new JSONObject();
+            out.put("paths", paths);
+            return out;
+        }, cb);
+    }
+
+    private static final class RelinkCandidate {
+        String contentHash;
+        String filename;
+        String artist;
+        String album;
+    }
+
+    private static void addRelinkCandidate(
+            java.util.Map<String, List<RelinkCandidate>> map,
+            String key,
+            RelinkCandidate c
+    ) {
+        if (key == null || key.isEmpty() || c == null
+                || c.contentHash == null || c.contentHash.isEmpty()) return;
+        List<RelinkCandidate> list = map.get(key);
+        if (list == null) {
+            list = new ArrayList<>();
+            map.put(key, list);
+        }
+        for (RelinkCandidate existing : list) {
+            if (c.contentHash.equals(existing.contentHash)) return;
+        }
+        list.add(c);
+    }
+
+    private static RelinkCandidate pickRelinkCandidate(
+            List<RelinkCandidate> cands,
+            String artist,
+            String album,
+            String filename
+    ) {
+        if (cands == null || cands.isEmpty()) return null;
+        if (cands.size() == 1) return cands.get(0);
+        String na = normName(artist);
+        String nal = normName(album);
+        String nf = normName(filename);
+        RelinkCandidate best = null;
+        int bestScore = Integer.MIN_VALUE;
+        for (RelinkCandidate c : cands) {
+            int score = 0;
+            if (!na.isEmpty() && na.equals(normName(c.artist))) score += 3;
+            if (!nal.isEmpty() && nal.equals(normName(c.album))) score += 3;
+            if (!nf.isEmpty() && nf.equals(normName(c.filename))) score += 2;
+            if (score > bestScore) {
+                bestScore = score;
+                best = c;
+            }
+        }
+        return best != null ? best : cands.get(0);
+    }
+
+    private static String normName(String s) {
+        return s == null ? "" : s.trim().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static String baseName(String path) {
+        if (path == null || path.isEmpty()) return "";
+        return normName(new File(path).getName());
     }
 
     private static List<String> jsonArrayToStringList(JSONArray arr) {

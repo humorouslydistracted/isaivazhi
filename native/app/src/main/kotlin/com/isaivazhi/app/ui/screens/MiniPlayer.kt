@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
@@ -25,6 +26,7 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbDownAlt
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -49,7 +51,7 @@ import com.isaivazhi.app.engine.PlaybackEngine
  *
  *   Row 1: art | title + artist + mode chip | favorite
  *   Row 2: draggable progress Slider
- *   Row 3: loop / prev / play-pause / neutral-skip / shuffle / dislike
+ *   Row 3: loop / shuffle / prev / play-pause / next / refresh / dislike
  *
  * Tapping anywhere on Row 1 (outside the buttons) expands to NowPlayingScreen.
  */
@@ -62,6 +64,8 @@ fun MiniPlayer(
     isFavorite: Boolean,
     isDisliked: Boolean,
     aiMode: Boolean,
+    /** Library has at least one embedding row — when false, mode chip shows Shuffle. */
+    hasEmbeddingsInLibrary: Boolean,
     hasEmbedding: Boolean,
     onToggleFavorite: () -> Unit,
     onToggleDislike: () -> Unit,
@@ -72,6 +76,14 @@ fun MiniPlayer(
     onCycleRepeat: () -> Unit,
     onToggleShuffle: () -> Unit,
     onSeek: (Long) -> Unit,
+    // Phase E (2026-06-01): Refresh-Up-Next button. Replaces the lockscreen-
+    // /mini-player-only "Up Next refresh" feature that previously lived only
+    // on the UpNext tab. When null OR refreshEnabled=false the icon is
+    // hidden — callers pass null on contexts where AI refresh wouldn't make
+    // sense (e.g. ALBUM / BROWSE_SECTION queues).
+    onRefresh: (() -> Unit)? = null,
+    refreshEnabled: Boolean = false,
+    refreshInProgress: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     if (state.currentMediaId == null) return
@@ -124,10 +136,12 @@ fun MiniPlayer(
                     )
                 }
             }
-            // Only show the AI / Shuffle mode chip when the current song
-            // has an embedding — songs without one already display a red
-            // dot before the title, so the AI chip would be misleading.
-            if (hasEmbedding) ModeChip(aiMode = aiMode)
+            // Up Next mode: Shuffle when the library has no embeddings; otherwise
+            // show AI/Shuffle for the current song only when it is embedded.
+            when {
+                !hasEmbeddingsInLibrary -> ModeChip(aiMode = false)
+                hasEmbedding -> ModeChip(aiMode = aiMode)
+            }
             IconButton(onClick = onToggleFavorite) {
                 Icon(
                     imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
@@ -169,7 +183,17 @@ fun MiniPlayer(
                     modifier = Modifier.size(22.dp),
                 )
             }
-            // Prev
+            // Shuffle (queue order)
+            IconButton(onClick = onToggleShuffle) {
+                Icon(
+                    imageVector = Icons.Filled.Shuffle,
+                    contentDescription = "Shuffle",
+                    tint = if (state.shuffleEnabled) MaterialTheme.colorScheme.primary
+                           else MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+            // Previous
             IconButton(onClick = onSkipPrev) {
                 Icon(
                     imageVector = Icons.Filled.SkipPrevious,
@@ -178,7 +202,7 @@ fun MiniPlayer(
                     modifier = Modifier.size(26.dp),
                 )
             }
-            // Play/Pause (primary, larger)
+            // Play/Pause (primary, larger — center slot)
             IconButton(onClick = onTogglePause) {
                 Icon(
                     imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
@@ -196,15 +220,29 @@ fun MiniPlayer(
                     modifier = Modifier.size(26.dp),
                 )
             }
-            // Shuffle
-            IconButton(onClick = onToggleShuffle) {
-                Icon(
-                    imageVector = Icons.Filled.Shuffle,
-                    contentDescription = "Shuffle",
-                    tint = if (state.shuffleEnabled) MaterialTheme.colorScheme.primary
-                           else MaterialTheme.colorScheme.onBackground,
-                    modifier = Modifier.size(22.dp),
-                )
+            // Refresh Up Next (AI) — only when caller supplied a handler.
+            // Greyed when no current song / no embeddings.
+            if (onRefresh != null) {
+                IconButton(
+                    onClick = onRefresh,
+                    enabled = refreshEnabled && !refreshInProgress,
+                ) {
+                    if (refreshInProgress) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Filled.Refresh,
+                            contentDescription = "Refresh Up Next",
+                            tint = if (refreshEnabled) MaterialTheme.colorScheme.primary
+                                   else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                }
             }
             // Dislike (thumbs down) — skips with penalty
             IconButton(onClick = onToggleDislike) {

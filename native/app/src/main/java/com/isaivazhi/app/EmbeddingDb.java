@@ -466,6 +466,55 @@ final class EmbeddingDb {
         return out;
     }
 
+    /**
+     * Bugfix 2026-06-01k: bulk-load every embedding row directly into JVM
+     * heap maps via a single Cursor. Bypasses the JSON/base64 path used by
+     * getVecsByHashes AND bypasses Song.contentHash (which is null in the
+     * Song objects returned by LibraryCache.loadOrScan on cold start - the
+     * 06-01j log showed VEC_HEAP_WARMED size=0 in 0ms because
+     * prewarmFromLibrary skipped every song). Decodes vec bytes straight
+     * into float[] in one pass.
+     */
+    int loadAllVecsIntoHeap(
+            java.util.Map<String, float[]> vecOut,
+            java.util.Map<String, String> hashToFilenameOut,
+            java.util.Map<String, String> hashToFilepathOut,
+            java.util.Map<String, String> filenameToHashOut
+    ) {
+        SQLiteDatabase db = getReadableDatabase();
+        int count = 0;
+        Cursor c = db.query(T_EMB,
+                new String[]{"content_hash","filename","filepath","vec","dim"},
+                null, null, null, null, null);
+        try {
+            while (c.moveToNext()) {
+                String hash = c.getString(0);
+                if (hash == null || hash.isEmpty()) continue;
+                String filename = c.getString(1);
+                String filepath = c.getString(2);
+                byte[] vecBytes = c.getBlob(3);
+                int dim = c.getInt(4);
+                if (vecBytes == null || dim <= 0 || vecBytes.length != dim * 4) continue;
+                float[] vec = new float[dim];
+                java.nio.ByteBuffer.wrap(vecBytes)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        .asFloatBuffer()
+                        .get(vec);
+                vecOut.put(hash, vec);
+                hashToFilepathOut.put(hash, filepath != null ? filepath
+                        : (filename != null ? filename : ""));
+                if (filename != null) {
+                    hashToFilenameOut.put(hash, filename);
+                    if (!filename.isEmpty()) filenameToHashOut.put(filename, hash);
+                }
+                count++;
+            }
+        } finally {
+            c.close();
+        }
+        return count;
+    }
+
     int count() {
         SQLiteDatabase db = getReadableDatabase();
         Cursor c = db.rawQuery("SELECT COUNT(*) FROM " + T_EMB, null);

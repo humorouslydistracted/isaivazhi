@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.ui.songHasEmbedding
 
 @Composable
 fun AlbumsScreen(
@@ -41,6 +42,7 @@ fun AlbumsScreen(
     // Push #59: filepath-based red-dot lookup (was filename, which
     // misclassified songs with DISPLAY_NAME drift).
     embeddedFilepaths: Set<String> = emptySet(),
+    embeddingsRowCount: Int? = null,
     initialExpandedAlbum: String? = null,
     onPlayAlbum: (albumTracks: List<Song>, startIndex: Int) -> Unit,
     onSongLongPress: (Song) -> Unit = {},
@@ -89,7 +91,11 @@ fun AlbumsScreen(
                         index = i + 1,
                         track = t,
                         isCurrent = t.filename == currentMediaId,
-                        hasEmbedding = embeddedFilepaths.isEmpty() || t.filePath in embeddedFilepaths,
+                        hasEmbedding = songHasEmbedding(
+                            filePath = t.filePath,
+                            embeddingsRowCount = embeddingsRowCount,
+                            embeddedFilepaths = embeddedFilepaths,
+                        ),
                         onTap = { onPlayAlbum(album.tracks, i) },
                         onLongPress = { onSongLongPress(t) },
                     )

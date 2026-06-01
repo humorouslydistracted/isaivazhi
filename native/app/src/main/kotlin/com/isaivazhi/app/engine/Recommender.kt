@@ -44,35 +44,8 @@ class Recommender(
         hasSession: Boolean,
         hasProfile: Boolean,
     ): BlendWeights {
-        if (mode == "refresh") {
-            if (hasSession && hasProfile && hasCurrent) return BlendWeights(0.30f, 0.40f, 0.30f)
-            if (hasSession && hasProfile) return BlendWeights(0f, 0.60f, 0.40f)
-            if (hasSession && hasCurrent) return BlendWeights(0.30f, 0.70f, 0f)
-            if (hasSession) return BlendWeights(0f, 1.0f, 0f)
-            if (hasProfile && hasCurrent) return BlendWeights(0.40f, 0f, 0.60f)
-            if (hasProfile) return BlendWeights(0f, 0f, 1.0f)
-            return BlendWeights(1.0f, 0f, 0f)
-        }
-        // mode == "play" (default): current-song-heavy, ramps to blend.
-        if (!hasCurrent) return BlendWeights(0f, if (hasSession) 0.6f else 0f, if (hasProfile) (if (hasSession) 0.4f else 1f) else 0f)
-        if (!hasSession && !hasProfile) return BlendWeights(1.0f, 0f, 0f)
-        if (!hasSession) {
-            val t = (nListened.toFloat() / 8f).coerceAtMost(1f)
-            val wCurrent = 0.5f + 0.1f * t
-            return BlendWeights(wCurrent, 0f, 1f - wCurrent)
-        }
-        if (!hasProfile) {
-            val t = (nListened.toFloat() / 10f).coerceAtMost(1f)
-            val wCurrent = 0.6f - 0.2f * t
-            return BlendWeights(wCurrent, 1f - wCurrent, 0f)
-        }
-        val t = (nListened.toFloat() / 10f).coerceAtMost(1f)
-        var wCurrent = 0.50f - 0.12f * t
-        var wSession = 0.52f * t
-        var wProfile = 1f - wCurrent - wSession
-        if (wProfile < 0.08f) wProfile = 0.08f
-        val total = wCurrent + wSession + wProfile
-        return BlendWeights(wCurrent / total, wSession / total, wProfile / total)
+        val w = BlendWeightLogic.compute(mode, nListened, hasCurrent, hasSession, hasProfile)
+        return BlendWeights(w.wCurrent, w.wSession, w.wProfile)
     }
 
     /**
@@ -211,6 +184,10 @@ class Recommender(
         // Capacitor engine-taste.js:751 — the recommendation policy
         // pass that prunes hard-blocked rows before MMR.
         hardBlockedFilenames: Set<String> = emptySet(),
+        /** Thumbs-down list — always excluded from Up Next (not scaled by Negative guard). */
+        dislikedFilenames: Set<String> = emptySet(),
+        /** Mild negatives excluded when Negative guard slider is raised. */
+        softExcludedFilenames: Set<String> = emptySet(),
         // Push #67: blended query vector for current+session+profile.
         // When non-null, candidates are ranked against this vec instead
         // of the current song's neighbors. Caller is responsible for
@@ -218,6 +195,9 @@ class Recommender(
         blendedQueryVec: FloatArray? = null,
     ): List<Song> {
         val lambda = (1f - adventurous).coerceIn(0f, 1f)
+        val policyExcludes = RecommendationPolicy.unionExcludes(
+            hardBlockedFilenames, softExcludedFilenames, dislikedFilenames,
+        )
         val excludeHashes = buildList {
             currentSong.contentHash?.takeIf { it.isNotBlank() }?.let { add(it) }
         }
@@ -231,7 +211,7 @@ class Recommender(
                 queryVec = blendedQueryVec,
                 library = library,
                 k = overFetch,
-                excludeFilenames = extraExcludeFilenames + hardBlockedFilenames + currentSong.filename,
+                excludeFilenames = extraExcludeFilenames + policyExcludes + currentSong.filename,
             )
             // Adapt to NnResult shape so the rest of the pipeline is shared.
             scored.map { ss ->
@@ -260,7 +240,7 @@ class Recommender(
 
         val viable = candidates.mapNotNull { row ->
             if (row.filename in extraExcludeFilenames) return@mapNotNull null
-            if (row.filename in hardBlockedFilenames) return@mapNotNull null
+            if (row.filename in policyExcludes) return@mapNotNull null
             val song = byFilename[row.filename]
                 ?: row.contentHash.takeIf { it.isNotBlank() }?.let { byHash[it] }
                 ?: return@mapNotNull null
@@ -423,6 +403,8 @@ class Recommender(
         adventurous: Float = 0.8f,
         extraExcludeFilenames: Set<String> = emptySet(),
         hardBlockedFilenames: Set<String> = emptySet(),
+        dislikedFilenames: Set<String> = emptySet(),
+        softExcludedFilenames: Set<String> = emptySet(),
         frozenZoneSize: Int = 5,
         stableZoneEnd: Int = 15,
     ): List<Song> {
@@ -439,6 +421,9 @@ class Recommender(
         val stableHashes = stableSrc.mapNotNull { it.contentHash }
         val stableVecs = if (stableHashes.isNotEmpty()) embeddingDb.getVecsByHashes(stableHashes) else emptyMap()
         val dim = blendedQueryVec.size
+        val policyExcludes = RecommendationPolicy.unionExcludes(
+            hardBlockedFilenames, softExcludedFilenames, dislikedFilenames,
+        )
         val stableSorted: List<Song> = if (stableVecs.isEmpty()) stableSrc else {
             stableSrc.map { song ->
                 val v = song.contentHash?.let { stableVecs[it] }
@@ -451,14 +436,15 @@ class Recommender(
                 song to sim
             }.sortedByDescending { it.second }.map { it.first }
         }
+        val stableFiltered = RecommendationPolicy.filterSongsForUpNext(stableSorted, policyExcludes)
 
         // Rebuild fluid zone with fresh recommendations against the
         // blended vector, excluding frozen+stable+current.
-        val excludeFns = (frozenZone + stableSorted).map { it.filename }.toMutableSet().also {
+        val excludeFns = (frozenZone + stableFiltered).map { it.filename }.toMutableSet().also {
             it += currentSong.filename
             it += extraExcludeFilenames
         }
-        val fluidTarget = (upcoming.size - frozenZone.size - stableSorted.size).coerceAtLeast(20)
+        val fluidTarget = (upcoming.size - frozenZone.size - stableFiltered.size).coerceAtLeast(20)
         val fluidNew = runCatching {
             recommendUpcoming(
                 currentSong = currentSong,
@@ -467,10 +453,12 @@ class Recommender(
                 adventurous = adventurous,
                 extraExcludeFilenames = excludeFns,
                 hardBlockedFilenames = hardBlockedFilenames,
+                dislikedFilenames = dislikedFilenames,
+                softExcludedFilenames = softExcludedFilenames,
                 blendedQueryVec = blendedQueryVec,
             )
         }.getOrDefault(fluidSrc)
-        return frozenZone + stableSorted + fluidNew
+        return frozenZone + stableFiltered + fluidNew
     }
 
     suspend fun softRefreshTail(
@@ -534,6 +522,8 @@ class Recommender(
         // Push #63: forwarded into recommendUpcoming.
         extraExcludeFilenames: Set<String> = emptySet(),
         hardBlockedFilenames: Set<String> = emptySet(),
+        dislikedFilenames: Set<String> = emptySet(),
+        softExcludedFilenames: Set<String> = emptySet(),
         // Push #72: optional blended query vector. When non-null, the
         // recommender ranks against the blend (current + session + profile)
         // instead of only the current song's neighbors.
@@ -543,6 +533,8 @@ class Recommender(
             currentSong, library, k, adventurous,
             extraExcludeFilenames = extraExcludeFilenames,
             hardBlockedFilenames = hardBlockedFilenames,
+            dislikedFilenames = dislikedFilenames,
+            softExcludedFilenames = softExcludedFilenames,
             blendedQueryVec = blendedQueryVec,
         )
         val head = listOf(currentSong)
@@ -663,7 +655,7 @@ class Recommender(
             }
             i++
         }
-        return applyNegativeStrengthFilter(out, dislikedFilenames, tuning.negativeStrength)
+        return applyDislikedFilter(out, dislikedFilenames)
     }
 
     /**
@@ -731,7 +723,7 @@ class Recommender(
         return anchors.map { src ->
             val sims = recommendScored(src, library, k = kPerSource, adventurous = tuning.adventurous)
                 .filter { it.song.filename !in hardBlockedFilenames }
-            src to applyNegativeStrengthFilter(sims, dislikedFilenames, tuning.negativeStrength)
+            src to applyDislikedFilter(sims, dislikedFilenames)
         }
     }
 
@@ -806,17 +798,12 @@ class Recommender(
         return out
     }
 
-    /**
-     * Filter disliked filenames out of a result list. negativeStrength
-     * controls aggressiveness: <0.3 = no filter; 0.3–0.7 = soft (drop direct
-     * matches); >0.7 = hard (drop direct matches + already filtered upstream).
-     */
-    private fun applyNegativeStrengthFilter(
+    /** Always drop thumbs-down songs from legacy section/card lists. */
+    private fun applyDislikedFilter(
         list: List<ScoredSong>,
         dislikedFilenames: Set<String>,
-        negativeStrength: Float,
     ): List<ScoredSong> {
-        if (negativeStrength < 0.3f || dislikedFilenames.isEmpty()) return list
+        if (dislikedFilenames.isEmpty()) return list
         return list.filter { it.song.filename !in dislikedFilenames }
     }
 

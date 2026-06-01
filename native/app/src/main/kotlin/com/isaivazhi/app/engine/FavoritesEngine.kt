@@ -80,6 +80,14 @@ class FavoritesEngine(private val appContext: Context) {
         onChangeHook?.invoke(filename, true)
     }
 
+    /** Persist membership without firing [onChangeHook] — used during startup reconcile. */
+    fun addSilent(filename: String) {
+        if (_favorites.value.contains(filename)) return
+        val next = _favorites.value + filename
+        _favorites.value = next
+        scope.launch { persist(next) }
+    }
+
     fun remove(filename: String) {
         if (!_favorites.value.contains(filename)) return
         val next = _favorites.value - filename

@@ -11,7 +11,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Capture for the in-app Debug Logs screen. Two sources combined:
+ * Capture for the in-app Diagnostics screen (Crashes + Startup tabs). Two sources:
  *
  *   - **Crashes** — persisted file in app data dir, written by an uncaught
  *     exception handler installed at app start. Survives the process death
@@ -23,7 +23,7 @@ import java.util.Locale
  *     screen. App's own process logs are always readable; other processes
  *     return empty on most user-installed builds (no READ_LOGS permission).
  *
- * Both are shown via [DebugLogsScreen] and copyable to clipboard.
+ * Startup tab uses filtered logcat; Crashes uses the persisted file. Raw logcat is not shown in UI.
  */
 object DebugLogCapture {
 
@@ -111,7 +111,7 @@ object DebugLogCapture {
     suspend fun captureLogcat(): String = withContext(Dispatchers.IO) {
         try {
             val process = ProcessBuilder(
-                "logcat", "-d", "-v", "threadtime", "-t", "1500"
+                "logcat", "-d", "-v", "threadtime", "-t", "3000"
             ).redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().use { it.readText() }
             process.waitFor()
@@ -119,6 +119,35 @@ object DebugLogCapture {
             else output.lines().asReversed().joinToString("\n")
         } catch (t: Throwable) {
             "logcat capture failed: ${t.message}"
+        }
+    }
+
+    suspend fun captureStartupDiagnostics(): String = withContext(Dispatchers.IO) {
+        val raw = captureLogcat()
+        if (raw.startsWith("logcat ")) return@withContext raw
+        val needles = listOf(
+            "StartupTrace",
+            "ActivityLog",
+            "LIBRARY_LOAD_",
+            "PERF_DB_",
+            "DISCOVER_CACHE_LOAD",
+            "DISCOVER_HYDRATE_",
+            "DISCOVER_FORYOU_",
+            "DISCOVER_UNEXP_",
+            "ACTIVITY_PROCESS_COLD",
+            "ACTIVITY_RECREATED",
+            "LibraryCache",
+            "PlaybackEngine",
+            "DiscoverLE",
+        )
+        val filtered = raw.lines()
+            .filter { line -> needles.any { needle -> line.contains(needle) } }
+            .joinToString("\n")
+        if (filtered.isBlank()) {
+            "No startup diagnostics found in current logcat buffer.\n\n" +
+                "Steps: open Diagnostics, Startup tab, tap Clear buffer, reproduce slow start, reopen Startup, tap Copy."
+        } else {
+            filtered
         }
     }
 }

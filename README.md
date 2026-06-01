@@ -206,6 +206,10 @@ Active personal/open-source project. The repository contains the full native
 Kotlin/Compose Android app.
 
 Recent changes:
+- **v2026.6.2** — Recommendation policy: configurable negative guard
+  (`negativeStrength`), hard-block top 18% of strong negatives, soft down-rank
+  for Up Next. `RecommendationPolicy` and `BlendWeightLogic` extracted for
+  unit tests; taste/recommender wiring in Now Playing, Refresh, and Up Next.
 - **06-01k** — Fixed zero-vector warm bug: `fullWarmFromDb` replaces the old
   chunk-based JSON path; single Cursor decode eliminates 27–32s background
   stalls. Background precomputes now consistently 150–600ms.

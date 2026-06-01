@@ -49,3 +49,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Secrets — never commit
+PAT
+native/PAT

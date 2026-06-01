@@ -26,6 +26,16 @@ public final class PlaybackCommandContract {
     static final String CMD_STOP_SERVICE = "isaivazhi.playback.STOP_SERVICE";
     static final String CMD_NOTIFICATION_TOGGLE_FAVORITE = "isaivazhi.playback.NOTIFICATION_TOGGLE_FAVORITE";
     static final String CMD_NOTIFICATION_DISMISS = "isaivazhi.playback.NOTIFICATION_DISMISS";
+    // 2026-06-01: lockscreen Refresh Up Next. The service receives this from
+    // the lockscreen / notification CommandButton, then forwards it to
+    // connected controllers (UI process) via EVT_MEDIA_ACTION action=
+    // "refresh_queue" so the recommender can rebuild the upcoming tail.
+    static final String CMD_NOTIFICATION_REFRESH_QUEUE = "isaivazhi.playback.NOTIFICATION_REFRESH_QUEUE";
+    // Phase 3 (2026-06-01): UI → service notification of refresh in-flight
+    // state. Service stores the flag and rebuilds the notification with the
+    // Refresh CommandButton's displayName/enabled state updated so the
+    // lockscreen reflects the spinner shown in MiniPlayer / NowPlaying.
+    public static final String CMD_NOTIFICATION_SET_REFRESH_BUSY = "isaivazhi.playback.NOTIFICATION_SET_REFRESH_BUSY";
 
     static final String EVT_TRANSPORT_READY = "isaivazhi.playback.event.TRANSPORT_READY";
     static final String EVT_AUDIO_TIME_UPDATE = "isaivazhi.playback.event.AUDIO_TIME_UPDATE";
@@ -61,6 +71,7 @@ public final class PlaybackCommandContract {
     static final String KEY_PREV_FRACTION = "prevFraction";
     static final String KEY_ERROR = "error";
     static final String KEY_PATH = "path";
+    public static final String KEY_BUSY = "busy";
 
     static SessionCommand command(String action) {
         return new SessionCommand(action, Bundle.EMPTY);
@@ -85,6 +96,8 @@ public final class PlaybackCommandContract {
                 .add(command(CMD_STOP_SERVICE))
                 .add(command(CMD_NOTIFICATION_TOGGLE_FAVORITE))
                 .add(command(CMD_NOTIFICATION_DISMISS))
+                .add(command(CMD_NOTIFICATION_REFRESH_QUEUE))
+                .add(command(CMD_NOTIFICATION_SET_REFRESH_BUSY))
                 .build();
     }
 }

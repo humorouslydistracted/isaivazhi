@@ -3,6 +3,7 @@ package com.isaivazhi.app.engine
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -10,6 +11,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /**
@@ -26,6 +28,7 @@ class DislikedEngine(private val appContext: Context) {
     val disliked: StateFlow<Set<String>> = _disliked.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
 
     /**
      * Hook invoked after any membership change (toggle/add/remove/clear).
@@ -38,12 +41,20 @@ class DislikedEngine(private val appContext: Context) {
     init {
         scope.launch {
             try {
-                val initial = appContext.dataStoreLocal.data.first()
-                _disliked.value = initial[KEY]?.split('\n')?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+                val initial = appContext.dataStoreLocal.data
+                    .map { it[KEY]?.split('\n')?.filter { fn -> fn.isNotBlank() }?.toSet() ?: emptySet() }
+                    .first()
+                _disliked.value = initial
             } catch (t: Throwable) {
                 android.util.Log.w("DislikedEngine", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun isDisliked(filename: String): Boolean = _disliked.value.contains(filename)
@@ -65,11 +76,32 @@ class DislikedEngine(private val appContext: Context) {
         onChangeHook?.invoke(filename, true)
     }
 
+    /** Persist membership without firing [onChangeHook] — used during startup reconcile. */
+    fun addSilent(filename: String) {
+        if (_disliked.value.contains(filename)) return
+        _disliked.value = _disliked.value + filename
+        scope.launch { persist(_disliked.value) }
+    }
+
     fun remove(filename: String) {
         if (!_disliked.value.contains(filename)) return
         _disliked.value = _disliked.value - filename
         scope.launch { persist(_disliked.value) }
         onChangeHook?.invoke(filename, false)
+    }
+
+    fun replaceAllFromExternal(next: Set<String>) {
+        val sanitized = next.filter { it.isNotBlank() }.toSet()
+        val cur = _disliked.value
+        if (cur == sanitized) return
+        _disliked.value = sanitized
+        scope.launch { persist(sanitized) }
+        val changed = cur union sanitized
+        for (filename in changed) {
+            val before = filename in cur
+            val after = filename in sanitized
+            if (before != after) onChangeHook?.invoke(filename, after)
+        }
     }
 
     fun clear() {

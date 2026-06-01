@@ -3,11 +3,11 @@ package com.isaivazhi.app.ui.screens
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -32,6 +32,8 @@ import androidx.compose.ui.unit.dp
 fun OnboardingScreen(
     songCount: Int,
     estimatedEmbedTimeSec: Long?,
+    importInProgress: Boolean = false,
+    importStatus: String? = null,
     onImportEmbeddings: () -> Unit,
     onEmbedInBackground: () -> Unit,
     onContinueWithoutEmbeddings: () -> Unit,
@@ -64,7 +66,19 @@ fun OnboardingScreen(
             )
 
             Spacer(Modifier.height(24.dp))
-            Button(onClick = onImportEmbeddings, modifier = Modifier.fillMaxWidth()) {
+            EmbeddingsImportStatusRow(
+                inProgress = importInProgress,
+                statusMessage = importStatus,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            )
+            if (importInProgress || !importStatus.isNullOrBlank()) {
+                Spacer(Modifier.height(16.dp))
+            }
+            Button(
+                onClick = onImportEmbeddings,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !importInProgress,
+            ) {
                 Text("Import local_embeddings.json")
             }
             Spacer(Modifier.height(6.dp))
@@ -75,7 +89,11 @@ fun OnboardingScreen(
             )
 
             Spacer(Modifier.height(20.dp))
-            OutlinedButton(onClick = onEmbedInBackground, modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = onEmbedInBackground,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !importInProgress,
+            ) {
                 Text("Embed in background")
             }
             Spacer(Modifier.height(6.dp))
@@ -93,7 +111,11 @@ fun OnboardingScreen(
             )
 
             Spacer(Modifier.height(20.dp))
-            TextButton(onClick = onContinueWithoutEmbeddings, modifier = Modifier.fillMaxWidth()) {
+            TextButton(
+                onClick = onContinueWithoutEmbeddings,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !importInProgress,
+            ) {
                 Text("Skip for now — shuffle only")
             }
         }

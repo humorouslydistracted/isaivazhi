@@ -21,6 +21,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -154,6 +155,45 @@ class PlaybackEngine(
     val livePosition: StateFlow<Long> = _livePosition.asStateFlow()
     private val _liveDuration = MutableStateFlow(0L)
     val liveDuration: StateFlow<Long> = _liveDuration.asStateFlow()
+
+    // 2026-06-01: emits when the lockscreen / notification Refresh-Up-Next
+    // button is tapped. The UI process collects this and invokes the same
+    // refreshUpcomingWithAI() lambda used by the in-app icons. Service-side
+    // we forward the tap as EVT_MEDIA_ACTION action="refresh_queue" (see
+    // controllerListener.onCustomCommand below).
+    private val _refreshRequests = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1,
+    )
+    val refreshRequests: kotlinx.coroutines.flow.SharedFlow<Unit> =
+        _refreshRequests.asSharedFlow()
+
+    // Phase 2 (2026-06-01): broadcast when refreshUpcomingWithAI() is in
+    // flight. UI swaps the Refresh icon for a CircularProgressIndicator;
+    // Media3PlaybackService rebuilds the notification CommandButton with
+    // displayName "Refreshing…" + enabled=false (Phase 3) so the
+    // lockscreen reflects the busy state. Single-writer (MainActivity);
+    // safe to expose mutator publicly because no concurrent producer.
+    private val _refreshBusy = MutableStateFlow(false)
+    val refreshBusy: StateFlow<Boolean> = _refreshBusy.asStateFlow()
+    fun setRefreshBusy(busy: Boolean) {
+        _refreshBusy.value = busy
+        // Phase 3 (2026-06-01): mirror the flag to the playback service so
+        // the lockscreen Refresh CommandButton flips to "Refreshing…" +
+        // disabled while a refresh is in flight. Fire-and-forget — if the
+        // controller isn't connected yet the next buildNotificationButtons()
+        // will pick the default (busy=false) anyway.
+        val ctrl = controller ?: return
+        val args = android.os.Bundle().apply {
+            putBoolean(com.isaivazhi.app.PlaybackCommandContract.KEY_BUSY, busy)
+        }
+        runCatching {
+            sendPlaybackCommand(
+                ctrl,
+                com.isaivazhi.app.PlaybackCommandContract.CMD_NOTIFICATION_SET_REFRESH_BUSY,
+                args,
+            )
+        }
+    }
 
     /**
      * Push #39: the played-ms accumulator now lives inside
@@ -479,6 +519,18 @@ class PlaybackEngine(
                             data = mapOf("filename" to filename),
                         )
                     }
+                    "refresh_queue" -> {
+                        // 2026-06-01: bridge service → UI for the lockscreen
+                        // Refresh button. tryEmit is non-blocking and OK to
+                        // drop overlapping taps (extraBufferCapacity=1).
+                        _refreshRequests.tryEmit(Unit)
+                        activityLog?.log(
+                            category = "notification",
+                            type = "REFRESH_QUEUE",
+                            message = "Lockscreen Refresh Up Next tapped",
+                            data = mapOf("filename" to filename),
+                        )
+                    }
                 }
             }
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -617,10 +669,20 @@ class PlaybackEngine(
         } else {
             val playNextFns = playNextSongs.map { it.filename }.toHashSet()
             val withoutPlayNext = playable.filterNot { it.filename in playNextFns }
-            val safeStart2 = startIndex.coerceIn(0, withoutPlayNext.size - 1)
-            val before = withoutPlayNext.subList(0, safeStart2 + 1)
-            val after = withoutPlayNext.subList(safeStart2 + 1, withoutPlayNext.size)
-            before + playNextSongs + after
+            if (withoutPlayNext.isEmpty()) {
+                // All incoming songs are Play Next markers (e.g. tap same
+                // similar song after Play Next). coerceIn(0, -1) would crash.
+                android.util.Log.i(
+                    "QueueOp",
+                    "playQueue: all playable songs are Play Next markers; using playable as-is"
+                )
+                playable
+            } else {
+                val safeStart2 = startIndex.coerceIn(0, withoutPlayNext.size - 1)
+                val before = withoutPlayNext.subList(0, safeStart2 + 1)
+                val after = withoutPlayNext.subList(safeStart2 + 1, withoutPlayNext.size)
+                before + playNextSongs + after
+            }
         }
         val finalSafeStart = if (playNextSongs.isEmpty()) safeStart
         else rebuilt.indexOfFirst { it.filename == playable[safeStart].filename }.coerceAtLeast(0)
@@ -660,8 +722,18 @@ class PlaybackEngine(
         }
     }
 
+    /** Clears a Play Next marker so an explicit tap can rebuild the queue safely. */
+    fun clearPlayNextMarker(filename: String) {
+        val cur = _state.value
+        if (filename !in cur.playNextFilenames) return
+        _state.value = cur.copy(playNextFilenames = cur.playNextFilenames - filename)
+    }
+
     /** Plays a single song. Convenience wrapper that builds a 1-item queue. */
-    fun play(song: Song) = playQueue(listOf(song), 0)
+    fun play(song: Song) {
+        clearPlayNextMarker(song.filename)
+        playQueue(listOf(song), 0)
+    }
 
     /**
      * Cold-start path: prepares a queue without auto-playing. The next user
@@ -949,6 +1021,24 @@ class PlaybackEngine(
         }
     }
 
+    /**
+     * Phase D (2026-06-01): explicitly set repeat mode. Used by
+     * playFromTap / playFromSection to silently force LOOP=OFF whenever
+     * the user starts an AI-eligible queue, so the queue-exhaust LE can
+     * append fresh recommendations. Without this, a user who previously
+     * set LOOP=ALL would forever loop the same ~10 songs.
+     * Silent (no toast): user did not explicitly toggle.
+     */
+    fun setRepeatMode(mode: Int) {
+        if (_state.value.repeatMode == mode) return
+        _state.value = _state.value.copy(repeatMode = mode)
+        android.util.Log.i("QueueOp", "setRepeatMode → $mode (silent)")
+        scope.launch {
+            val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            sendPlaybackCommand(ctrl, CMD_SET_LOOP_MODE, Bundle().apply { putInt(KEY_LOOP_MODE, mode) })
+        }
+    }
+
     /** Cycle repeat mode: OFF → ALL → ONE → OFF. */
     fun cycleRepeat() {
         val cur = _state.value.repeatMode
@@ -976,6 +1066,32 @@ class PlaybackEngine(
      */
     fun preWarm() {
         scope.launch { runCatching { ensureController() } }
+        // Phase C (2026-06-01) optimistic MiniPlayer: read last persisted
+        // song metadata BEFORE the controller round-trip completes, so the
+        // MiniPlayer renders with title/artist/album within ~500ms of
+        // launch instead of waiting ~1.9s for prepareForResume to populate
+        // the Song lookup. Only writes when current state is still empty
+        // (so we never clobber a real transition that beat us to it).
+        scope.launch(Dispatchers.IO) {
+            try {
+                val snap = preferences.snapshot()
+                val mediaId = snap.mediaId ?: return@launch
+                val cur = _state.value
+                if (cur.currentMediaId != null) return@launch  // real state already arrived
+                _state.value = cur.copy(
+                    currentMediaId = mediaId,
+                    title = snap.title,
+                    artist = snap.artist,
+                    album = snap.album,
+                    queueFilenames = if (cur.queueFilenames.isEmpty()) snap.queueFilenames else cur.queueFilenames,
+                    queueIndex = if (cur.queueFilenames.isEmpty()) snap.queueIndex else cur.queueIndex,
+                    preparedNotPlaying = true,
+                )
+                _livePosition.value = snap.positionMs
+            } catch (t: Throwable) {
+                android.util.Log.w("PlaybackEngine", "optimistic hydrate failed: ${t.message}")
+            }
+        }
     }
 
     fun stop() {
@@ -1054,7 +1170,61 @@ class PlaybackEngine(
                 if (kotlin.math.abs(delta) > 0.001f) {
                     t.propagateSimilarityBoost(removedFilename, delta, "queue_remove")
                 }
+                signalTimeline?.append(
+                    SignalTimelineEngine.Event(
+                        timestamp = System.currentTimeMillis(),
+                        filename = removedFilename,
+                        title = removedFilename,
+                        artist = "",
+                        source = "queue_remove",
+                        fraction = 0f,
+                        classification = SignalTimelineEngine.Classification.SKIP,
+                        tasteBefore = snapshotOf(before),
+                        tasteAfter = snapshotOf(after),
+                        xScoreBefore = before.xScore,
+                        xScoreAfter = after.xScore,
+                        sessionPullBefore = t.tuning.value.sessionBias.coerceIn(0f, 1f),
+                        sessionPullAfter = t.tuning.value.sessionBias.coerceIn(0f, 1f),
+                        libraryAvgBefore = avgLibraryFraction(),
+                        libraryAvgAfter = avgLibraryFraction(),
+                    ),
+                )
             }
+        }
+    }
+
+    /**
+     * Strip [filenames] from the upcoming queue (after the current song)
+     * without rebuilding AI recommendations. Used when the user dislikes
+     * a track that is still queued in Up Next.
+     */
+    fun removeFilenamesFromUpcoming(filenames: Set<String>) {
+        if (filenames.isEmpty()) return
+        scope.launch {
+            val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val cur = _state.value
+            val idx = cur.queueIndex.coerceAtLeast(0)
+            val list = cur.queueFilenames
+            if (list.size <= idx + 1) return@launch
+            val toRemove = list.indices
+                .filter { i -> i > idx && list[i] in filenames }
+                .sortedDescending()
+            if (toRemove.isEmpty()) return@launch
+            for (i in toRemove) {
+                if (i < ctrl.mediaItemCount) ctrl.removeMediaItem(i)
+            }
+            val nextFilenames = list.filterIndexed { i, fn -> i <= idx || fn !in filenames }
+            val nextIdx = ctrl.currentMediaItemIndex
+            _state.value = cur.copy(
+                queueFilenames = nextFilenames,
+                queueIndex = nextIdx,
+                playNextFilenames = cur.playNextFilenames - filenames,
+            )
+            persistQueue(nextFilenames, nextIdx)
+            android.util.Log.i(
+                "QueueOp",
+                "removeFilenamesFromUpcoming removed=${filenames.size} remaining=${nextFilenames.size}",
+            )
         }
     }
 
@@ -1126,9 +1296,49 @@ class PlaybackEngine(
         }
     }
 
+    /**
+     * Insert multiple songs right after the current track ("Queue all similar").
+     * Push #70: all inserted filenames join `playNextFilenames` so they survive
+     * queue rebuilds. De-dupes against current track and existing queue.
+     */
+    fun playNextMany(songs: List<Song>) {
+        val cur = _state.value
+        val have = cur.queueFilenames.toSet()
+        val curFilename = cur.currentMediaId
+        val seen = HashSet<String>()
+        curFilename?.let { seen += it }
+        val toInsert = songs.filter {
+            !it.filePath.isNullOrEmpty() &&
+                it.filename !in have &&
+                seen.add(it.filename)
+        }
+        if (toInsert.isEmpty()) return
+        scope.launch {
+            val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val insertAt = (ctrl.currentMediaItemIndex + 1).coerceAtLeast(0)
+            sendPlaybackCommand(ctrl, CMD_INSERT_AFTER_CURRENT, queueCommandArgs(toInsert))
+            val curState = _state.value
+            val nextFilenames = curState.queueFilenames.toMutableList().also { list ->
+                val offset = insertAt.coerceAtMost(list.size)
+                list.addAll(offset, toInsert.map { it.filename })
+            }
+            val newPlayNextSet = curState.playNextFilenames + toInsert.map { it.filename }.toSet()
+            _state.value = curState.copy(
+                queueFilenames = nextFilenames,
+                playNextFilenames = newPlayNextSet,
+            )
+            android.util.Log.i(
+                "QueueOp",
+                "playNextMany: inserted ${toInsert.size} at $insertAt; playNextSet size=${newPlayNextSet.size}"
+            )
+            persistQueue(nextFilenames, ctrl.currentMediaItemIndex)
+        }
+    }
+
     /** "Play only" — replace queue with just this song, no auto-rebuild. */
     fun playOnly(song: Song) {
         if (song.filePath.isNullOrEmpty()) return
+        clearPlayNextMarker(song.filename)
         playQueue(listOf(song), 0, source = "manual_tap")
     }
 
@@ -1190,8 +1400,16 @@ class PlaybackEngine(
             .build()
 
     private fun persistCurrent(mediaId: String, positionMs: Long) {
+        // Phase C (2026-06-01): also persist display metadata for the optimistic
+        // MiniPlayer hydrate path in preWarm(). Falls back to _state.value
+        // (which the controller listener keeps current). Blank strings stay
+        // blank — saveCurrent() preserves prior values when null is passed.
+        val st = _state.value
+        val title = st.title.takeIf { it.isNotBlank() }
+        val artist = st.artist.takeIf { it.isNotBlank() }
+        val album = st.album.takeIf { it.isNotBlank() }
         scope.launch(Dispatchers.IO) {
-            try { preferences.saveCurrent(mediaId, positionMs) }
+            try { preferences.saveCurrent(mediaId, positionMs, title, artist, album) }
             catch (t: Throwable) { android.util.Log.w("PlaybackEngine", "saveCurrent failed: ${t.message}") }
         }
     }

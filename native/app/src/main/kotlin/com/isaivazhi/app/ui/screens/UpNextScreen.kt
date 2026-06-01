@@ -61,6 +61,8 @@ fun UpNextScreen(
     currentMediaId: String?,
     currentIndex: Int,
     aiMode: Boolean,
+    /** When false, AI chip is disabled (e.g. no embeddings imported yet). */
+    aiModeEnabled: Boolean = true,
     onToggleMode: (aiMode: Boolean) -> Unit,
     onJumpTo: (index: Int) -> Unit,
     onLongPress: (Song) -> Unit,
@@ -82,9 +84,21 @@ fun UpNextScreen(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            ModeChip(label = "AI", icon = Icons.Filled.AutoAwesome, active = aiMode, onClick = { onToggleMode(true) })
+            ModeChip(
+                label = "AI",
+                icon = Icons.Filled.AutoAwesome,
+                active = aiMode,
+                enabled = aiModeEnabled,
+                onClick = { if (aiModeEnabled) onToggleMode(true) },
+            )
             Spacer(Modifier.width(6.dp))
-            ModeChip(label = "Shuffle", icon = Icons.Filled.Shuffle, active = !aiMode, onClick = { onToggleMode(false) })
+            ModeChip(
+                label = "Shuffle",
+                icon = Icons.Filled.Shuffle,
+                active = !aiMode,
+                enabled = true,
+                onClick = { onToggleMode(false) },
+            )
             Spacer(Modifier.weight(1f))
             Text(
                 text = "${queue.size} tracks",
@@ -103,7 +117,7 @@ fun UpNextScreen(
         if (queue.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                 Text(
-                    text = "No queue. Play a song from Discover, Albums, or Songs to start one.",
+                    text = "No queue. Play a song from Songs, Albums, or Playlists to start one.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -277,15 +291,24 @@ private fun ModeChip(
     label: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     active: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
-    val bg = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
-    val fg = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+    val bg = when {
+        !enabled -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        active -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    val fg = when {
+        !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+        active -> MaterialTheme.colorScheme.onPrimary
+        else -> MaterialTheme.colorScheme.onSurface
+    }
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(16.dp))
             .background(bg)
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

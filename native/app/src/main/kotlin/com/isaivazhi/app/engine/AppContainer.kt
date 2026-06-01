@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * Single source of engines for the app. Constructed once at process start
@@ -108,6 +109,51 @@ class AppContainer(private val appContext: Context) {
         }
     }
 
+    /** Import legacy Capacitor `disliked_songs` JSON into [DislikedEngine]. */
+    suspend fun reconcileCapacitorDislikedStorage() {
+        disliked.awaitReady()
+        val prefs = appContext.getSharedPreferences("CapacitorStorage", android.content.Context.MODE_PRIVATE)
+        val raw = prefs.getString("disliked_songs", null)
+        if (raw.isNullOrBlank()) return
+        val fromCapacitor = runCatching {
+            val arr = org.json.JSONArray(raw)
+            buildSet {
+                for (i in 0 until arr.length()) {
+                    val filename = arr.optString(i, "")
+                    if (filename.isNotBlank()) add(filename)
+                }
+            }
+        }.getOrDefault(emptySet())
+        if (fromCapacitor.isEmpty()) return
+        disliked.replaceAllFromExternal(disliked.disliked.value + fromCapacitor)
+    }
+
+    /**
+     * Backfill favorites/dislikes engines from legacy taste-signal flags and
+     * sync taste priors from the authoritative engine sets.
+     */
+    suspend fun reconcileManualTasteFlags() {
+        taste.awaitReady()
+        favorites.awaitReady()
+        disliked.awaitReady()
+        for ((fn, sig) in taste.signals.value) {
+            if (sig.isDisliked && !disliked.isDisliked(fn)) {
+                disliked.addSilent(fn)
+            }
+            if (sig.isFavorite && !favorites.isFavorite(fn)) {
+                favorites.addSilent(fn)
+            }
+        }
+        val allManual = favorites.favorites.value + disliked.disliked.value
+        for (fn in allManual) {
+            taste.applyManualPriorChange(
+                filename = fn,
+                isFavorite = fn in favorites.favorites.value,
+                isDisliked = fn in disliked.disliked.value,
+            )
+        }
+    }
+
     val disliked: DislikedEngine by lazy {
         DislikedEngine(appContext).also { dis ->
             dis.onChangeHook = { fn, _ ->
@@ -127,6 +173,9 @@ class AppContainer(private val appContext: Context) {
                 sideEffectScope.launch {
                     taste.propagateSimilarityBoost(fn, delta, "dislike_toggle")
                     _rebuildSignal.emit("dislike_toggle")
+                }
+                if (nowDis) {
+                    playback.removeFilenamesFromUpcoming(setOf(fn))
                 }
             }
         }
@@ -166,10 +215,9 @@ class AppContainer(private val appContext: Context) {
     // build the session-level snapshots that the SignalTimeline records.
     val session: SessionEngine by lazy { SessionEngine() }
 
-    // Push #64: persistent Discover snapshot so cold start renders the
-    // page from cache instantly while fresh data overlays in the
-    // background. Capacitor parity: `lastProfile` cache.
-    val discoverCache: DiscoverCacheEngine by lazy { DiscoverCacheEngine(appContext, activityLog) }
+    // Phase 4 (2026-06-01): DiscoverCacheEngine removed alongside the Discover
+    // page. "Similar to current" now recomputes inline inside NowPlayingScreen;
+    // no caching needed since it's a single k=10 query per song change.
 
     // Push #69: app-wide activity log for non-playback events. Capacitor
     // parity: `engine.activity` separate from SignalTimeline.
@@ -185,6 +233,35 @@ class AppContainer(private val appContext: Context) {
     val recommender: Recommender by lazy { Recommender(embeddingDb) }
 
     val embedding: EmbeddingEngine by lazy { EmbeddingEngine(appContext, embeddingDb, toaster) }
+
+    /**
+     * Bugfix 2026-06-01d: process-lifetime library snapshot. Originally
+     * the song list lived only as a Compose state inside MainActivity,
+     * which meant background engines (like RecommendationCache) couldn't
+     * see it when the Activity was destroyed on the lockscreen. Now any
+     * loader (IsaiVazhiApp warm path or MainActivity's LaunchedEffect)
+     * publishes the result here so all process-lifetime code can read it.
+     */
+    val library: kotlinx.coroutines.flow.MutableStateFlow<List<Song>> =
+        kotlinx.coroutines.flow.MutableStateFlow(emptyList())
+
+    /**
+     * Bugfix 2026-06-01d: process-lifetime scope for engines that must
+     * keep working after MainActivity is destroyed (lockscreen precompute,
+     * etc.). Uses Default dispatcher so embedding-DB calls don't block
+     * Main; the EmbeddingDbFacade itself serializes onto its own
+     * HandlerThread so dispatcher choice here is just for orchestration.
+     */
+    val applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Bugfix 2026-06-01d: proactive recommendation precompute. See
+     * RecommendationCache kdoc for the full rationale. Must be started
+     * explicitly (Application class calls `start()` after warm).
+     */
+    val recommendationCache: RecommendationCache by lazy {
+        RecommendationCache(this, applicationScope)
+    }
 
     /**
      * Push #57: filepaths the user has chosen to skip embedding for. The
@@ -206,10 +283,8 @@ class AppContainer(private val appContext: Context) {
         activityLog.log("engine", "reset", "Engine reset triggered", level = ActivityLogEngine.Level.WARN)
         playback.stop()
         history.resetAllStats()
-        taste.resetAllSignals()
         signalTimeline.clear()
         session.reset()
-        discoverCache.clear()
         activityLog.clear()
         // Push #66: clear the transitions history buffer + pending evidence
         // so cold-start reconciliation doesn't replay pre-reset listens.
@@ -228,19 +303,20 @@ class AppContainer(private val appContext: Context) {
         // tuning). Without this re-apply, favorites would have
         // isFavorite=true in FavoritesEngine but no TasteSignal entry,
         // so they'd show as 0 in the Taste page's positive list.
-        val favSet = favorites.favorites.value.toSet()
-        val disSet = disliked.disliked.value.toSet()
-        val toReapply = (favSet + disSet)
-        for (fn in toReapply) {
-            taste.applyManualPriorChange(
-                filename = fn,
-                isFavorite = fn in favSet,
-                isDisliked = fn in disSet,
-            )
+        runBlocking {
+            favorites.awaitReady()
+            disliked.awaitReady()
         }
+        val favFromEngine = favorites.favorites.value
+        val disFromEngine = disliked.disliked.value
+        val favFromTaste = taste.signals.value.filter { it.value.isFavorite }.keys
+        val disFromTaste = taste.signals.value.filter { it.value.isDisliked }.keys
+        val favSet = (favFromEngine + favFromTaste).toSet()
+        val disSet = (disFromEngine + disFromTaste).toSet()
+        taste.resetAllSignalsPreservingManual(favSet, disSet)
         android.util.Log.i(
             "AppContainer",
-            "Engine reset: preserved ${favSet.size} favorites + ${disSet.size} dislikes; re-applied priors for ${toReapply.size} songs"
+            "Engine reset: preserved ${favSet.size} favorites + ${disSet.size} dislikes; re-applied priors for ${(favSet + disSet).size} songs"
         )
 
         toaster.show("Engine reset (favorites + dislikes preserved)")
