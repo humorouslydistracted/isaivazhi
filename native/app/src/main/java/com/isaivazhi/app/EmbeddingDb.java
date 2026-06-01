@@ -8,6 +8,7 @@ import android.util.Log;
 import io.requery.android.database.sqlite.SQLiteCustomExtension;
 import io.requery.android.database.sqlite.SQLiteDatabase;
 import io.requery.android.database.sqlite.SQLiteDatabaseConfiguration;
+import io.requery.android.database.sqlite.SQLiteStatement;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -725,26 +726,45 @@ final class EmbeddingDb {
     void replaceAll(List<EmbeddingEntity> ents, List<EmbeddingPathIndexEntity> paths) {
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
+        SQLiteStatement embStmt = null;
+        SQLiteStatement pathStmt = null;
         try {
             db.delete(T_EMB, null, null);
             db.delete(T_PATH, null, null);
-            if (ents != null) {
+            if (ents != null && !ents.isEmpty()) {
+                embStmt = db.compileStatement(
+                        "INSERT OR REPLACE INTO " + T_EMB
+                                + " (content_hash, filepath, filename, artist, album, timestamp, dim, vec)"
+                                + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
                 for (EmbeddingEntity e : ents) {
-                    ContentValues cv = embToContentValues(e);
-                    db.insertWithOnConflict(T_EMB, null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+                    if (e == null || e.contentHash == null || e.contentHash.isEmpty()) continue;
+                    embStmt.bindString(1, e.contentHash);
+                    embStmt.bindString(2, e.filepath != null ? e.filepath : "");
+                    embStmt.bindString(3, e.filename != null ? e.filename : "");
+                    embStmt.bindString(4, e.artist != null ? e.artist : "");
+                    embStmt.bindString(5, e.album != null ? e.album : "");
+                    embStmt.bindLong(6, e.timestamp);
+                    embStmt.bindLong(7, e.dim);
+                    embStmt.bindBlob(8, e.vec != null ? e.vec : new byte[0]);
+                    embStmt.executeInsert();
+                    embStmt.clearBindings();
                 }
             }
-            if (paths != null) {
+            if (paths != null && !paths.isEmpty()) {
+                pathStmt = db.compileStatement(
+                        "INSERT OR REPLACE INTO " + T_PATH + " (filepath, content_hash) VALUES (?, ?)");
                 for (EmbeddingPathIndexEntity p : paths) {
                     if (p == null || p.filepath == null || p.filepath.isEmpty()) continue;
-                    ContentValues cv = new ContentValues();
-                    cv.put("filepath", p.filepath);
-                    cv.put("content_hash", p.contentHash != null ? p.contentHash : "");
-                    db.insertWithOnConflict(T_PATH, null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+                    pathStmt.bindString(1, p.filepath);
+                    pathStmt.bindString(2, p.contentHash != null ? p.contentHash : "");
+                    pathStmt.executeInsert();
+                    pathStmt.clearBindings();
                 }
             }
             db.setTransactionSuccessful();
         } finally {
+            if (embStmt != null) embStmt.close();
+            if (pathStmt != null) pathStmt.close();
             db.endTransaction();
             invalidateFallbackSnapshot();
         }

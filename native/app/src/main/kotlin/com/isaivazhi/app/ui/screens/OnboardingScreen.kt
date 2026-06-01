@@ -21,7 +21,7 @@ import androidx.compose.ui.unit.dp
 /**
  * Onboarding step shown once permission is granted and the embeddings DB
  * is empty. Three actions per the user's spec:
- *   1. Import an existing local_embeddings.json
+ *   1. Import isaivazhi_embeddings.bin (or legacy local_embeddings.json)
  *   2. Embed in background (run ONNX over the library)
  *   3. Continue without (shuffle mode)
  *
@@ -79,7 +79,7 @@ fun OnboardingScreen(
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !importInProgress,
             ) {
-                Text("Import local_embeddings.json")
+                Text("Import embeddings backup (.bin)")
             }
             Spacer(Modifier.height(6.dp))
             Text(

@@ -73,7 +73,7 @@ fun SettingsScreen(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
             )
             ActionRow(
-                title = "Import local_embeddings.json",
+                title = "Import isaivazhi_embeddings.bin",
                 subtitle = "Restore after reinstall. Export a backup from AI & Library first.",
                 onClick = onReimportEmbeddings,
                 enabled = !importInProgress,

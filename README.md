@@ -206,6 +206,10 @@ Active personal/open-source project. The repository contains the full native
 Kotlin/Compose Android app.
 
 Recent changes:
+- **v2026.6.3** — **IVZ1** portable embeddings (`isaivazhi_embeddings.bin`) for fast
+  import/export (~5 MB vs ~25 MB JSON). Configurable **3 / 5 / 7** CLAP window splits
+  on the AI page and in `tools/embeddings/embedding_config.py` (re-embed full library
+  after changing split count). Legacy `local_embeddings.json` still supported.
 - **v2026.6.2** — Recommendation policy: configurable negative guard
   (`negativeStrength`), hard-block top 18% of strong negatives, soft down-rank
   for Up Next. `RecommendationPolicy` and `BlendWeightLogic` extracted for

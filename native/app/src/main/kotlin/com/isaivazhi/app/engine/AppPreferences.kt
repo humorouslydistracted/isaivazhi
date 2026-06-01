@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -84,6 +85,10 @@ class AppPreferences(private val appContext: Context) {
         // left off. Empty string on first-ever launch → caller picks the
         // default (Songs).
         val LAST_TAB = stringPreferencesKey("last_tab_v1")
+        // CLAP window splits per song (3 legacy, 5/7 higher quality). Must match
+        // embedding_config.py / EmbeddingWindowConfig.java.
+        val EMBEDDING_SPLIT_COUNT = intPreferencesKey("embedding_split_count_v1")
+        val LAST_EMBED_SPLIT_COUNT = intPreferencesKey("last_embed_split_count_v1")
     }
 
     val recMode: kotlinx.coroutines.flow.Flow<Boolean> =
@@ -185,6 +190,28 @@ class AppPreferences(private val appContext: Context) {
 
     suspend fun saveLastTab(tabName: String) {
         appContext.dataStore.edit { it[Keys.LAST_TAB] = tabName }
+    }
+
+    /** User-selected splits for the next embed run (3, 5, or 7). */
+    suspend fun getEmbeddingSplitCount(): Int {
+        val raw = appContext.dataStore.data.first()[Keys.EMBEDDING_SPLIT_COUNT] ?: 3
+        return EmbeddingSplitCount.normalize(raw)
+    }
+
+    suspend fun setEmbeddingSplitCount(count: Int) {
+        val n = EmbeddingSplitCount.normalize(count)
+        appContext.dataStore.edit { it[Keys.EMBEDDING_SPLIT_COUNT] = n }
+    }
+
+    /** Split count used for the current library vectors (from last completed batch or import). */
+    suspend fun getLastEmbedSplitCount(): Int? {
+        val v = appContext.dataStore.data.first()[Keys.LAST_EMBED_SPLIT_COUNT] ?: return null
+        return if (v in EmbeddingSplitCount.allowed) v else null
+    }
+
+    suspend fun saveLastEmbedSplitCount(count: Int) {
+        val n = EmbeddingSplitCount.normalize(count)
+        appContext.dataStore.edit { it[Keys.LAST_EMBED_SPLIT_COUNT] = n }
     }
 
     suspend fun saveQueue(filenames: List<String>, index: Int) {

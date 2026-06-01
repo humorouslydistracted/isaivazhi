@@ -44,6 +44,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -65,6 +66,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.EmbeddingDbFacade
 import com.isaivazhi.app.engine.EmbeddingEngine
+import com.isaivazhi.app.engine.EmbeddingSplitCount
 import com.isaivazhi.app.engine.SignalTimelineEngine
 import com.isaivazhi.app.engine.Song
 import java.text.SimpleDateFormat
@@ -78,6 +80,9 @@ fun AiManagementScreen(
     embeddingsDim: Int,
     vecExtensionLoaded: Boolean,
     status: EmbeddingEngine.EmbeddingStatus,
+    embeddingSplitCount: Int = 3,
+    libraryEmbedSplitCount: Int? = null,
+    onEmbeddingSplitCountChange: (Int) -> Unit = {},
     embeddedFilenames: Set<String>,
     // Push #53: filepath-based "is this song embedded" lookup. The
     // previous filename-based comparison failed for songs whose
@@ -315,6 +320,15 @@ fun AiManagementScreen(
             // doing the work, even before any progress arrives.
             item {
                 BackendBadge(activeBackend = status.activeBackend, inProgress = status.inProgress, error = status.error)
+            }
+
+            item {
+                EmbeddingSplitSection(
+                    selected = embeddingSplitCount,
+                    librarySplitCount = libraryEmbedSplitCount,
+                    inProgress = status.inProgress,
+                    onSelect = onEmbeddingSplitCountChange,
+                )
             }
 
             // Progress banner (in-progress)
@@ -1454,13 +1468,92 @@ private fun TopActionBar(
                 title = { Text("Export embeddings") },
                 text = {
                     Text(
-                        "Saves every AI vector to local_embeddings.json on your device. " +
+                        "Saves every AI vector to isaivazhi_embeddings.bin on your device. " +
                             "After reinstall, use Settings → Import to restore without re-embedding."
                     )
                 },
                 confirmButton = {
                     TextButton(onClick = { showExportInfo = false }) { Text("OK") }
                 },
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmbeddingSplitSection(
+    selected: Int,
+    librarySplitCount: Int?,
+    inProgress: Boolean,
+    onSelect: (Int) -> Unit,
+) {
+    val normalized = EmbeddingSplitCount.normalize(selected)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+            .padding(12.dp),
+    ) {
+        Text(
+            text = "CLAP windows per song",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = EmbeddingSplitCount.positionsLabel(normalized) +
+                " — averaged, then L2-normalized (512-d)",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            for (n in EmbeddingSplitCount.allowed) {
+                FilterChip(
+                    selected = normalized == n,
+                    onClick = { if (!inProgress) onSelect(n) },
+                    label = { Text("$n") },
+                    enabled = !inProgress,
+                )
+            }
+        }
+        if (normalized > 3) {
+            val pct = ((EmbeddingSplitCount.timeMultiplier(normalized) - 1f) * 100f).toInt()
+            Text(
+                text = "Roughly ~$pct% longer per song than 3 windows (more ONNX passes).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        if (librarySplitCount != null && librarySplitCount != normalized) {
+            Text(
+                text = "Library was embedded with $librarySplitCount splits. " +
+                    "Use Re-embed all after changing — do not mix split counts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        } else if (librarySplitCount == null && normalized != 3) {
+            Text(
+                text = "Existing backups are usually 3-split. Re-embed all after switching to $normalized.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        if (inProgress) {
+            Text(
+                text = "Split count locked while a batch is running.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
             )
         }
     }

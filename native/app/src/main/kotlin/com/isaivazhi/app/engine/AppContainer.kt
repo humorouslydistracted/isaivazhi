@@ -232,7 +232,9 @@ class AppContainer(private val appContext: Context) {
 
     val recommender: Recommender by lazy { Recommender(embeddingDb) }
 
-    val embedding: EmbeddingEngine by lazy { EmbeddingEngine(appContext, embeddingDb, toaster) }
+    val embedding: EmbeddingEngine by lazy {
+        EmbeddingEngine(appContext, embeddingDb, toaster, preferences)
+    }
 
     /**
      * Bugfix 2026-06-01d: process-lifetime library snapshot. Originally

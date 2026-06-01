@@ -284,11 +284,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        // Push #46: refresh the portable local_embeddings.json mirror
-        // when the user backgrounds the app. Catches any drift between
-        // the last batch's auto-export and "now" (e.g. embeddings that
-        // landed via :ai recovery while the user was idle). Atomic
-        // tmp+rename so a process kill while writing can't corrupt.
+        // Portable IVZ backup on background (fast ~5 MB write; no JSON float stringify).
         if (::container.isInitialized) {
             // Push #65: flush mid-song listening evidence into the
             // SignalTimeline before the process can be killed. Without
@@ -300,7 +296,10 @@ class MainActivity : ComponentActivity() {
             //  cold-start recovery reconciles the two."
             flushCurrentPlayback(reason = "app_background")
             CoroutineScope(Dispatchers.IO).launch {
-                runCatching { container.embeddingDb.exportLegacyMirror() }
+                runCatching {
+                    val splits = container.preferences.getEmbeddingSplitCount()
+                    container.embeddingDb.exportEmbeddingsBin(splits)
+                }
             }
         }
         super.onPause()
@@ -436,6 +435,12 @@ private fun AppRoot(container: AppContainer) {
     var importInProgress by remember { mutableStateOf(false) }
     var exportBackupInProgress by remember { mutableStateOf(false) }
     var exportBackupStatus by remember { mutableStateOf<String?>(null) }
+    var embeddingSplitCount by remember { mutableStateOf(3) }
+    var libraryEmbedSplitCount by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(Unit) {
+        embeddingSplitCount = container.preferences.getEmbeddingSplitCount()
+        libraryEmbedSplitCount = container.preferences.getLastEmbedSplitCount()
+    }
     var overlay by remember { mutableStateOf<Overlay>(Overlay.None) }
     var libraryMenuOpen by remember { mutableStateOf(false) }
     var menuSong by remember { mutableStateOf<Song?>(null) }
@@ -693,15 +698,35 @@ private fun AppRoot(container: AppContainer) {
                     container.embedding.logBuffer.append("import", "FAILED copy: $err")
                     return@launch
                 }
-                importMessage = "Ingesting ${result.bytesCopied / 1024} KB — may take 1–2 min…"
-                val reimport = container.embeddingDb.forceReimportLegacyJson()
+                importMessage = when (result.format) {
+                    EmbeddingsImport.PortableFormat.IVZ ->
+                        "Ingesting ${result.bytesCopied / 1024} KB — usually under a minute…"
+                    EmbeddingsImport.PortableFormat.LEGACY_JSON ->
+                        "Ingesting JSON ${result.bytesCopied / 1024} KB — may take 1–2 min…"
+                    else -> "Ingesting…"
+                }
+                val reimport = container.embeddingDb.forceReimportEmbeddings()
                 val rows = reimport?.optInt("rowCount", 0) ?: 0
+                val fileSplits = reimport?.optInt("splitCount", 3) ?: 3
+                val desiredSplits = container.preferences.getEmbeddingSplitCount()
+                if (rows > 0) {
+                    container.preferences.saveLastEmbedSplitCount(fileSplits)
+                    libraryEmbedSplitCount = fileSplits
+                }
+                if (rows > 0 && fileSplits != desiredSplits) {
+                    container.toaster.show(
+                        "Backup used $fileSplits splits; settings use $desiredSplits — re-embed for best match",
+                    )
+                }
                 val relink = container.embeddingDb.relinkLibraryPaths(songs)
                 val relinked = relink?.optInt("relinked", 0) ?: 0
                 val hashMap = container.embeddingDb.contentHashByFilepath()
                 songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
                 container.library.value = songs
+                container.embeddingDb.clearVecHeapCache()
                 container.embeddingDb.prewarmFromLibrary(songs)
+                container.embeddingDb.fullWarmFromDb()
+                container.recommendationCache.precomputeNow(reason = "import_done")
                 refreshDbStats(container) { rc, dim, ext, fns, fps ->
                     embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                     embeddedFilenames = fns
@@ -736,7 +761,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     val exportSaveLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/json"),
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri ->
         coroutineScope.launch {
             try {
@@ -752,7 +777,7 @@ private fun AppRoot(container: AppContainer) {
                 val copy = EmbeddingsImport.copyBackupToUri(ctx, uri)
                 if (copy.ok) {
                     val mb = copy.bytesCopied / 1024.0 / 1024.0
-                    val msg = "Saved local_embeddings.json (${"%.1f".format(mb)} MB)"
+                    val msg = "Saved embeddings backup (${"%.1f".format(mb)} MB)"
                     exportBackupStatus = msg
                     container.toaster.show(msg)
                     container.embedding.logBuffer.append(
@@ -937,6 +962,7 @@ private fun AppRoot(container: AppContainer) {
                 "batchComplete: processed=${ev.processed} failed=${ev.failed} recoveredIntoDb=${ev.recoveredIntoDb} totalRows=${ev.totalRows}"
             )
             embeddingsRowCount = ev.totalRows
+            libraryEmbedSplitCount = container.preferences.getLastEmbedSplitCount()
             refreshDbStats(container) { rc, dim, ext, fns, fps ->
                 embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                 embeddedFilenames = fns
@@ -2559,6 +2585,14 @@ private fun AppRoot(container: AppContainer) {
             embeddingsDim = embeddingsDim,
             vecExtensionLoaded = vecExtLoaded,
             status = embeddingStatus,
+            embeddingSplitCount = embeddingSplitCount,
+            libraryEmbedSplitCount = libraryEmbedSplitCount,
+            onEmbeddingSplitCountChange = { count ->
+                coroutineScope.launch {
+                    container.preferences.setEmbeddingSplitCount(count)
+                    embeddingSplitCount = count
+                }
+            },
             embeddedFilenames = embeddedFilenames,
             embeddedFilepaths = embeddedFilepaths,
             // Push #57: skip set + skip/un-skip callbacks. Pending list
@@ -2655,22 +2689,21 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Embedding stopped")
                 container.embedding.logBuffer.append("stop", "user stopped embedding")
             },
-            // Push #46: manual one-shot export of the SQLite embeddings
-            // into a portable `local_embeddings.json` mirror file. Useful
-            // right before a reinstall — copy the JSON off the device,
-            // install the fresh APK, drop the JSON back, app's
-            // migrateFromLegacyIfNeeded() ingests it on first launch.
+            // Manual one-shot IVZ backup (isaivazhi_embeddings.bin).
             onExportBackup = {
                 if (exportBackupInProgress) {
                     container.toaster.show("Export already in progress…")
                 } else {
                 exportBackupInProgress = true
                 val rowHint = embeddingsRowCount ?: 0
-                exportBackupStatus = "Preparing backup — reading $rowHint embeddings (may take 1–2 min)…"
+                exportBackupStatus = "Preparing backup — reading $rowHint embeddings…"
                 container.embedding.logBuffer.append("backup", "manual export started")
                 coroutineScope.launch {
                     try {
-                        val res = runCatching { container.embeddingDb.exportLegacyMirror() }.getOrNull()
+                        val splits = container.preferences.getEmbeddingSplitCount()
+                        val res = runCatching {
+                            container.embeddingDb.exportEmbeddingsBin(splits)
+                        }.getOrNull()
                         val rows = res?.optInt("rowCount", 0) ?: 0
                         val bytes = res?.optLong("bytes", 0L) ?: 0L
                         val mbStr = "%.1f".format(bytes / 1024.0 / 1024.0)
@@ -2688,7 +2721,7 @@ private fun AppRoot(container: AppContainer) {
                             "manual export complete — $rows rows, $bytes bytes ($mbStr MB)",
                         )
                         exportBackupStatus = "Ready — choose where to save ($rows songs, $mbStr MB)"
-                        exportSaveLauncher.launch("local_embeddings.json")
+                        exportSaveLauncher.launch(EmbeddingsImport.BIN_FILENAME)
                     } catch (t: Throwable) {
                         val err = t.message ?: t.javaClass.simpleName
                         exportBackupStatus = "Export failed: $err"

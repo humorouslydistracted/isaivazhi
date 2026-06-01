@@ -41,6 +41,11 @@ public final class EmbeddingDbManager {
     private static final String LEGACY_BIN = "local_embeddings.bin";
     private static final String LEGACY_META = "local_embeddings_meta.json";
     private static final String LEGACY_JSON = "local_embeddings.json";
+    /** Single-file portable store (IVZ1): vectors + embedded metadata. */
+    public static final String EMBEDDINGS_BIN = "isaivazhi_embeddings.bin";
+    private static final byte[] IVZ_MAGIC_BYTES = new byte[]{'I', 'V', 'Z', '1'};
+    private static final int IVZ_VERSION = 1;
+    private static final int IVZ_HEADER_SIZE = 20;
     // Read-optimized binary snapshot of the SQLite store. Written atomically
     // by loadAllSnapshot so JS can pull vectors via convertFileSrc + fetch
     // (~85 ms for 5 MB) instead of a multi-MB base64 string over the JSI
@@ -133,11 +138,18 @@ public final class EmbeddingDbManager {
             migrationChecked.set(true);
 
             File dir = getDataDir();
+            File ivzFile = new File(dir, EMBEDDINGS_BIN);
             File binFile = new File(dir, LEGACY_BIN);
             File metaFile = new File(dir, LEGACY_META);
             File jsonFile = new File(dir, LEGACY_JSON);
 
-            // Prefer the binary store. Fall back to the legacy JSON mirror if no .bin.
+            if (ivzFile.exists() && isIvzFile(ivzFile)) {
+                int inserted = ingestIvzFile(ivzFile);
+                result.put("migrated", true);
+                result.put("source", "ivz");
+                result.put("rowCount", inserted);
+                return result;
+            }
             if (binFile.exists() && metaFile.exists()) {
                 int inserted = ingestBinaryStore(binFile, metaFile);
                 result.put("migrated", true);
@@ -254,6 +266,232 @@ public final class EmbeddingDbManager {
         db.replaceAll(entities, paths);
         Log.i(TAG, "Migrated " + entities.size() + " embeddings from legacy JSON");
         return entities.size();
+    }
+
+    private static boolean isIvzFile(File f) throws Exception {
+        byte[] head = new byte[4];
+        FileInputStream fis = new FileInputStream(f);
+        try {
+            int n = fis.read(head);
+            if (n < 4) return false;
+        } finally {
+            fis.close();
+        }
+        for (int i = 0; i < 4; i++) {
+            if (head[i] != IVZ_MAGIC_BYTES[i]) return false;
+        }
+        return true;
+    }
+
+    private int ingestIvzFile(File ivzFile) throws Exception {
+        byte[] data = readBytes(ivzFile);
+        if (data.length < IVZ_HEADER_SIZE) {
+            throw new IllegalStateException("IVZ file too short");
+        }
+        ByteBuffer hdr = ByteBuffer.wrap(data, 0, IVZ_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        byte[] magic = new byte[4];
+        hdr.get(magic);
+        for (int i = 0; i < 4; i++) {
+            if (magic[i] != IVZ_MAGIC_BYTES[i]) {
+                throw new IllegalStateException("bad IVZ magic");
+            }
+        }
+        int version = hdr.getInt();
+        if (version != IVZ_VERSION) {
+            throw new IllegalStateException("unsupported IVZ version " + version);
+        }
+        int dim = hdr.getInt();
+        int rowCount = hdr.getInt();
+        int metaLen = hdr.getInt();
+        if (dim <= 0 || rowCount < 0 || metaLen < 0) {
+            throw new IllegalStateException("invalid IVZ header");
+        }
+        int metaStart = IVZ_HEADER_SIZE;
+        int metaEnd = metaStart + metaLen;
+        int vecStart = metaEnd;
+        int vecBytes = rowCount * dim * 4;
+        if (data.length < vecStart + vecBytes) {
+            throw new IllegalStateException("IVZ vector blob truncated");
+        }
+        String metaText = new String(data, metaStart, metaLen, StandardCharsets.UTF_8);
+        JSONObject meta = new JSONObject(metaText);
+        JSONArray entryArr = meta.optJSONArray("entries");
+        if (entryArr == null) return 0;
+
+        byte[] raw = new byte[vecBytes];
+        System.arraycopy(data, vecStart, raw, 0, vecBytes);
+
+        List<EmbeddingEntity> entities = new ArrayList<>(entryArr.length());
+        for (int i = 0; i < entryArr.length(); i++) {
+            JSONObject e = entryArr.optJSONObject(i);
+            if (e == null) continue;
+            EmbeddingEntity ent = new EmbeddingEntity();
+            ent.contentHash = e.optString("contentHash", e.optString("key", ""));
+            if (ent.contentHash.isEmpty()) continue;
+            ent.filepath = e.optString("filepath", "");
+            ent.filename = e.optString("filename", "");
+            ent.artist = e.optString("artist", "");
+            ent.album = e.optString("album", "");
+            ent.timestamp = e.optLong("timestamp", 0L);
+            ent.dim = dim;
+            ent.vec = sliceVecBytes(raw, i, dim);
+            entities.add(ent);
+        }
+
+        List<EmbeddingPathIndexEntity> paths = new ArrayList<>();
+        JSONObject pathIndex = meta.optJSONObject("pathIndex");
+        if (pathIndex != null) {
+            Iterator<String> keys = pathIndex.keys();
+            while (keys.hasNext()) {
+                String fp = keys.next();
+                String hash = pathIndex.optString(fp, "");
+                if (fp.isEmpty() || hash.isEmpty()) continue;
+                EmbeddingPathIndexEntity row = new EmbeddingPathIndexEntity();
+                row.filepath = fp;
+                row.contentHash = hash;
+                paths.add(row);
+            }
+        }
+
+        db.replaceAll(entities, paths);
+        int splitCount = meta.optInt("splitCount", 3);
+        if (splitCount != 3 && splitCount != 5 && splitCount != 7) {
+            splitCount = 3;
+        }
+        Log.i(TAG, "Migrated " + entities.size() + " embeddings from IVZ file (splitCount=" + splitCount + ")");
+        lastIngestSplitCount = splitCount;
+        return entities.size();
+    }
+
+    /** Split count from the most recent IVZ ingest; 3 if unknown. */
+    private volatile int lastIngestSplitCount = 3;
+
+    public int getLastIngestSplitCount() {
+        return lastIngestSplitCount;
+    }
+
+    /**
+     * Writes SQLite contents to isaivazhi_embeddings.bin (IVZ1). Read-only
+     * from the DB's perspective; does not touch heap caches.
+     */
+    public void exportEmbeddingsBin(int splitCount, Callback<JSONObject> cb) {
+        run(() -> {
+            File dir = getDataDir();
+            File dst = new File(dir, EMBEDDINGS_BIN);
+            return writeIvzFile(dst, splitCount);
+        }, cb);
+    }
+
+    private JSONObject writeIvzFile(File dst, int splitCount) throws Exception {
+        splitCount = EmbeddingWindowConfig.normalizeSplitCount(splitCount);
+        List<EmbeddingEntity> rows = db.getAll();
+        int dim = 0;
+        for (EmbeddingEntity r : rows) {
+            if (r.dim > 0) {
+                dim = r.dim;
+                break;
+            }
+        }
+        JSONArray entries = new JSONArray();
+        int rowBytes = dim * 4;
+        byte[] concat = new byte[rows.size() * rowBytes];
+        int wrote = 0;
+        for (EmbeddingEntity r : rows) {
+            if (r.vec == null || r.dim != dim || dim <= 0) continue;
+            System.arraycopy(r.vec, 0, concat, wrote * rowBytes, rowBytes);
+            JSONObject e = new JSONObject();
+            e.put("contentHash", r.contentHash);
+            e.put("filepath", r.filepath);
+            e.put("filename", r.filename);
+            e.put("artist", r.artist);
+            e.put("album", r.album);
+            e.put("timestamp", r.timestamp);
+            entries.put(e);
+            wrote++;
+        }
+        int writtenBytes = wrote * rowBytes;
+        byte[] finalBlob;
+        if (writtenBytes == concat.length) {
+            finalBlob = concat;
+        } else {
+            finalBlob = new byte[writtenBytes];
+            System.arraycopy(concat, 0, finalBlob, 0, writtenBytes);
+        }
+
+        JSONObject pathIndex = new JSONObject();
+        for (EmbeddingPathIndexEntity p : db.getAllPaths()) {
+            pathIndex.put(p.filepath, p.contentHash);
+        }
+        JSONObject meta = new JSONObject();
+        meta.put("entries", entries);
+        meta.put("pathIndex", pathIndex);
+        meta.put("splitCount", splitCount);
+        byte[] metaBytes = meta.toString().getBytes(StandardCharsets.UTF_8);
+
+        ByteBuffer hdr = ByteBuffer.allocate(IVZ_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);
+        hdr.put(IVZ_MAGIC_BYTES);
+        hdr.putInt(IVZ_VERSION);
+        hdr.putInt(dim);
+        hdr.putInt(wrote);
+        hdr.putInt(metaBytes.length);
+
+        File tmp = new File(dst.getParentFile(), dst.getName() + ".tmp");
+        FileOutputStream fos = new FileOutputStream(tmp);
+        try {
+            fos.write(hdr.array());
+            fos.write(metaBytes);
+            fos.write(finalBlob);
+            fos.flush();
+            fos.getFD().sync();
+        } finally {
+            fos.close();
+        }
+        if (dst.exists()) dst.delete();
+        if (!tmp.renameTo(dst)) {
+            throw new IOException("rename failed for IVZ export");
+        }
+
+        JSONObject out = new JSONObject();
+        out.put("rowCount", wrote);
+        out.put("bytes", dst.length());
+        out.put("path", dst.getAbsolutePath());
+        out.put("splitCount", splitCount);
+        Log.i(TAG, "Exported IVZ " + wrote + " rows, " + dst.length() + " bytes, splitCount=" + splitCount);
+        return out;
+    }
+
+    /**
+     * Re-ingest portable backup (IVZ .bin preferred, legacy JSON fallback).
+     */
+    public void forceReimportEmbeddings(Callback<JSONObject> cb) {
+        run(() -> {
+            JSONObject result = new JSONObject();
+            File dir = getDataDir();
+            File ivzFile = new File(dir, EMBEDDINGS_BIN);
+            File jsonFile = new File(dir, LEGACY_JSON);
+
+            if (ivzFile.exists() && isIvzFile(ivzFile)) {
+                int inserted = ingestIvzFile(ivzFile);
+                result.put("reimported", true);
+                result.put("source", "ivz");
+                result.put("rowCount", inserted);
+                result.put("splitCount", lastIngestSplitCount);
+                return result;
+            }
+            if (jsonFile.exists()) {
+                Log.w(TAG, "forceReimport: using legacy JSON (slow); convert to .bin with json_to_ivz.py");
+                int inserted = ingestLegacyJson(jsonFile);
+                result.put("reimported", true);
+                result.put("source", "legacy_json");
+                result.put("rowCount", inserted);
+                result.put("splitCount", lastIngestSplitCount);
+                return result;
+            }
+            result.put("reimported", false);
+            result.put("reason", "no_portable_file");
+            result.put("rowCount", db.count());
+            return result;
+        }, cb);
     }
 
     private static byte[] sliceVecBytes(byte[] raw, int rowIndex, int dim) {
@@ -930,26 +1168,11 @@ public final class EmbeddingDbManager {
     }
 
     /**
-     * Re-ingest local_embeddings.json even when SQLite already has rows.
-     * Used after the user picks a backup file — migrateFromLegacyIfNeeded
-     * would otherwise no-op with reason db_already_populated.
+     * @deprecated Use {@link #forceReimportEmbeddings}; kept for call-site compat.
      */
+    @Deprecated
     public void forceReimportLegacyJson(Callback<JSONObject> cb) {
-        run(() -> {
-            JSONObject result = new JSONObject();
-            File jsonFile = new File(getDataDir(), LEGACY_JSON);
-            if (!jsonFile.exists()) {
-                result.put("reimported", false);
-                result.put("reason", "no_json_file");
-                result.put("rowCount", db.count());
-                return result;
-            }
-            int inserted = ingestLegacyJson(jsonFile);
-            result.put("reimported", true);
-            result.put("source", "legacy_json");
-            result.put("rowCount", inserted);
-            return result;
-        }, cb);
+        forceReimportEmbeddings(cb);
     }
 
     /**

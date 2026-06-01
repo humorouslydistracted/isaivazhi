@@ -130,9 +130,23 @@ class EmbeddingDbFacade(appContext: Context) {
         manager.migrateFromLegacyIfNeeded(cb)
     }
 
-    /** Re-ingest local_embeddings.json even when the DB already has rows. */
-    suspend fun forceReimportLegacyJson(): JSONObject? = awaitJsonObject { cb ->
-        manager.forceReimportLegacyJson(cb)
+    /** Re-ingest portable backup (IVZ .bin preferred, legacy JSON fallback). */
+    suspend fun forceReimportEmbeddings(): JSONObject? = awaitJsonObject { cb ->
+        manager.forceReimportEmbeddings(cb)
+    }
+
+    /** @deprecated Use [forceReimportEmbeddings]. */
+    suspend fun forceReimportLegacyJson(): JSONObject? = forceReimportEmbeddings()
+
+    /** Clear JVM heap caches after a full DB replace (import). */
+    fun clearVecHeapCache() {
+        vecHeapCache.clear()
+        hashToMetaCache.clear()
+        filenameToHashCache.clear()
+    }
+
+    suspend fun exportEmbeddingsBin(splitCount: Int = 3): JSONObject? = awaitJsonObject { cb ->
+        manager.exportEmbeddingsBin(EmbeddingSplitCount.normalize(splitCount), cb)
     }
 
     /**
@@ -207,6 +221,9 @@ class EmbeddingDbFacade(appContext: Context) {
     suspend fun exportLegacyMirror(): JSONObject? = awaitJsonObject { cb ->
         manager.exportLegacyMirror(cb)
     }
+
+    /** Fast portable backup (IVZ1 single file). Preferred over [exportLegacyMirror]. */
+    suspend fun exportPortableBin(): JSONObject? = exportEmbeddingsBin()
 
     /**
      * Batch fetch of vec FloatArrays by content hash. Used by the MMR rerank

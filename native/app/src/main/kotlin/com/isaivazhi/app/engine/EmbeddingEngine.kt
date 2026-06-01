@@ -40,9 +40,13 @@ class EmbeddingEngine(
     // Push #41: optional toaster — emits "Embeddings ready" on
     // MSG_COMPLETE and the error string on MSG_ERROR.
     private val toaster: Toaster? = null,
+    private val preferences: AppPreferences = AppPreferences(appContext),
     /** Optional sink for human-readable log lines surfaced on the AI page. */
     val logBuffer: LogBuffer = LogBuffer(archiveContext = appContext),
 ) {
+
+    /** Split count for the in-flight or most recently started batch. */
+    private var batchSplitCount: Int = 3
 
     data class EmbeddingStatus(
         val inProgress: Boolean = false,
@@ -171,6 +175,7 @@ class EmbeddingEngine(
                 _status.value = _status.value.copy(error = "no_playable_songs")
                 return@launch
             }
+            batchSplitCount = preferences.getEmbeddingSplitCount()
             batchStartedAtMs = android.os.SystemClock.elapsedRealtime()
             // Push #49: preserve the previous run's snapshot fields so the
             // "Last run" line can keep showing during the brief gap
@@ -183,22 +188,26 @@ class EmbeddingEngine(
                 total = paths.size,
                 processed = 0,
                 current = "",
-                etaSeconds = estimateEtaSeconds(paths.size, prev.activeBackend),
+                etaSeconds = estimateEtaSeconds(paths.size, prev.activeBackend, batchSplitCount),
                 activeBackend = prev.activeBackend,
                 failed = 0,
                 lastCompletedAtMs = prev.lastCompletedAtMs,
                 lastCompletedProcessed = prev.lastCompletedProcessed,
                 lastCompletedFailed = prev.lastCompletedFailed,
             )
-            logBuffer.append("start", "batch of ${paths.size} songs queued")
-            startForegroundService(paths)
+            logBuffer.append(
+                "start",
+                "batch of ${paths.size} songs queued (${EmbeddingSplitCount.positionsLabel(batchSplitCount)})",
+            )
+            startForegroundService(paths, batchSplitCount)
         }
     }
 
-    private fun startForegroundService(paths: List<String>) {
+    private fun startForegroundService(paths: List<String>, splitCount: Int) {
         val intent = Intent(appContext, EmbeddingForegroundService::class.java).apply {
             action = EmbeddingForegroundService.ACTION_START
             putStringArrayListExtra(EmbeddingForegroundService.EXTRA_PATHS, ArrayList(paths))
+            putExtra(EmbeddingForegroundService.EXTRA_SPLIT_COUNT, splitCount)
             // playback-active hint: assume false here; PlaybackEngine could
             // set this via EmbeddingControllerClient.setPlaybackActive when
             // we wire that bridge in a future session.
@@ -233,7 +242,8 @@ class EmbeddingEngine(
                 logBuffer.append("stale", "removed $removed stale embedding row(s)")
                 // Refresh the JSON backup so the next reinstall doesn't
                 // re-import the rows we just deleted.
-                runCatching { embeddingDb.exportLegacyMirror() }
+                val splits = preferences.getEmbeddingSplitCount()
+                runCatching { embeddingDb.exportEmbeddingsBin(splits) }
                 toaster?.show(
                     if (removed > 0) "Removed $removed stale embedding${if (removed == 1) "" else "s"}"
                     else "No stale rows to remove"
@@ -308,7 +318,8 @@ class EmbeddingEngine(
             try {
                 val removed = embeddingDb.deleteEmbeddingsByContentHash(contentHashes)
                 logBuffer.append("dupes", "removed $removed duplicate row(s) by hash")
-                runCatching { embeddingDb.exportLegacyMirror() }
+                val splits = preferences.getEmbeddingSplitCount()
+                runCatching { embeddingDb.exportEmbeddingsBin(splits) }
                 toaster?.show(
                     if (removed > 0) "Removed $removed duplicate row${if (removed == 1) "" else "s"}"
                     else "No matching rows to remove"
@@ -367,7 +378,7 @@ class EmbeddingEngine(
                     failed = failed,
                     activeBackend = backend.ifBlank { _status.value.activeBackend },
                     etaSeconds = if (inProgress) {
-                        estimateEtaSeconds((total - processed).coerceAtLeast(0), backend)
+                        estimateEtaSeconds((total - processed).coerceAtLeast(0), backend, batchSplitCount)
                     } else null,
                     // Push #43: surface init-step text. Clear once embedding
                     // moves past init (first onProgress arrives → processed>0
@@ -392,7 +403,7 @@ class EmbeddingEngine(
                     failed = failed,
                     current = filename,
                     activeBackend = backend.ifBlank { _status.value.activeBackend },
-                    etaSeconds = estimateEtaSeconds((total - processed).coerceAtLeast(0), backend),
+                    etaSeconds = estimateEtaSeconds((total - processed).coerceAtLeast(0), backend, batchSplitCount),
                     // Clear init step text once embedding actually starts moving.
                     initStepText = "",
                 )
@@ -450,6 +461,7 @@ class EmbeddingEngine(
                 )
                 scope.launch {
                     try {
+                        preferences.saveLastEmbedSplitCount(batchSplitCount)
                         val res = embeddingDb.recoverPendingIfAny()
                         val recovered = res?.optInt("recovered", 0) ?: 0
                         val totalRows = res?.optInt("totalRows", 0) ?: 0
@@ -460,10 +472,10 @@ class EmbeddingEngine(
                         // (tmp + rename) so a crash mid-write can't
                         // corrupt the existing file. User can copy this
                         // off the device and use it to seed a reinstall.
-                        val ex = embeddingDb.exportLegacyMirror()
+                        val ex = embeddingDb.exportEmbeddingsBin(batchSplitCount)
                         val exRows = ex?.optInt("rowCount", 0) ?: 0
                         val exBytes = ex?.optLong("bytes", 0L) ?: 0L
-                        logBuffer.append("backup", "local_embeddings.json refreshed: $exRows rows, $exBytes bytes")
+                        logBuffer.append("backup", "isaivazhi_embeddings.bin refreshed: $exRows rows, $exBytes bytes")
                     } catch (t: Throwable) {
                         android.util.Log.w("EmbeddingEngine", "post-complete chain failed: ${t.message}")
                         logBuffer.append("error", "post-complete chain failed: ${t.message}")
@@ -507,7 +519,11 @@ class EmbeddingEngine(
      *   - cpu: ~1400 ms/song
      *   - unknown / "": assume ~400 ms (mid-range)
      */
-    private fun estimateEtaSeconds(remainingSongs: Int, backend: String): Long? {
+    private fun estimateEtaSeconds(
+        remainingSongs: Int,
+        backend: String,
+        splitCount: Int = batchSplitCount,
+    ): Long? {
         if (remainingSongs <= 0) return null
         val perSongMs = when {
             backend.contains("fp16", ignoreCase = true) -> 180
@@ -515,6 +531,7 @@ class EmbeddingEngine(
             backend.equals("cpu", ignoreCase = true) -> 1400
             else -> 400
         }
-        return (remainingSongs.toLong() * perSongMs) / 1000L
+        val scaled = (perSongMs * EmbeddingSplitCount.timeMultiplier(splitCount)).toLong()
+        return (remainingSongs.toLong() * scaled) / 1000L
     }
 }

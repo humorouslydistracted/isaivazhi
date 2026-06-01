@@ -66,7 +66,8 @@ public class EmbeddingService {
     private static final int TARGET_SAMPLE_RATE = 48000;
     private static final int WINDOW_SECONDS = 10;
     private static final int WINDOW_SAMPLES = TARGET_SAMPLE_RATE * WINDOW_SECONDS; // 480,000
-    private static final float[] WINDOW_POSITIONS = {0.20f, 0.50f, 0.80f};
+    private volatile float[] windowPositions = EmbeddingWindowConfig.windowPositions(3);
+    private volatile int splitCount = 3;
     private static final int EMBEDDING_DIM = 512;
     private static final int DEFAULT_ORT_THREADS = 2;
     private static final int PLAYBACK_FRIENDLY_ORT_THREADS = 1;
@@ -94,6 +95,17 @@ public class EmbeddingService {
     private volatile boolean nnapiPermanentlyDisabled = false;
 
     public String getActiveBackend() { return activeBackend; }
+
+    /** 3, 5, or 7 — must match tools/embeddings/embedding_config.py. */
+    public void setSplitCount(int count) {
+        splitCount = EmbeddingWindowConfig.normalizeSplitCount(count);
+        windowPositions = EmbeddingWindowConfig.windowPositions(splitCount);
+        Log.i(TAG, "splitCount=" + splitCount + " windows=" + windowPositions.length);
+    }
+
+    public int getSplitCount() {
+        return splitCount;
+    }
 
     // Callback for progress/completion
     public interface PlaybackActivityProvider {
@@ -444,6 +456,9 @@ public class EmbeddingService {
 
             // Load existing pending embeddings so interrupted runs can resume safely.
             JSONObject localEmbeddings = loadLocalEmbeddings();
+            try {
+                localEmbeddings.put("_split_count", splitCount);
+            } catch (Exception ignored) {}
             int processed = 0;
             int failed = 0;
 
@@ -700,7 +715,7 @@ public class EmbeddingService {
             float[] audio = decodeAudio(filePath);
             if (audio == null || audio.length == 0) return null;
 
-            List<float[]> windows = extractWindows(audio);
+            List<float[]> windows = extractWindows(audio, windowPositions);
             List<float[]> embeddings = new ArrayList<>();
 
             for (float[] window : windows) {
@@ -967,9 +982,10 @@ public class EmbeddingService {
             codec.flush();
             float[] first30s = decodeRange(extractor, codec, sampleRate, channels, 0L, hashDurUs);
 
-            // 2. Three 10-second windows at 20 %, 50 %, 80 %.
-            List<float[]> windows = new ArrayList<>(3);
-            for (float pos : WINDOW_POSITIONS) {
+            // 2. Ten-second windows at configured center positions.
+            float[] positions = windowPositions;
+            List<float[]> windows = new ArrayList<>(positions.length);
+            for (float pos : positions) {
                 long centerUs = (long) (durationUs * pos);
                 long startUs = Math.max(0L, centerUs - windowDurUs / 2);
                 long endUs = Math.min(durationUs, startUs + windowDurUs);
@@ -1138,7 +1154,7 @@ public class EmbeddingService {
      * Extract 10-second windows at specified positions (20%, 50%, 80%).
      * For short songs (< 10s), returns a single zero-padded window.
      */
-    private List<float[]> extractWindows(float[] audio) {
+    private List<float[]> extractWindows(float[] audio, float[] positions) {
         List<float[]> windows = new ArrayList<>();
 
         if (audio.length <= WINDOW_SAMPLES) {
@@ -1149,7 +1165,7 @@ public class EmbeddingService {
             return windows;
         }
 
-        for (float pos : WINDOW_POSITIONS) {
+        for (float pos : positions) {
             int center = (int) (audio.length * pos);
             int start = Math.max(0, center - WINDOW_SAMPLES / 2);
             if (start + WINDOW_SAMPLES > audio.length) {
