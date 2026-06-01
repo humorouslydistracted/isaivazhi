@@ -5,10 +5,7 @@ listening behavior. It combines native playback, durable background signal
 capture, and CLAP audio embeddings to recommend music without accounts,
 streaming, tracking, or a server.
 
-Current release: `v3.1.2`
-
 <p align="center">
-  <img src="docs/screenshots/discover.png" width="23%" alt="Discover recommendations">
   <img src="docs/screenshots/library.png" width="23%" alt="Songs library">
   <img src="docs/screenshots/now-playing.png" width="23%" alt="Now playing">
   <img src="docs/screenshots/song-actions.png" width="23%" alt="Song actions">
@@ -27,8 +24,14 @@ dislikes, playlists, and recommendation state on the device.
 - Offline recommendation engine that blends current song, session taste,
   long-term taste, explicit feedback, skip behavior, and CLAP similarity.
 - Background-safe playback signal capture through a Media3 `MediaSessionService`.
-- Discover surfaces for "For You", "Because You Played", similar tracks, and
-  underexplored parts of the library.
+- **Similar Songs row** in Now Playing — AI surfaces tracks similar to the
+  current song; tap to play, long-press to queue.
+- **AI is invisible by design** — recommendation work runs entirely in the
+  background; UI never lags, stalls, or shows AI loading states.
+- **Lockscreen Refresh button** — rebuilds the upcoming queue with fresh AI
+  recommendations without unlocking the phone.
+- **Refresh spinner** — NowPlaying and MiniPlayer show a subtle progress
+  indicator only while the AI refresh is actively running.
 - Taste Signal page with audit-style playback evidence, tuning controls, and
   visible positive/negative signals.
 - Playlist, album, Up Next, favorites, disliked songs, search, and batch delete
@@ -101,6 +104,35 @@ Debug APK:
 native/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## AI Architecture
+
+The recommendation engine runs in a separate `:ai` process
+(`EmbeddingForegroundService`) so that vector operations never block the UI
+thread. The UI process talks to it over a command bus; results arrive
+asynchronously and are applied without any visible stall.
+
+### How recommendations surface
+
+| Surface | Trigger | What it shows |
+| --- | --- | --- |
+| Now Playing — Similar Songs row | Current track changes | Top 10 tracks most similar to the current song (CLAP cosine similarity) |
+| Up Next queue | Refresh button (NowPlaying, MiniPlayer, lockscreen) | 50-track blended queue from current song + session taste + long-term taste |
+| Queue end | Last track of an AI or Library queue | Silently appends 50 fresh AI picks so playback never stops |
+
+### Refresh button
+
+The Refresh button appears in three places:
+- **Now Playing screen** — top-right area, next to the track title
+- **Mini Player** — right side of the persistent bottom bar
+- **Lockscreen / notification** — alongside the Favorite button (SLOT_OVERFLOW)
+
+Tapping Refresh replaces the upcoming queue with a fresh AI-blended selection
+based on what you are currently playing and your long-term taste. Any songs you
+manually queued with "Play Next" are preserved at the front.
+
+A small circular progress indicator is visible in NowPlaying and MiniPlayer
+while the refresh is running. It disappears automatically when done.
+
 ## Embeddings
 
 The player works as a local music player without precomputed embeddings. The
@@ -132,9 +164,7 @@ embeddings. They are not required for normal playback.
 ## Status
 
 This is an active personal/open-source project. The current codebase is the
-native Kotlin/Compose app in `native/`; older Capacitor-era development notes
-were removed from the public tree to keep the repository focused on the current
-implementation.
+native Kotlin/Compose app in `native/`.
 
 ## License
 
