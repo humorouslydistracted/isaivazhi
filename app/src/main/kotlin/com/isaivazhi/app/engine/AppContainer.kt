@@ -186,6 +186,35 @@ class AppContainer(private val appContext: Context) {
     val embedding: EmbeddingEngine by lazy { EmbeddingEngine(appContext, embeddingDb, toaster) }
 
     /**
+     * Bugfix 2026-06-01d: process-lifetime library snapshot. Originally
+     * the song list lived only as a Compose state inside MainActivity,
+     * which meant background engines (like RecommendationCache) couldn't
+     * see it when the Activity was destroyed on the lockscreen. Now any
+     * loader (IsaiVazhiApp warm path or MainActivity's LaunchedEffect)
+     * publishes the result here so all process-lifetime code can read it.
+     */
+    val library: kotlinx.coroutines.flow.MutableStateFlow<List<Song>> =
+        kotlinx.coroutines.flow.MutableStateFlow(emptyList())
+
+    /**
+     * Bugfix 2026-06-01d: process-lifetime scope for engines that must
+     * keep working after MainActivity is destroyed (lockscreen precompute,
+     * etc.). Uses Default dispatcher so embedding-DB calls don't block
+     * Main; the EmbeddingDbFacade itself serializes onto its own
+     * HandlerThread so dispatcher choice here is just for orchestration.
+     */
+    val applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Bugfix 2026-06-01d: proactive recommendation precompute. See
+     * RecommendationCache kdoc for the full rationale. Must be started
+     * explicitly (Application class calls `start()` after warm).
+     */
+    val recommendationCache: RecommendationCache by lazy {
+        RecommendationCache(this, applicationScope)
+    }
+
+    /**
      * Push #57: filepaths the user has chosen to skip embedding for. The
      * AI page's Pending list excludes these so a permanently-failing song
      * (e.g. an unusual FLAC variant Android's MediaExtractor can't open)

@@ -199,7 +199,14 @@ class MainActivity : ComponentActivity() {
         // lands in the persisted Debug Logs file before the process dies.
         DebugLogCapture.installCrashHandler(applicationContext)
 
-        container = AppContainer(applicationContext)
+        // Bugfix 2026-06-01c: reuse the Application-scoped AppContainer
+        // so the eager DB warm done in IsaiVazhiApp.onCreate is visible
+        // to MainActivity. Creating a fresh AppContainer here would have
+        // re-instantiated `embeddingDb` (a `by lazy` field) and undone
+        // the warm. Fallback to a new container only if (in tests or
+        // some edge teardown path) the app instance isn't IsaiVazhiApp.
+        container = (application as? IsaiVazhiApp)?.container
+            ?: AppContainer(applicationContext)
 
         // Push #77 diagnostic: log every Activity onCreate with the
         // process-cold vs Activity-cold distinction surfaced.
@@ -221,10 +228,25 @@ class MainActivity : ComponentActivity() {
         )
 
         CoroutineScope(Dispatchers.Default).launch {
-            // Phase A instrumentation (2026-06-01): wrap migrate with
-            // PERF_MIGRATE_START / _DONE so we can attribute the cold-start
-            // delay to either migrate itself, the FIRST DB call's Room/
-            // sqlite-vec init cost, or the subsequent stats fetch.
+            // Bugfix 2026-06-01c: skip migrate when the DataStore cache
+            // proves the DB is already populated. The migrate call is a
+            // no-op in that case (reason="db_already_populated") but the
+            // FIRST DB call after activity recreate still pays ~22s of
+            // sqlite-vec/Room re-init cost on the single
+            // EmbeddingDbWorker thread. Skipping it here keeps the worker
+            // free for the recommend pipeline triggered by lockscreen
+            // Refresh taps. The Application class (IsaiVazhiApp) warms
+            // the DB eagerly once per process via a stats() call.
+            val cached = try { container.preferences.cachedEmbedStats() } catch (_: Throwable) { null }
+            if (cached != null && cached.rowCount > 0) {
+                container.activityLog.log(
+                    category = "engine",
+                    type = "PERF_MIGRATE_SKIPPED",
+                    message = "skip migrateFromLegacy (cached rowCount=${cached.rowCount})",
+                    data = mapOf("cachedRowCount" to cached.rowCount),
+                )
+                return@launch
+            }
             val migStart = System.currentTimeMillis()
             container.activityLog.log(
                 category = "engine",
@@ -370,6 +392,14 @@ private fun AppRoot(container: AppContainer) {
     val notificationsPermission = rememberNotificationsPermissionGate(ctx)
     var notifGateDismissed by remember { mutableStateOf(false) }
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
+    // Bugfix 2026-06-01d: mirror songs to the process-lifetime container
+    // so engines that run outside the Activity (RecommendationCache) can
+    // see the library. Covers every reload site — invalidate-on-import,
+    // settings rescan, library-changed broadcast — without sprinkling
+    // assignments through each callsite.
+    LaunchedEffect(songs) {
+        if (songs.isNotEmpty()) container.library.value = songs
+    }
     var scanError by remember { mutableStateOf<String?>(null) }
     // Phase 4 (2026-06-01): pager starts on Songs (index 0 after Discover
     // removal). A LaunchedEffect below restores the persisted last tab on
@@ -450,6 +480,17 @@ private fun AppRoot(container: AppContainer) {
                         )
                         logLedgerState(container, "foreground_resume_after_drain")
                     }
+                }
+            }
+            // Bugfix 2026-06-01g: fire a precompute the moment the Activity
+            // moves to background. mmap pages are still hot at this instant
+            // (eviction starts ~1-2s later). This guarantees the cache is
+            // freshly populated when the user taps Refresh on the lockscreen,
+            // and the subsequent pop_refill runs against the still-warm pages
+            // kept alive by the 30s keepWarmRunnable in Media3PlaybackService.
+            if (event == Lifecycle.Event.ON_STOP && permission.granted) {
+                runCatching {
+                    container.recommendationCache.precomputeNow(reason = "on_stop")
                 }
             }
         }
@@ -641,6 +682,10 @@ private fun AppRoot(container: AppContainer) {
                     data = mapOf("permissionGranted" to permission.granted),
                 )
                 songs = LibraryCache.loadOrScan(ctx)
+                // Bugfix 2026-06-01d: publish to container so the
+                // process-lifetime RecommendationCache can see the
+                // library even after the Activity is destroyed.
+                container.library.value = songs
                 val libElapsed = System.currentTimeMillis() - libStartMs
                 container.activityLog.log(
                     category = "engine",
@@ -700,26 +745,40 @@ private fun AppRoot(container: AppContainer) {
                 embeddingsDim = dim
                 vecExtLoaded = ext
             }
-            // Stage 2 — full refresh (also populates filename/filepath sets
-            // the AI management page needs). Runs in parallel but the UI
-            // critical path already unblocked at stage 1.
-            refreshDbStats(container) { rc, dim, ext, fns, fps ->
-                embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
-                embeddedFilenames = fns
-                embeddedFilepaths = fps
-                val elapsed = System.currentTimeMillis() - dbStartMs
+            // Bugfix 2026-06-01c: stage 2 (full refreshDbStats with
+            // allFilenames + allFilepaths) is HEAVY — 3 sequential queries
+            // on the single EmbeddingDbWorker thread, ~20s when cold.
+            // It blocks the recommend pipeline behind it. The filename /
+            // filepath sets are ONLY used by the AI management page; we
+            // can lazy-load them when that page actually opens. Skip the
+            // call here when cache hit; cold first launch (no cache) still
+            // runs it to populate sets for the initial AI page render.
+            if (cached.rowCount <= 0) {
+                refreshDbStats(container) { rc, dim, ext, fns, fps ->
+                    embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
+                    embeddedFilenames = fns
+                    embeddedFilepaths = fps
+                    val elapsed = System.currentTimeMillis() - dbStartMs
+                    container.activityLog.log(
+                        category = "engine",
+                        type = "PERF_DB_DONE",
+                        message = "refreshDbStats done in ${elapsed}ms (rows=$rc dim=$dim vecExt=$ext)",
+                        data = mapOf(
+                            "rowCount" to rc,
+                            "dim" to dim,
+                            "vecExtLoaded" to ext,
+                            "embeddedFilenames" to fns.size,
+                            "embeddedFilepaths" to fps.size,
+                            "elapsedMs" to elapsed,
+                        ),
+                    )
+                }
+            } else {
                 container.activityLog.log(
                     category = "engine",
-                    type = "PERF_DB_DONE",
-                    message = "refreshDbStats done in ${elapsed}ms (rows=$rc dim=$dim vecExt=$ext)",
-                    data = mapOf(
-                        "rowCount" to rc,
-                        "dim" to dim,
-                        "vecExtLoaded" to ext,
-                        "embeddedFilenames" to fns.size,
-                        "embeddedFilepaths" to fps.size,
-                        "elapsedMs" to elapsed,
-                    ),
+                    type = "PERF_DB_STATS_DEFERRED",
+                    message = "skip startup refreshDbStats (cached) — filenames/filepaths lazy-load on AI page open",
+                    data = mapOf("cachedRowCount" to cached.rowCount),
                 )
             }
             artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) }
@@ -1116,6 +1175,34 @@ private fun AppRoot(container: AppContainer) {
         // so the result reflects only what's ready so far.
         if (container.playback.refreshBusy.value) return@refreshUpcomingWithAI
         container.playback.setRefreshBusy(true)
+
+        // Bugfix 2026-06-01d: cache-pop fast path. RecommendationCache
+        // continuously precomputes a tail as the current song changes
+        // (process-lifetime, so it works even when MainActivity has been
+        // destroyed during a long lockscreen). If a tail is ready we
+        // serve it instantly — no sqlite-vec mmap reload, no Recommender
+        // call. Falls through to the live-compute path only on cache miss.
+        val cachedTail = container.recommendationCache.popTail()
+        if (cachedTail != null && cachedTail.isNotEmpty()) {
+            val playNextSet = playbackState.playNextFilenames
+            val byFn = songs.associateBy { it.filename }
+            val playNextSongs = playNextSet.mapNotNull { byFn[it] }
+            val finalUpcoming = playNextSongs + cachedTail.filter { it.filename !in playNextSet && it.filename != mediaId }
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_CACHE_HIT",
+                message = "Served upcoming from RecommendationCache (size=${cachedTail.size})",
+                data = mapOf("tailSize" to cachedTail.size, "mediaId" to mediaId),
+            )
+            container.toaster.show("Up Next refreshed")
+            if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
+                newUpcoming = finalUpcoming,
+                newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+            )
+            container.playback.setRefreshBusy(false)
+            return@refreshUpcomingWithAI
+        }
+
         val embStatus = container.embedding.status.value
         if (embStatus.inProgress && embStatus.total > 0) {
             container.toaster.show(
@@ -1123,7 +1210,28 @@ private fun AppRoot(container: AppContainer) {
                     "refresh uses what's ready."
             )
         }
-        coroutineScope.launch {
+        // Bugfix 2026-06-01b: dispatch on Dispatchers.Default, NOT the
+        // default Compose rememberCoroutineScope dispatcher
+        // (AndroidUiDispatcher.Main). That dispatcher runs via Choreographer
+        // frame callbacks; while the activity is STOPPED (screen locked) no
+        // frames tick, so a launch body queued there does not execute until
+        // the user unlocks. Lockscreen Refresh taps were appearing to take
+        // 10s–60s because the recommend work was deferred until unlock.
+        // Running on Dispatchers.Default decouples the recommend pipeline
+        // from the UI lifecycle.
+        val dispatchStartedAt = android.os.SystemClock.elapsedRealtime()
+        coroutineScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val dispatchLatencyMs = android.os.SystemClock.elapsedRealtime() - dispatchStartedAt
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_DISPATCH_START",
+                message = "refreshUpcomingWithAI body dispatched",
+                data = mapOf(
+                    "dispatchLatencyMs" to dispatchLatencyMs,
+                    "mediaId" to mediaId,
+                ),
+            )
+            val recommendStartedAt = android.os.SystemClock.elapsedRealtime()
             try {
             val playNextSet = playbackState.playNextFilenames
             val byFn = songs.associateBy { it.filename }
@@ -1154,15 +1262,36 @@ private fun AppRoot(container: AppContainer) {
                 songs.filter { it.filePath != null && it.filename !in excludeFns }
                     .shuffled().take(50)
             }
+            val recommendElapsedMs = android.os.SystemClock.elapsedRealtime() - recommendStartedAt
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_RECOMMEND_DONE",
+                message = "recommendUpcoming returned ${newTail.size} tracks",
+                data = mapOf(
+                    "elapsedMs" to recommendElapsedMs,
+                    "tailSize" to newTail.size,
+                    "blend" to (blendedTriple?.third ?: "n/a"),
+                ),
+            )
             container.toaster.show("Up Next refreshed (blend=${blendedTriple?.third ?: "current"})")
             val finalUpcoming = playNextSongs + newTail
             android.util.Log.i(
                 "QueueOp",
                 "Refresh: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
             )
+            val replaceStartedAt = android.os.SystemClock.elapsedRealtime()
             if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
                 newUpcoming = finalUpcoming,
                 newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+            )
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_REPLACE_DONE",
+                message = "replaceUpcoming done",
+                data = mapOf(
+                    "elapsedMs" to (android.os.SystemClock.elapsedRealtime() - replaceStartedAt),
+                    "finalUpcomingSize" to finalUpcoming.size,
+                ),
             )
             } finally {
                 container.playback.setRefreshBusy(false)
@@ -1177,6 +1306,11 @@ private fun AppRoot(container: AppContainer) {
     // UI process; the service is intentionally state-free for the AI side.
     LaunchedEffect(Unit) {
         container.playback.refreshRequests.collect {
+            container.activityLog.log(
+                category = "notification",
+                type = "LOCKSCREEN_REFRESH_TAP",
+                message = "Lockscreen/notification Refresh tap received by UI",
+            )
             refreshUpcomingWithAI()
         }
     }

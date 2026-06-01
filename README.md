@@ -5,12 +5,6 @@ listening behavior. It combines native playback, durable background signal
 capture, and CLAP audio embeddings to recommend music without accounts,
 streaming, tracking, or a server.
 
-<p align="center">
-  <img src="docs/screenshots/library.png" width="23%" alt="Songs library">
-  <img src="docs/screenshots/now-playing.png" width="23%" alt="Now playing">
-  <img src="docs/screenshots/song-actions.png" width="23%" alt="Song actions">
-</p>
-
 ## Why It Exists
 
 Most music apps optimize for streaming catalogs. IsaiVazhi is built for people
@@ -32,6 +26,9 @@ dislikes, playlists, and recommendation state on the device.
   recommendations without unlocking the phone.
 - **Refresh spinner** — NowPlaying and MiniPlayer show a subtle progress
   indicator only while the AI refresh is actively running.
+- **Fast cold-start vector warm** — all 2455 embedding vectors are loaded into
+  the JVM heap from a single SQLite Cursor pass at startup (~150ms); every
+  subsequent recommendation call is heap-only, no disk I/O.
 - Taste Signal page with audit-style playback evidence, tuning controls, and
   visible positive/negative signals.
 - Playlist, album, Up Next, favorites, disliked songs, search, and batch delete
@@ -54,21 +51,37 @@ dislikes, playlists, and recommendation state on the device.
 ## Repository Layout
 
 ```text
-.
-|-- native/                  # Android app source
-|   |-- app/src/main/kotlin/ # Compose UI and Kotlin engines
-|   |-- app/src/main/java/   # Media3 service and embedding database bridge
-|   |-- app/src/main/cpp/    # Native vector acceleration
-|   `-- gradle/              # Gradle wrapper
-|-- tools/embeddings/        # Kaggle, Colab, local, and merge tools
-|-- docs/
-|   |-- architecture.md
-|   `-- screenshots/
-|-- LICENSE
-`-- README.md
+app/
+├── src/main/
+│   ├── java/com/isaivazhi/app/
+│   │   ├── EmbeddingDb.java              # SQLite embedding store (sqlite-vec)
+│   │   ├── EmbeddingDbManager.java       # Worker-thread DB wrapper
+│   │   ├── EmbeddingService.java         # Background embedding foreground service
+│   │   ├── Media3PlaybackService.java    # Media3 MediaSessionService
+│   │   └── ...                           # Other Java service/contract classes
+│   ├── kotlin/com/isaivazhi/app/
+│   │   ├── IsaiVazhiApp.kt               # Application class — startup warm sequence
+│   │   ├── MainActivity.kt               # Single activity host
+│   │   ├── engine/
+│   │   │   ├── EmbeddingDbFacade.kt      # Coroutine façade + JVM heap vector cache
+│   │   │   ├── Recommender.kt            # Core MMR recommendation logic
+│   │   │   ├── RecommendationCache.kt    # Background precompute cache
+│   │   │   ├── PlaybackEngine.kt         # Playback state + queue management
+│   │   │   ├── PlaybackSignalLedger.kt   # Durable cross-process signal capture
+│   │   │   ├── TasteEngine.kt            # Long-term taste profile
+│   │   │   ├── SessionEngine.kt          # Per-session taste
+│   │   │   ├── LibraryCache.kt           # Song library JSON cache
+│   │   │   └── ...                       # Favorites, history, playlists, etc.
+│   │   └── ui/screens/                   # Compose screens
+│   ├── cpp/
+│   │   ├── embedding_native.cpp          # NEON-accelerated dot-product
+│   │   └── CMakeLists.txt
+│   └── AndroidManifest.xml
+├── build.gradle.kts
+build.gradle.kts
+settings.gradle.kts
+gradle.properties
 ```
-
-See [docs/architecture.md](docs/architecture.md) for a deeper overview.
 
 ## Install
 
@@ -86,38 +99,52 @@ Requirements:
 
 ```bash
 git clone https://github.com/humorouslydistracted/isaivazhi.git
-cd isaivazhi
+cd isaivazhi/native
 
 # Point this at your local Android SDK.
-echo "sdk.dir=/path/to/Android/Sdk" > native/local.properties
+echo "sdk.dir=/path/to/Android/Sdk" > local.properties
 
-# Point JAVA_HOME at Android Studio's bundled JBR or any compatible JDK 17+.
-export JAVA_HOME="/path/to/Android Studio/jbr"
-
-cd native
 ./gradlew :app:assembleDebug
 ```
 
 Debug APK:
 
 ```text
-native/app/build/outputs/apk/debug/app-debug.apk
+app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## AI Architecture
 
-The recommendation engine runs in a separate `:ai` process
-(`EmbeddingForegroundService`) so that vector operations never block the UI
-thread. The UI process talks to it over a command bus; results arrive
-asynchronously and are applied without any visible stall.
+### Startup warm sequence
+
+On cold start, `IsaiVazhiApp` runs a one-time warm on a background
+`CoroutineScope`:
+
+1. `LibraryCache.loadOrScan` — deserialises the song library JSON (~1.2s).
+2. `EmbeddingDbFacade.fullWarmFromDb()` — opens a single SQLite `Cursor` over
+   the `embeddings` table and decodes every `vec` blob directly into
+   `float[]` in a single pass. For a 2455-row × 512-dim library this takes
+   **~150ms** and populates three `ConcurrentHashMap` caches:
+   - `vecHeapCache` — `hash → float[]`
+   - `hashToMetaCache` — `hash → HeapMeta(filename, filepath)`
+   - `filenameToHashCache` — `filename → hash`
+3. `RecommendationCache.start()` is started only **after** the warm completes,
+   so the first recommendation query always hits the heap and never waits on
+   disk I/O or mmap page faults.
+
+After warm, every `nearestNeighbors` call is pure in-memory arithmetic; no DB
+access, no mmap, no blocking. Background precomputes consistently complete in
+**150–600ms** regardless of how long the app has been backgrounded (previously
+27–32s when vectors were mmap-backed and the kernel had evicted the pages).
 
 ### How recommendations surface
 
 | Surface | Trigger | What it shows |
 | --- | --- | --- |
-| Now Playing — Similar Songs row | Current track changes | Top 10 tracks most similar to the current song (CLAP cosine similarity) |
+| Now Playing — Similar Songs row | Current track changes | Top 10 tracks most similar to the current song (cosine similarity) |
 | Up Next queue | Refresh button (NowPlaying, MiniPlayer, lockscreen) | 50-track blended queue from current song + session taste + long-term taste |
 | Queue end | Last track of an AI or Library queue | Silently appends 50 fresh AI picks so playback never stops |
+| Background (on_stop) | App backgrounded while playing | Precomputes next 50-track queue from background thread; ~180–316ms |
 
 ### Refresh button
 
@@ -133,13 +160,25 @@ manually queued with "Play Next" are preserved at the front.
 A small circular progress indicator is visible in NowPlaying and MiniPlayer
 while the refresh is running. It disappears automatically when done.
 
+### Key classes
+
+| Class | Layer | Responsibility |
+| --- | --- | --- |
+| `EmbeddingDb` | Java / SQLite | Raw DB operations; `loadAllVecsIntoHeap` bulk-loads all rows in one Cursor pass |
+| `EmbeddingDbManager` | Java | Worker-thread serialisation of all DB ops via `HandlerThread` |
+| `EmbeddingDbFacade` | Kotlin | Coroutine façade; owns JVM heap caches; `fullWarmFromDb` drives cold-start warm |
+| `Recommender` | Kotlin | MMR-based selection blending cosine similarity, taste scores, recency decay |
+| `RecommendationCache` | Kotlin | Async background cache; keeps a warm 50-track precomputed tail |
+| `PlaybackSignalLedger` | Kotlin | Cross-process durable signal capture; survives media service restarts |
+| `TasteEngine` / `SessionEngine` | Kotlin | Long-term and per-session taste vectors |
+
 ## Embeddings
 
 The player works as a local music player without precomputed embeddings. The
 recommendation engine becomes much more useful after importing CLAP embeddings
 for the library.
 
-Use the scripts in [tools/embeddings](tools/embeddings):
+Use the scripts in `tools/embeddings/`:
 
 - Kaggle GPU workflow: `kaggle_embedding_generator.py`
 - Google Colab workflow: `colab_embedding_generator.py`
@@ -163,8 +202,17 @@ embeddings. They are not required for normal playback.
 
 ## Status
 
-This is an active personal/open-source project. The current codebase is the
-native Kotlin/Compose app in `native/`.
+Active personal/open-source project. The repository contains the full native
+Kotlin/Compose Android app.
+
+Recent changes:
+- **06-01k** — Fixed zero-vector warm bug: `fullWarmFromDb` replaces the old
+  chunk-based JSON path; single Cursor decode eliminates 27–32s background
+  stalls. Background precomputes now consistently 150–600ms.
+- **06-01j** — Fixed warm-vs-observer race: full warm completes before
+  `RecommendationCache` starts observing song changes.
+- **UI** — Lockscreen Refresh button, AI spinner, Similar Songs row,
+  last-tab persistence.
 
 ## License
 

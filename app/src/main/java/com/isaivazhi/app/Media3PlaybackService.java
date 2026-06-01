@@ -74,6 +74,12 @@ public class Media3PlaybackService extends MediaSessionService {
             Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    // Bugfix 2026-06-01g: mmap pages of sqlite-vec index evict within 1-2s of
+    // Activity ON_STOP (lockscreen). 3 minutes was way too coarse — pages were
+    // long gone before the first ping. 30s keeps them resident through quiet
+    // lockscreen stretches. Cost: ~150ms DB ping every 30s while backgrounded.
+    private static final long KEEP_WARM_INTERVAL_MS = 30 * 1000L; // 30 seconds
+
     private final Runnable progressRunnable = new Runnable() {
         @Override
         public void run() {
@@ -82,6 +88,30 @@ public class Media3PlaybackService extends MediaSessionService {
                 emitAudioTimeUpdate();
                 mainHandler.postDelayed(this, PROGRESS_INTERVAL_MS);
             }
+        }
+    };
+
+    /**
+     * Bugfix 2026-06-01c: keep the sqlite-vec vector index warm while the
+     * service is alive (during lockscreen / backgrounded). The OS evicts
+     * the mmap'd index pages when the app backgrounds, costing ~23s on
+     * the next Refresh tap. Firing a tiny nearestNeighbors query every
+     * 3 minutes keeps those pages hot so Refresh is instant.
+     */
+    private final Runnable keepWarmRunnable = new Runnable() {
+        @Override
+        public void run() {
+            String seed = lastKnownMediaId;
+            if (!seed.isEmpty()) {
+                EmbeddingDbManager.get(Media3PlaybackService.this)
+                    .nearestNeighborsForFilename(
+                        seed,
+                        1,
+                        java.util.Collections.emptyList(),
+                        (result, err) -> Log.d(TAG, "keep-warm ping done for " + seed)
+                    );
+            }
+            mainHandler.postDelayed(this, KEEP_WARM_INTERVAL_MS);
         }
     };
 
@@ -159,6 +189,9 @@ public class Media3PlaybackService extends MediaSessionService {
                 .build();
         setMediaNotificationProvider(new PlaybackNotificationProvider());
         refreshNotificationUiState();
+        // Schedule the first keep-warm after 60s so the app has time to
+        // fully start and pay the initial DB init cost before we ping.
+        mainHandler.postDelayed(keepWarmRunnable, 60_000L);
     }
 
     @Override
@@ -170,6 +203,7 @@ public class Media3PlaybackService extends MediaSessionService {
     public void onDestroy() {
         Log.i(TAG, "onDestroy: Media3 playback service stopping");
         stopProgressUpdates();
+        mainHandler.removeCallbacks(keepWarmRunnable);
         connectedControllers.clear();
         if (mediaSession != null) {
             mediaSession.release();
@@ -874,6 +908,12 @@ public class Media3PlaybackService extends MediaSessionService {
         mainHandler.removeCallbacks(progressRunnable);
     }
 
+    /** Restart the keep-warm schedule (e.g. after a song change). */
+    private void resetKeepWarm() {
+        mainHandler.removeCallbacks(keepWarmRunnable);
+        mainHandler.postDelayed(keepWarmRunnable, KEEP_WARM_INTERVAL_MS);
+    }
+
     private long currentPositionMs() {
         if (player == null) return lastKnownPositionMs;
         long pos = Math.max(0L, player.getCurrentPosition());
@@ -1132,6 +1172,10 @@ public class Media3PlaybackService extends MediaSessionService {
         lastKnownTitle = item.title;
         lastKnownArtist = item.artist;
         lastKnownAlbum = item.album;
+        // Bugfix 2026-06-01g: do NOT reset keep-warm on song change. With
+        // KEEP_WARM_INTERVAL_MS=30s and rapid skipping, resetting would mean
+        // the ping never fires. The keep-warm schedule runs independently of
+        // song changes — song_change precompute warms naturally on its own.
     }
 
     private void updateLastKnownMediaSnapshot() {
@@ -1278,13 +1322,19 @@ public class Media3PlaybackService extends MediaSessionService {
         // 2026-06-01: Refresh Up Next — visible on lockscreen + notification.
         // ICON_REPEAT_ALL was semantically wrong (renders as the Repeat
         // toggle's loop glyph); R.drawable.ic_refresh_24 is the Material
-        // Refresh symbol. Busy state → "Refreshing…" + disabled.
-        boolean refreshEnabled = hasCurrentMedia && !refreshBusy;
+        // Refresh symbol.
+        //
+        // Bugfix 2026-06-01b: do NOT toggle enabled=false while refreshBusy.
+        // Android's lockscreen MediaStyle renderer DROPS disabled overflow
+        // CommandButtons rather than greying them, so the user sees the
+        // Refresh button "vanish" mid-refresh. The reentrancy guard in
+        // MainActivity.refreshUpcomingWithAI already prevents double-runs;
+        // a stale tap during refresh is harmless.
         buttons.add(new CommandButton.Builder(CommandButton.ICON_UNDEFINED)
                 .setSessionCommand(PlaybackCommandContract.command(PlaybackCommandContract.CMD_NOTIFICATION_REFRESH_QUEUE))
                 .setCustomIconResId(R.drawable.ic_refresh_24)
-                .setDisplayName(refreshBusy ? "Refreshing…" : "Refresh Up Next")
-                .setEnabled(refreshEnabled)
+                .setDisplayName("Refresh Up Next")
+                .setEnabled(hasCurrentMedia)
                 .setSlots(CommandButton.SLOT_OVERFLOW)
                 .build());
 
