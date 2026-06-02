@@ -185,7 +185,17 @@ Use the scripts in `tools/embeddings/`:
 - Local CUDA/CPU workflow: `local_embedding_generator.py`
 - Strict merge/validation: `merge_local_embeddings.py`
 
-The generated `local_embeddings.json` can be imported from the app's AI page.
+Primary output is now **`isaivazhi_embeddings.bin`** (IVZ1), a compact portable
+format that imports much faster than legacy JSON backups.
+
+Quick embedding flow for users:
+
+1. Generate embeddings on Local / Kaggle / Colab (recommended split = 7).
+2. Copy `isaivazhi_embeddings.bin` to your phone.
+3. Import from Settings or the AI page.
+
+The app remains fully local and private: no cloud recommendation API, no user
+accounts, and no analytics dependency for playback/recommendations.
 
 ## Privacy
 

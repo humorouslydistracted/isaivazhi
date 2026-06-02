@@ -1,44 +1,71 @@
-# Embedding Tools
+# Embedding Tools (Bin-First)
 
-Scripts produce **isaivazhi_embeddings.bin** (IVZ1) for fast import into the app.
-Legacy **local_embeddings.json** is still supported but slow (~25 MB, 1–2 min import).
+All generators now target the same outcome:
 
-## Convert existing JSON (no re-embedding)
+- `local_embeddings.json` (resume/checkpoint)
+- `isaivazhi_embeddings.bin` (**final import file for app**)
+
+Python baseline across environments: **3.12**.
+
+## Minimal Inputs
+
+Most users only need:
+
+1. `songs_dir` — where your songs are in that environment
+2. `splits` — `7` recommended for your quality-first one-time run
+
+`phone_base` defaults to `/storage/emulated/0/Music`.
+
+## Quick Start
+
+### Local (Windows / GTX 1650)
+
+Use the guided flow in **[LAPTOP_EMBED.md](LAPTOP_EMBED.md)**.
+
+### Kaggle (private dataset, GPU)
 
 ```bash
-cd tools/embeddings
-python json_to_ivz.py ../../local_embeddings.json ../../isaivazhi_embeddings.bin --verify
+pip install -q numpy==1.26.4 laion-clap librosa soundfile mutagen
+pip install -q torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+python tools/embeddings/kaggle_embedding_generator.py --songs-dir /kaggle/input/your-private-dataset --splits 7
 ```
 
-Copy `isaivazhi_embeddings.bin` to the phone and import from Settings or the AI page.
+Output file: `/kaggle/working/isaivazhi_embeddings.bin`
 
-## IVZ1 format
+### Colab (GPU)
 
-Single file: magic `IVZ1`, header, small metadata JSON (`entries`, `pathIndex`, optional `splitCount`), then float32 LE vectors (512-dim CLAP, row-major).
+```bash
+pip install -q numpy==1.26.4 laion-clap librosa soundfile mutagen
+pip install -q torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+python tools/embeddings/colab_embedding_generator.py --songs-dir /content/drive/MyDrive/isaivazhi_songs --splits 7
+```
 
-## Split count (3 / 5 / 7)
+Output file: `/content/isaivazhi_embeddings.bin`
 
-Each song uses **N × 10 s** CLAP windows (not one full-file pass). Positions are shared in `embedding_config.py` and `EmbeddingWindowConfig.java`:
+## CPU Fallback
 
-| Splits | Window centers (fraction of duration) |
+If CUDA is unavailable, scripts continue on CPU and print a clear warning at startup.
+
+## Split Count (3 / 5 / 7)
+
+Window centers are shared in `embedding_config.py`:
+
+| Splits | Positions |
 | --- | --- |
-| 3 | 20%, 50%, 80% (legacy Colab/mobile) |
+| 3 | 20%, 50%, 80% |
 | 5 | 1/6, 2/6, 3/6, 4/6, 5/6 |
 | 7 | 1/8 … 7/8 |
 
-- **Mobile:** AI & Library page → pick 3, 5, or 7 before embedding.
-- **Python:** `json_to_ivz.py … --splits 7` tags the IVZ meta (vectors unchanged on convert).
-- **Generators:** pass `--splits 3|5|7` when re-embedding (Colab/Kaggle/local scripts should import `embedding_config.window_positions`).
+Use the same split count in the app import/runtime.
 
-Do not mix 3-split and 7-split vectors in one library — re-embed everything after changing.
+## Folder Rename Concern (Phone Path)
 
-## Generators
+Embeddings are based on audio content hash, not folder name.  
+`filepath` is stored for fast matching. If you later rename top-level folders, re-import + relink usually recovers mapping without full re-embed.
 
-| Script | Use case |
-| --- | --- |
-| `local_embedding_generator.py` | Desktop / CUDA |
-| `colab_embedding_generator.py` | Google Colab |
-| `kaggle_embedding_generator.py` | Kaggle GPU |
-| `merge_local_embeddings.py` | Merge two JSON backups (IVZ merge: use `ivz_format` + script update) |
+## Convert Existing JSON (No Re-Embedding)
 
-Generators will write `.bin` by default once updated; until then use `json_to_ivz.py` after JSON generation.
+```bash
+cd tools/embeddings
+python json_to_ivz.py ../../local_embeddings.json ../../isaivazhi_embeddings.bin --splits 7 --verify
+```
