@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -24,6 +25,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.ui.songHasEmbedding
 
 @Composable
 fun AlbumsScreen(
@@ -41,7 +44,9 @@ fun AlbumsScreen(
     // Push #59: filepath-based red-dot lookup (was filename, which
     // misclassified songs with DISPLAY_NAME drift).
     embeddedFilepaths: Set<String> = emptySet(),
+    embeddingsRowCount: Int? = null,
     initialExpandedAlbum: String? = null,
+    revealRequestId: Int = 0,
     onPlayAlbum: (albumTracks: List<Song>, startIndex: Int) -> Unit,
     onSongLongPress: (Song) -> Unit = {},
     // Push #62: album-level long-press → opens a menu (Play / Shuffle /
@@ -53,8 +58,16 @@ fun AlbumsScreen(
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     val albums = remember(songs) { groupIntoAlbums(songs) }
-    var expandedAlbum by remember(initialExpandedAlbum) {
-        mutableStateOf(initialExpandedAlbum)
+    var expandedAlbum by remember { mutableStateOf<String?>(null) }
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(initialExpandedAlbum, revealRequestId, albums) {
+        val target = initialExpandedAlbum ?: return@LaunchedEffect
+        val idx = albums.indexOfFirst { it.name == target }
+        if (idx >= 0) {
+            expandedAlbum = target
+            runCatching { listState.animateScrollToItem(idx) }
+        }
     }
 
     if (albums.isEmpty()) {
@@ -72,6 +85,7 @@ fun AlbumsScreen(
     }
 
     LazyColumn(
+        state = listState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = contentPadding,
     ) {
@@ -89,7 +103,11 @@ fun AlbumsScreen(
                         index = i + 1,
                         track = t,
                         isCurrent = t.filename == currentMediaId,
-                        hasEmbedding = embeddedFilepaths.isEmpty() || t.filePath in embeddedFilepaths,
+                        hasEmbedding = songHasEmbedding(
+                            filePath = t.filePath,
+                            embeddingsRowCount = embeddingsRowCount,
+                            embeddedFilepaths = embeddedFilepaths,
+                        ),
                         onTap = { onPlayAlbum(album.tracks, i) },
                         onLongPress = { onSongLongPress(t) },
                     )

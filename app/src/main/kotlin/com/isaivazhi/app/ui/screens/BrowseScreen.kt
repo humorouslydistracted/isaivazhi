@@ -24,11 +24,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -62,11 +64,19 @@ fun BrowseScreen(
     playlists: List<PlaylistsEngine.Playlist>,
     onOpenCategory: (BrowseCategory) -> Unit,
     onCreatePlaylist: (String) -> Unit,
+    onRenamePlaylist: (id: String, name: String) -> Unit,
     onOpenPlaylist: (id: String) -> Unit,
     onDeletePlaylist: (id: String) -> Unit,
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     var showCreateDialog by remember { mutableStateOf(false) }
+    var renamePlaylistId by remember { mutableStateOf<String?>(null) }
+    var renameDraft by remember { mutableStateOf("") }
+    var pendingDeletePlaylistId by remember { mutableStateOf<String?>(null) }
+    val inputColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = MaterialTheme.colorScheme.error,
+        unfocusedBorderColor = MaterialTheme.colorScheme.primary,
+    )
 
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
@@ -112,7 +122,11 @@ fun BrowseScreen(
                 PlaylistRow(
                     playlist = pl,
                     onOpen = { onOpenPlaylist(pl.id) },
-                    onDelete = { onDeletePlaylist(pl.id) },
+                    onRename = {
+                        renamePlaylistId = pl.id
+                        renameDraft = pl.name
+                    },
+                    onDelete = { pendingDeletePlaylistId = pl.id },
                 )
             }
         }
@@ -129,6 +143,7 @@ fun BrowseScreen(
                     onValueChange = { draft = it },
                     label = { Text("Name") },
                     singleLine = true,
+                    colors = inputColors,
                 )
             },
             confirmButton = {
@@ -143,12 +158,58 @@ fun BrowseScreen(
             },
         )
     }
+
+    if (renamePlaylistId != null) {
+        AlertDialog(
+            onDismissRequest = { renamePlaylistId = null },
+            title = { Text("Rename playlist") },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it },
+                    label = { Text("Name") },
+                    singleLine = true,
+                    colors = inputColors,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val id = renamePlaylistId ?: return@TextButton
+                    val name = renameDraft.trim().ifBlank { "New playlist" }
+                    onRenamePlaylist(id, name)
+                    renamePlaylistId = null
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renamePlaylistId = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (pendingDeletePlaylistId != null) {
+        val playlistName = playlists.firstOrNull { it.id == pendingDeletePlaylistId }?.name ?: "this playlist"
+        AlertDialog(
+            onDismissRequest = { pendingDeletePlaylistId = null },
+            title = { Text("Delete playlist?") },
+            text = { Text("Delete \"$playlistName\"? This removes the playlist entry but does not delete song files.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDeletePlaylistId?.let { onDeletePlaylist(it) }
+                    pendingDeletePlaylistId = null
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeletePlaylistId = null }) { Text("Cancel") }
+            },
+        )
+    }
 }
 
 @Composable
 private fun PlaylistRow(
     playlist: PlaylistsEngine.Playlist,
     onOpen: () -> Unit,
+    onRename: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Row(
@@ -179,6 +240,14 @@ private fun PlaylistRow(
                 text = "${playlist.songFilenames.size} songs",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        IconButton(onClick = onRename) {
+            Icon(
+                imageVector = Icons.Filled.Edit,
+                contentDescription = "Rename playlist",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
             )
         }
         IconButton(onClick = onDelete) {
@@ -272,30 +341,27 @@ fun buildBrowseTiles(
 ): List<BrowseTile> {
     val byFilename = songs.associateBy { it.filename }
 
-    val mostPlayed = historyStats.entries
+    val mostPlayedAll = historyStats.entries
         .filter { it.value.plays > 0 }
         .sortedByDescending { it.value.plays }
         .mapNotNull { byFilename[it.key] }
-        .take(4)
 
-    val recentlyPlayed = historyEvents
+    val recentlyPlayedAll = historyEvents
         .distinctBy { it.filename }
         .mapNotNull { byFilename[it.filename] }
-        .take(4)
 
     val neverPlayed = songs.filter { it.filename !in historyStats.keys && it.filePath != null }
-    val lastAdded = songs.filter { it.filePath != null }
+    val lastAddedAll = songs.filter { it.filePath != null }
         .sortedByDescending { it.id }
-        .take(4)
     val favSongs = songs.filter { it.filename in favorites }
     val disSongs = songs.filter { it.filename in disliked }
 
     return listOf(
-        BrowseTile(BrowseCategory.MostPlayed, mostPlayed.size, mostPlayed.map { it.filePath }),
-        BrowseTile(BrowseCategory.RecentlyPlayed, recentlyPlayed.size, recentlyPlayed.map { it.filePath }),
+        BrowseTile(BrowseCategory.MostPlayed, mostPlayedAll.size, mostPlayedAll.take(4).map { it.filePath }),
+        BrowseTile(BrowseCategory.RecentlyPlayed, recentlyPlayedAll.size, recentlyPlayedAll.take(4).map { it.filePath }),
         BrowseTile(BrowseCategory.NeverPlayed, neverPlayed.size,
             neverPlayed.shuffled().take(4).map { it.filePath }),
-        BrowseTile(BrowseCategory.LastAdded, lastAdded.size, lastAdded.map { it.filePath }),
+        BrowseTile(BrowseCategory.LastAdded, lastAddedAll.size, lastAddedAll.take(4).map { it.filePath }),
         BrowseTile(BrowseCategory.Favorites, favSongs.size,
             favSongs.take(4).map { it.filePath }),
         BrowseTile(BrowseCategory.Disliked, disSongs.size,

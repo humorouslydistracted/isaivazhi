@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
@@ -24,7 +23,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -45,6 +43,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -66,6 +66,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.EmbeddingDbFacade
 import com.isaivazhi.app.engine.EmbeddingEngine
+import com.isaivazhi.app.engine.EmbeddingSplitCount
 import com.isaivazhi.app.engine.SignalTimelineEngine
 import com.isaivazhi.app.engine.Song
 import java.text.SimpleDateFormat
@@ -79,6 +80,9 @@ fun AiManagementScreen(
     embeddingsDim: Int,
     vecExtensionLoaded: Boolean,
     status: EmbeddingEngine.EmbeddingStatus,
+    embeddingSplitCount: Int = 3,
+    libraryEmbedSplitCount: Int? = null,
+    onEmbeddingSplitCountChange: (Int) -> Unit = {},
     embeddedFilenames: Set<String>,
     // Push #53: filepath-based "is this song embedded" lookup. The
     // previous filename-based comparison failed for songs whose
@@ -87,20 +91,19 @@ fun AiManagementScreen(
     // which is unambiguous. embeddedFilenames is kept for back-compat /
     // legacy callers but should be considered secondary.
     embeddedFilepaths: Set<String> = emptySet(),
-    logLines: List<String>,
-    embeddingPaused: Boolean = false,
     onBack: () -> Unit,
     onEmbedPending: () -> Unit,
     onEmbedOne: (Song) -> Unit,
     onReembedAll: () -> Unit,
     onRescanLibrary: () -> Unit,
     onStop: () -> Unit,
-    onClearLog: () -> Unit,
     // Push #46: explicit user-triggered backup of the embeddings DB
     // into a portable local_embeddings.json file. Useful right before
     // a reinstall — the user copies the JSON off the device and
     // re-imports it on the new install.
     onExportBackup: () -> Unit = {},
+    exportBackupInProgress: Boolean = false,
+    exportBackupStatus: String? = null,
     // Push #49: filenames present in the embeddings DB but missing from
     // the current MediaStore library (file deleted / renamed / imported
     // from another install). Surfaced under the "Stale" stat — tapping
@@ -157,9 +160,7 @@ fun AiManagementScreen(
     // so the user can un-skip if they re-encode the file.
     val skippedSongs = songs.filter { it.filePath != null && it.filePath in skippedEmbeddings }
     val librarySize = songs.count { it.filePath != null }
-    val logListState = rememberLazyListState()
 
-    var pendingExpanded by remember { mutableStateOf(false) }
     var reembedExpanded by remember { mutableStateOf(false) }
     var skippedExpanded by remember { mutableStateOf(false) }
     // Push #61: audio-dupes section expand state + optimistic hide for
@@ -245,12 +246,25 @@ fun AiManagementScreen(
     }
     val extraRowsCount: Int = extraRowsToDelete.size
 
-    // Push #54: AI Logs render newest-first (reversed). Auto-scroll to
-    // index 0 on every new line so the latest is always visible at the
-    // top without the user having to scroll.
-    LaunchedEffect(logLines.size) {
-        if (logLines.isNotEmpty()) logListState.animateScrollToItem(0)
+    val audioDupIssueGroups = remember(audioDuplicateGroups, hiddenAudioDupFilepaths) {
+        audioDuplicateGroups
+            .map { g -> g.copy(filepaths = g.filepaths.filter { it !in hiddenAudioDupFilepaths }) }
+            .filter { it.filepaths.size >= 2 }
     }
+    // One "issue" per category bucket (not per duplicate row): orphan filename,
+    // filepath with multiple embedding rows, or audio-identical file group.
+    val healthIssueCount = staleFilenames.size + duplicateGroups.size + audioDupIssueGroups.size
+    val healthBreakdownSummary = remember(staleFilenames.size, duplicateGroups.size, audioDupIssueGroups.size) {
+        buildHealthBreakdownSummary(
+            staleCount = staleFilenames.size,
+            duplicateGroupCount = duplicateGroups.size,
+            audioDupGroupCount = audioDupIssueGroups.size,
+        )
+    }
+    var libraryHealthExpanded by remember(healthIssueCount) { mutableStateOf(healthIssueCount > 0) }
+    var advancedExpanded by remember { mutableStateOf(false) }
+    var engineStatusExpanded by remember { mutableStateOf(false) }
+    var showEngineInfoDialog by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -273,7 +287,7 @@ fun AiManagementScreen(
                     }
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        text = "AI / Embeddings",
+                        text = "AI & Library",
                         style = MaterialTheme.typography.titleLarge,
                         color = MaterialTheme.colorScheme.onBackground,
                     )
@@ -296,6 +310,8 @@ fun AiManagementScreen(
                     onStop = onStop,
                     onRescan = { showRescanConfirm = true },
                     onExportBackup = onExportBackup,
+                    exportBackupInProgress = exportBackupInProgress,
+                    exportBackupStatus = exportBackupStatus,
                 )
             }
 
@@ -304,6 +320,15 @@ fun AiManagementScreen(
             // doing the work, even before any progress arrives.
             item {
                 BackendBadge(activeBackend = status.activeBackend, inProgress = status.inProgress, error = status.error)
+            }
+
+            item {
+                EmbeddingSplitSection(
+                    selected = embeddingSplitCount,
+                    librarySplitCount = libraryEmbedSplitCount,
+                    inProgress = status.inProgress,
+                    onSelect = onEmbeddingSplitCountChange,
+                )
             }
 
             // Progress banner (in-progress)
@@ -332,102 +357,276 @@ fun AiManagementScreen(
                         "$stale",
                         if (staleFilenames.isNotEmpty()) "Stale ▾" else "Stale",
                         onClick = if (staleFilenames.isNotEmpty()) {
-                            { staleExpanded = !staleExpanded }
+                            {
+                                libraryHealthExpanded = true
+                                staleExpanded = true
+                            }
                         } else null,
                     )
                 }
             }
 
-            // Push #49: stale embeddings list — only shown when the
-            // Stale stat is tapped and there is at least one stale row.
-            if (staleExpanded && staleFilenames.isNotEmpty()) {
-                item {
-                    Text(
-                        text = "These embedding rows reference songs no longer in your library. " +
-                            "Common causes: file deleted, file renamed, or imported via " +
-                            "local_embeddings.json from another install. Removing them frees " +
-                            "DB space and shrinks the JSON backup. Cannot be undone — " +
-                            "re-importing the file will require re-embedding.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                    )
+            item {
+                Text(
+                    text = "Open Diagnostics → Activity or Embedding for history.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 8.dp),
+                )
+            }
+
+            item {
+                val healthLabel = if (healthIssueCount == 0) {
+                    "Library health (no issues)"
+                } else {
+                    "Library health ($healthIssueCount to review)"
                 }
-                val visibleStale = staleVisible.coerceAtMost(staleFilenames.size)
-                itemsIndexed(
-                    staleFilenames.take(visibleStale),
-                    key = { i, fn -> "stale_${i}_$fn" },
-                ) { _, fn ->
-                    Text(
-                        text = "• $fn",
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
-                    )
+                CollapsibleHeader(
+                    label = healthLabel,
+                    expanded = libraryHealthExpanded,
+                    onToggle = {
+                        val next = !libraryHealthExpanded
+                        libraryHealthExpanded = next
+                        if (next) {
+                            if (staleFilenames.isNotEmpty()) staleExpanded = true
+                            if (duplicateGroups.isNotEmpty()) duplicatesExpanded = true
+                            if (audioDupIssueGroups.isNotEmpty()) audioDupesExpanded = true
+                        }
+                    },
+                )
+            }
+
+            if (libraryHealthExpanded) {
+                if (healthIssueCount > 0) {
+                    item {
+                        Text(
+                            text = "$healthIssueCount to review: $healthBreakdownSummary",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                        )
+                    }
                 }
-                if (staleFilenames.size > visibleStale) {
-                    item("stale_loadmore") {
-                        val remaining = staleFilenames.size - visibleStale
-                        val next = remaining.coerceAtMost(20)
+                if (duplicateGroups.isEmpty() && audioDupIssueGroups.isEmpty() && staleFilenames.isEmpty()) {
+                    item {
+                        Text(
+                            text = "No stale rows, duplicate embeddings, or audio duplicates. Tap Scan library above to recheck after library changes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+
+                if (staleFilenames.isNotEmpty() && staleExpanded) {
+                    item {
+                        Text(
+                            text = "Orphan embedding rows (${staleFilenames.size}) — file gone from library",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                        Text(
+                            text = "These DB rows point to songs that were deleted, renamed, or moved. Removing them frees space; you cannot re-embed without the file.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 6.dp),
+                        )
+                    }
+                    val visibleStale = staleVisible.coerceAtMost(staleFilenames.size)
+                    itemsIndexed(
+                        staleFilenames.take(visibleStale),
+                        key = { i, fn -> "stale_${i}_$fn" },
+                    ) { _, fn ->
+                        Text(
+                            text = "• $fn",
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
+                        )
+                    }
+                    if (staleFilenames.size > visibleStale) {
+                        item("stale_loadmore") {
+                            val remaining = staleFilenames.size - visibleStale
+                            val next = remaining.coerceAtMost(20)
+                            TextButton(
+                                onClick = { staleVisible += 20 },
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                            ) {
+                                Text(
+                                    text = "Load $next more ($remaining remaining)",
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
+                        }
+                    }
+                    item {
                         TextButton(
-                            onClick = { staleVisible += 20 },
+                            onClick = { showRemoveStaleConfirm = true },
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                         ) {
                             Text(
-                                text = "Load $next more ($remaining remaining)",
-                                style = MaterialTheme.typography.labelMedium,
+                                "Remove ${staleFilenames.size} orphan row${if (staleFilenames.size == 1) "" else "s"}",
+                                color = MaterialTheme.colorScheme.error,
                             )
                         }
                     }
                 }
+
                 item {
-                    TextButton(
-                        onClick = { showRemoveStaleConfirm = true },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                    ) {
+                    val label = if (duplicateGroups.isEmpty()) {
+                        "Duplicate embeddings (none)"
+                    } else {
+                        "Duplicate embeddings ($visibleDuplicateRowCount rows in ${duplicateGroups.size} group${if (duplicateGroups.size == 1) "" else "s"})"
+                    }
+                    CollapsibleHeader(
+                        label = label,
+                        expanded = duplicatesExpanded,
+                        onToggle = { duplicatesExpanded = !duplicatesExpanded },
+                    )
+                }
+                if (duplicatesExpanded && duplicateGroups.isEmpty()) {
+                    item {
                         Text(
-                            "Remove ${staleFilenames.size} stale embedding${if (staleFilenames.size == 1) "" else "s"}",
-                            color = MaterialTheme.colorScheme.error,
+                            text = "No duplicates detected. Tap Scan library above to recheck — duplicates refresh on every scan and when this page opens.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                         )
                     }
                 }
-            }
+                if (duplicateGroups.isNotEmpty()) {
+                    if (duplicatesExpanded) {
+                        item {
+                            Text(
+                                text = "Multiple embedding rows point to the same physical file " +
+                                    "(same filepath, different content hashes — usually because " +
+                                    "re-embedding produced a new hash). Tap a row to play, long-press " +
+                                    "or tap (ⓘ) for details. Use (−) to remove a specific row, or the " +
+                                    "button below to remove everything except the newest in each " +
+                                    "group. Groups whose file is no longer on the device are deleted " +
+                                    "entirely by the bulk action.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                            )
+                        }
+                        if (extraRowsCount > 0) {
+                            item {
+                                TextButton(
+                                    onClick = { showDedupeAllConfirm = true },
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                ) {
+                                    Text(
+                                        "Remove all $extraRowsCount extra${if (extraRowsCount == 1) "" else "s"} (keep newest where file exists)",
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            }
+                        }
 
-            // Chips row
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    if (status.activeBackend.isNotBlank()) {
-                        InfoChip(label = "ONNX", value = status.activeBackend)
+                        val visibleGroups = duplicateGroups.take(duplicateGroupsVisible.coerceAtMost(duplicateGroups.size))
+                        itemsIndexed(
+                            items = visibleGroups,
+                            key = { _, pair -> "dupgrp_${pair.first}" },
+                        ) { _, pair ->
+                            val filepath = pair.first
+                            val rows = pair.second
+                            val matchedSong = songsByFilepath[filepath]
+                            DuplicateGroupCard(
+                                filepath = filepath,
+                                rows = rows,
+                                matchedSong = matchedSong,
+                                signalsLookup = signalsForFilename,
+                                onPlay = onPlayDuplicate,
+                                onRemoveRow = { hash ->
+                                    hiddenContentHashes = hiddenContentHashes + hash
+                                    onRemoveDuplicateRows(listOf(hash))
+                                },
+                                onOpenDetails = { detailSheetRow = it },
+                            )
+                        }
+                        if (duplicateGroups.size > duplicateGroupsVisible) {
+                            item("dupgrp_loadmore") {
+                                val remaining = duplicateGroups.size - duplicateGroupsVisible
+                                val next = remaining.coerceAtMost(10)
+                                TextButton(
+                                    onClick = { duplicateGroupsVisible += 10 },
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                                ) {
+                                    Text(
+                                        text = "Load $next more group${if (next == 1) "" else "s"} ($remaining remaining)",
+                                        style = MaterialTheme.typography.labelMedium,
+                                    )
+                                }
+                            }
+                        }
                     }
-                    InfoChip(
-                        label = "sqlite-vec",
-                        value = if (vecExtensionLoaded) "Loaded" else "Fallback (NEON)",
-                    )
-                    if (embeddingsDim > 0) InfoChip(label = "Dim", value = "$embeddingsDim")
-                    if (embeddingPaused) InfoChip(label = "Auto-embed", value = "Paused")
                 }
-            }
 
-            if (status.inProgress && status.total > 0) {
                 item {
-                    Text(
-                        text = buildString {
-                            append("Session: ${status.processed} / ${status.total} processed")
-                            if (status.failed > 0) append(" • ${status.failed} failed")
-                            status.etaSeconds?.let { eta -> if (eta > 0) append(" • ~${eta}s remaining") }
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    val visibleGroups = audioDuplicateGroups
+                        .map { g -> g.copy(filepaths = g.filepaths.filter { it !in hiddenAudioDupFilepaths }) }
+                        .filter { it.filepaths.size >= 2 }
+                    val visibleFileCount = visibleGroups.sumOf { it.filepaths.size }
+                    val label = if (visibleGroups.isEmpty()) {
+                        "Audio duplicates (none)"
+                    } else {
+                        "Audio duplicates ($visibleFileCount files in ${visibleGroups.size} group${if (visibleGroups.size == 1) "" else "s"})"
+                    }
+                    CollapsibleHeader(
+                        label = label,
+                        expanded = audioDupesExpanded,
+                        onToggle = { audioDupesExpanded = !audioDupesExpanded },
                     )
                 }
-            } else if (!status.inProgress && status.lastCompletedAtMs > 0) {
+                if (audioDupesExpanded) {
+                    val visibleGroups = audioDuplicateGroups
+                        .map { g -> g.copy(filepaths = g.filepaths.filter { it !in hiddenAudioDupFilepaths }) }
+                        .filter { it.filepaths.size >= 2 }
+                    if (visibleGroups.isEmpty()) {
+                        item {
+                            Text(
+                                text = "No audio duplicates detected. Finds byte-identical audio (first 30 s) at different filepaths — e.g. copies in multiple folders. Tap Scan library to re-check.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            )
+                        }
+                    } else {
+                        item {
+                            Text(
+                                text = "Each group is one piece of audio at multiple filepaths. Tap to play, (−) to delete a copy from device.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                            )
+                        }
+                        itemsIndexed(
+                            items = visibleGroups,
+                            key = { _, g -> "audiodup_${g.contentHash}" },
+                        ) { _, group ->
+                            AudioDuplicateGroupCard(
+                                group = group,
+                                songsByFilepath = songsByFilepath,
+                                onPlay = onPlayAudioDup,
+                                onDelete = { fp ->
+                                    hiddenAudioDupFilepaths = hiddenAudioDupFilepaths + fp
+                                    onDeleteAudioDup(fp)
+                                },
+                                onOpenDetails = { fp ->
+                                    audioDupDetailFilepath = fp
+                                    audioDupDetailHash = group.contentHash
+                                },
+                            )
+                        }
+                    }
+                }
+            } // libraryHealthExpanded
+
+            if (!status.inProgress && status.lastCompletedAtMs > 0) {
                 // Push #49: keep showing the most recent batch's
                 // summary until the user starts another batch. Capacitor
                 // had this; the Kotlin port previously hid it as soon as
@@ -454,19 +653,67 @@ fun AiManagementScreen(
                 }
             }
 
-            // Section: pending actions (collapsible). Push #49: append
-            // a "(N failed)" hint when the most recent batch attempted
-            // songs that didn't succeed — these stay in the pending list
-            // and will be retried on the next Embed Pending tap.
             item {
-                val failedHint = if (status.failed > 0) " (${status.failed} failed)" else ""
                 CollapsibleHeader(
-                    label = "Embed Pending Songs (${pending.size})$failedHint",
-                    expanded = pendingExpanded,
-                    onToggle = { pendingExpanded = !pendingExpanded },
+                    label = "Engine status",
+                    expanded = engineStatusExpanded,
+                    onToggle = { engineStatusExpanded = !engineStatusExpanded },
                 )
             }
-            if (pendingExpanded) {
+            if (engineStatusExpanded) {
+                item {
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                        val vecLabel = if (vecExtensionLoaded) "sqlite-vec (fast)" else "NEON fallback"
+                        val dimLabel = if (embeddingsDim > 0) "$embeddingsDim-D" else "unknown"
+                        val backendLabel = status.activeBackend.ifBlank { "— until embedding runs" }
+                        Text(
+                            text = "Vector search: $vecLabel",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "Embedding size: $dimLabel (fixed by model)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                        Text(
+                            text = "Sampling: 3 × 10 s per song at 20%, 50%, 80%",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                        if (status.activeBackend.isNotBlank()) {
+                            Text(
+                                text = "ONNX backend: $backendLabel",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                        }
+                        TextButton(onClick = { showEngineInfoDialog = true }) {
+                            Icon(Icons.Filled.Info, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("What do these mean?", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+            }
+
+            item {
+                val failedHint = if (status.failed > 0) ", ${status.failed} failed" else ""
+                val advancedLabel = when {
+                    pending.isEmpty() -> "Advanced embedding"
+                    else -> "Advanced embedding (${pending.size} pending$failedHint)"
+                }
+                CollapsibleHeader(
+                    label = advancedLabel,
+                    expanded = advancedExpanded,
+                    onToggle = { advancedExpanded = !advancedExpanded },
+                )
+            }
+
+            if (advancedExpanded) {
                 if (pending.isEmpty()) {
                     item {
                         Text(
@@ -477,18 +724,11 @@ fun AiManagementScreen(
                         )
                     }
                 } else {
-                    // Push #47: 10-at-a-time pagination. Saves a lot of
-                    // scrolling when pending list has hundreds of rows.
                     val visibleCount = pendingVisible.coerceAtMost(pending.size)
                     itemsIndexed(
                         pending.take(visibleCount),
                         key = { i, s -> "pend_${i}_${s.id}" },
                     ) { _, song ->
-                        // Push #43: per-row Embed icon stays ENABLED while
-                        // a batch is in progress. Tapping queues the song
-                        // for embedding (EmbeddingForegroundService now
-                        // appends to a pending-additions queue when
-                        // already running, instead of rejecting).
                         PendingRow(
                             song = song,
                             onEmbedOne = { onEmbedOne(song) },
@@ -511,10 +751,7 @@ fun AiManagementScreen(
                             }
                         }
                     }
-                    // Push #40: the in-list "Embed all pending" CTA moved
-                    // to TopActionBar at the top of the screen.
                 }
-            }
 
             // Push #57: Skipped Songs section — files the user has
             // explicitly opted out of embedding. Always visible (header
@@ -532,7 +769,7 @@ fun AiManagementScreen(
                 if (skippedSongs.isEmpty()) {
                     item {
                         Text(
-                            text = "No skipped songs. Tap the ⊖ icon on a Pending row to skip permanently — useful for files Android can't decode (unusual codec variants, etc.). Skipped songs still play normally, they just won't be tried for embedding again.",
+                            text = "No skipped songs. Use ⊖ on a pending row to skip a file that won't embed.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -583,243 +820,7 @@ fun AiManagementScreen(
                     }
                 }
             }
-
-            // Push #53: Duplicate Embeddings section is now ALWAYS
-            // visible (was hidden when empty). The user asked for a
-            // persistent indicator so they can confirm "no duplicates"
-            // explicitly + re-trigger a check via Rescan library. The
-            // header label switches to "(none)" when empty; the body
-            // shows an empty-state message under expand.
-            item { HorizontalDivider(color = MaterialTheme.colorScheme.outline) }
-            item {
-                val label = if (duplicateGroups.isEmpty()) {
-                    "Duplicate Embeddings (none)"
-                } else {
-                    "Duplicate Embeddings ($visibleDuplicateRowCount rows in ${duplicateGroups.size} group${if (duplicateGroups.size == 1) "" else "s"})"
-                }
-                CollapsibleHeader(
-                    label = label,
-                    expanded = duplicatesExpanded,
-                    onToggle = { duplicatesExpanded = !duplicatesExpanded },
-                )
-            }
-            if (duplicatesExpanded && duplicateGroups.isEmpty()) {
-                item {
-                    Text(
-                        text = "No duplicates detected. Tap Rescan library above to recheck — duplicates are recomputed from the live embeddings DB on every rescan and on every AI-page open.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    )
-                }
-            }
-            if (duplicateGroups.isNotEmpty()) {
-                if (duplicatesExpanded) {
-                    item {
-                        Text(
-                            text = "Multiple embedding rows point to the same physical file " +
-                                "(same filepath, different content hashes — usually because " +
-                                "re-embedding produced a new hash). Tap a row to play, long-press " +
-                                "or tap (ⓘ) for details. Use (−) to remove a specific row, or the " +
-                                "button below to remove everything except the newest in each " +
-                                "group. Groups whose file is no longer on the device are deleted " +
-                                "entirely by the bulk action.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                        )
-                    }
-                    if (extraRowsCount > 0) {
-                        item {
-                            TextButton(
-                                onClick = { showDedupeAllConfirm = true },
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                            ) {
-                                Text(
-                                    "Remove all $extraRowsCount extra${if (extraRowsCount == 1) "" else "s"} (keep newest where file exists)",
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
-                        }
-                    }
-
-                    val visibleGroups = duplicateGroups.take(duplicateGroupsVisible.coerceAtMost(duplicateGroups.size))
-                    itemsIndexed(
-                        items = visibleGroups,
-                        key = { _, pair -> "dupgrp_${pair.first}" },
-                    ) { _, pair ->
-                        val filepath = pair.first
-                        val rows = pair.second
-                        val matchedSong = songsByFilepath[filepath]
-                        DuplicateGroupCard(
-                            filepath = filepath,
-                            rows = rows,
-                            matchedSong = matchedSong,
-                            signalsLookup = signalsForFilename,
-                            onPlay = onPlayDuplicate,
-                            onRemoveRow = { hash ->
-                                // Optimistic hide so the row vanishes
-                                // instantly. The real DB delete fires
-                                // through onRemoveDuplicateRows; on the
-                                // post-delete refresh, the duplicateRows
-                                // change re-keys this state and the
-                                // hidden set is cleared.
-                                hiddenContentHashes = hiddenContentHashes + hash
-                                onRemoveDuplicateRows(listOf(hash))
-                            },
-                            onOpenDetails = { detailSheetRow = it },
-                        )
-                    }
-                    if (duplicateGroups.size > duplicateGroupsVisible) {
-                        item("dupgrp_loadmore") {
-                            val remaining = duplicateGroups.size - duplicateGroupsVisible
-                            val next = remaining.coerceAtMost(10)
-                            TextButton(
-                                onClick = { duplicateGroupsVisible += 10 },
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                            ) {
-                                Text(
-                                    text = "Load $next more group${if (next == 1) "" else "s"} ($remaining remaining)",
-                                    style = MaterialTheme.typography.labelMedium,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Push #61: Audio Duplicates section — groups of filepaths
-            // pointing at the same content_hash in T_PATH. These are
-            // byte-identical-first-30s audio files: typically a song
-            // present in two folders, or "song.flac" + "song (1).flac".
-            // T_EMB can only hold one row per hash (PK), so the second
-            // file's filepath isn't in `embeddedFilepaths` — appears as
-            // Pending. This section makes them visible + actionable.
-            item { HorizontalDivider(color = MaterialTheme.colorScheme.outline) }
-            item {
-                val visibleGroups = audioDuplicateGroups
-                    .map { g -> g.copy(filepaths = g.filepaths.filter { it !in hiddenAudioDupFilepaths }) }
-                    .filter { it.filepaths.size >= 2 }
-                val visibleFileCount = visibleGroups.sumOf { it.filepaths.size }
-                val label = if (visibleGroups.isEmpty()) {
-                    "Audio Duplicates (none)"
-                } else {
-                    "Audio Duplicates ($visibleFileCount files in ${visibleGroups.size} group${if (visibleGroups.size == 1) "" else "s"})"
-                }
-                CollapsibleHeader(
-                    label = label,
-                    expanded = audioDupesExpanded,
-                    onToggle = { audioDupesExpanded = !audioDupesExpanded },
-                )
-            }
-            if (audioDupesExpanded) {
-                val visibleGroups = audioDuplicateGroups
-                    .map { g -> g.copy(filepaths = g.filepaths.filter { it !in hiddenAudioDupFilepaths }) }
-                    .filter { it.filepaths.size >= 2 }
-                if (visibleGroups.isEmpty()) {
-                    item {
-                        Text(
-                            text = "No audio duplicates detected. This section finds files where the audio is byte-identical (same first 30 s) across different filepaths — typically copies of the same song in multiple folders. Tap Rescan library to re-check after embedding new songs.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                        )
-                    }
-                } else {
-                    item {
-                        Text(
-                            text = "Each group below is one piece of audio that exists at multiple filepaths. Tap a row to play, (−) to delete the file from device. Keep the version you prefer; the others can be safely removed.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                        )
-                    }
-                    itemsIndexed(
-                        items = visibleGroups,
-                        key = { _, g -> "audiodup_${g.contentHash}" },
-                    ) { _, group ->
-                        AudioDuplicateGroupCard(
-                            group = group,
-                            songsByFilepath = songsByFilepath,
-                            onPlay = onPlayAudioDup,
-                            onDelete = { fp ->
-                                hiddenAudioDupFilepaths = hiddenAudioDupFilepaths + fp
-                                onDeleteAudioDup(fp)
-                            },
-                            onOpenDetails = { fp ->
-                                audioDupDetailFilepath = fp
-                                audioDupDetailHash = group.contentHash
-                            },
-                        )
-                    }
-                }
-            }
-
-            // Logs section with 2 tabs + per-tab Copy
-            item { HorizontalDivider(color = MaterialTheme.colorScheme.outline) }
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // Push #48: unified into a single "AI Logs" section.
-                    // Previously this had Common / Embedding tabs that
-                    // both rendered the same `logLines` list (the two
-                    // tabs were never wired to different sources). The
-                    // log is now persisted across app restarts so a
-                    // long-running batch's progress survives a process
-                    // kill or device reboot.
-                    Text(
-                        text = "AI Logs (${logLines.size})",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.weight(1f),
-                    )
-                    TextButton(onClick = onClearLog) { Text("Clear") }
-                    TextButton(onClick = {
-                        val text = logLines.joinToString("\n")
-                        copyToClipboard(ctx, "IsaiVazhi AI logs", text)
-                    }) {
-                        Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Copy")
-                    }
-                }
-            }
-            item {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                        .heightIn(min = 120.dp, max = 280.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(MaterialTheme.colorScheme.surface)
-                        .padding(8.dp),
-                ) {
-                    if (logLines.isEmpty()) {
-                        Text(
-                            text = "No log lines yet. Start an embedding batch to see live progress here.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    } else {
-                        // Push #54: newest log line first. Render the
-                        // ring buffer in reverse — index 0 of the
-                        // LazyColumn is the most recent append.
-                        LazyColumn(state = logListState, modifier = Modifier.fillMaxWidth()) {
-                            val total = logLines.size
-                            items(total) { i ->
-                                Text(
-                                    text = logLines[total - 1 - i],
-                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    modifier = Modifier.padding(vertical = 1.dp),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+            } // advancedExpanded
         }
     }
 
@@ -967,14 +968,36 @@ fun AiManagementScreen(
     if (showRescanConfirm) {
         AlertDialog(
             onDismissRequest = { showRescanConfirm = false },
-            title = { Text("Rescan library?") },
-            text = { Text("Re-reads MediaStore to pick up newly added or removed songs. Embeddings are preserved.") },
+            title = { Text("Scan library?") },
+            text = {
+                Text(
+                    "Re-reads MediaStore for added or removed songs, refreshes counts, " +
+                        "and recomputes stale rows and duplicates. Does not run embedding."
+                )
+            },
             confirmButton = {
                 TextButton(onClick = { showRescanConfirm = false; onRescanLibrary() }) {
-                    Text("Rescan")
+                    Text("Scan")
                 }
             },
             dismissButton = { TextButton(onClick = { showRescanConfirm = false }) { Text("Cancel") } },
+        )
+    }
+    if (showEngineInfoDialog) {
+        AlertDialog(
+            onDismissRequest = { showEngineInfoDialog = false },
+            title = { Text("Engine status") },
+            text = {
+                Text(
+                    "These values are automatic, not settings.\n\n" +
+                        "• Vector search: sqlite-vec speeds up similarity search; otherwise NEON fallback.\n" +
+                        "• Embedding size: 512 numbers per song (fixed by the ONNX model).\n" +
+                        "• Sampling: 3 × 10 s clips per song at 20%, 50%, and 80% of track length, then averaged."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showEngineInfoDialog = false }) { Text("OK") }
+            },
         )
     }
 }
@@ -1041,6 +1064,35 @@ private fun CollapsibleHeader(label: String, expanded: Boolean, onToggle: () -> 
     }
 }
 
+private fun buildHealthBreakdownSummary(
+    staleCount: Int,
+    duplicateGroupCount: Int,
+    audioDupGroupCount: Int,
+): String {
+    val parts = mutableListOf<String>()
+    if (staleCount > 0) {
+        parts.add("$staleCount orphan ${if (staleCount == 1) "row" else "rows"}")
+    }
+    if (duplicateGroupCount > 0) {
+        parts.add("$duplicateGroupCount duplicate-embedding ${if (duplicateGroupCount == 1) "group" else "groups"}")
+    }
+    if (audioDupGroupCount > 0) {
+        parts.add("$audioDupGroupCount audio-duplicate ${if (audioDupGroupCount == 1) "group" else "groups"}")
+    }
+    return parts.joinToString(" · ")
+}
+
+/** Prefer title/artist; avoid showing a full filesystem path as the row title. */
+private fun songDisplayTitle(song: Song): String {
+    val raw = song.title.ifBlank { song.filename }
+    if (raw.contains('/') || raw.contains('\\')) {
+        return song.filePath?.substringAfterLast('/')?.substringAfterLast('\\')
+            ?.ifBlank { song.filename }
+            ?: song.filename.ifBlank { raw.substringAfterLast('/', raw) }
+    }
+    return raw
+}
+
 @Composable
 private fun PendingRow(
     song: Song,
@@ -1056,7 +1108,7 @@ private fun PendingRow(
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
             Text(
-                text = song.title.ifBlank { song.filename },
+                text = songDisplayTitle(song),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onBackground,
                 maxLines = 1,
@@ -1270,6 +1322,8 @@ private fun TopActionBar(
     onStop: () -> Unit,
     onRescan: () -> Unit,
     onExportBackup: () -> Unit,
+    exportBackupInProgress: Boolean = false,
+    exportBackupStatus: String? = null,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -1343,27 +1397,164 @@ private fun TopActionBar(
             }
         }
         Spacer(Modifier.height(8.dp))
-        // Push #48 (revised): "Re-embed all" was removed from the top
-        // action bar. It now lives only inside the "Re-embed All Songs"
-        // collapsible section below so it can't be tapped accidentally.
-        TextButton(
-            onClick = onRescan,
+        var showExportInfo by remember { mutableStateOf(false) }
+        Row(
             modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(4.dp))
-            Text("Rescan library", style = MaterialTheme.typography.labelMedium)
+            TextButton(
+                onClick = onRescan,
+                modifier = Modifier.weight(1f),
+                enabled = !exportBackupInProgress,
+            ) {
+                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Scan library", style = MaterialTheme.typography.labelMedium)
+            }
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                TextButton(
+                    onClick = onExportBackup,
+                    enabled = !exportBackupInProgress,
+                ) {
+                    Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (exportBackupInProgress) "Exporting…"
+                        else "Export embeddings",
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+                IconButton(
+                    onClick = { showExportInfo = true },
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Info,
+                        contentDescription = "About export",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
-        // Push #46: explicit backup button. Auto-export already runs
-        // after every batch and on app pause; this lets the user force
-        // a fresh write before they reinstall / copy the file off.
-        TextButton(
-            onClick = onExportBackup,
-            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        if (exportBackupInProgress || !exportBackupStatus.isNullOrBlank()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp, start = 4.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (exportBackupInProgress) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                }
+                Text(
+                    text = exportBackupStatus ?: "Export in progress…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        if (showExportInfo) {
+            AlertDialog(
+                onDismissRequest = { showExportInfo = false },
+                title = { Text("Export embeddings") },
+                text = {
+                    Text(
+                        "Saves every AI vector to isaivazhi_embeddings.bin on your device. " +
+                            "After reinstall, use Settings → Import to restore without re-embedding."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { showExportInfo = false }) { Text("OK") }
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmbeddingSplitSection(
+    selected: Int,
+    librarySplitCount: Int?,
+    inProgress: Boolean,
+    onSelect: (Int) -> Unit,
+) {
+    val normalized = EmbeddingSplitCount.normalize(selected)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+            .padding(12.dp),
+    ) {
+        Text(
+            text = "CLAP windows per song",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = EmbeddingSplitCount.positionsLabel(normalized) +
+                " — averaged, then L2-normalized (512-d)",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("Export embeddings backup now", style = MaterialTheme.typography.labelMedium)
+            for (n in EmbeddingSplitCount.allowed) {
+                FilterChip(
+                    selected = normalized == n,
+                    onClick = { if (!inProgress) onSelect(n) },
+                    label = { Text("$n") },
+                    enabled = !inProgress,
+                )
+            }
+        }
+        if (normalized > 3) {
+            val pct = ((EmbeddingSplitCount.timeMultiplier(normalized) - 1f) * 100f).toInt()
+            Text(
+                text = "Roughly ~$pct% longer per song than 3 windows (more ONNX passes).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        if (librarySplitCount != null && librarySplitCount != normalized) {
+            Text(
+                text = "Library was embedded with $librarySplitCount splits. " +
+                    "Use Re-embed all after changing — do not mix split counts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        } else if (librarySplitCount == null && normalized != 3) {
+            Text(
+                text = "Existing backups are usually 3-split. Re-embed all after switching to $normalized.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        if (inProgress) {
+            Text(
+                text = "Split count locked while a batch is running.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
         }
     }
 }
@@ -1393,7 +1584,7 @@ private fun BackendBadge(activeBackend: String, inProgress: Boolean, error: Stri
             "Backend: warming up audio model…")
         else -> Triple(MaterialTheme.colorScheme.surfaceVariant,
             MaterialTheme.colorScheme.onSurfaceVariant,
-            "Backend: not yet selected")
+            "Inference hardware: picks NPU/GPU or CPU when embedding starts")
     }
     Row(
         modifier = Modifier

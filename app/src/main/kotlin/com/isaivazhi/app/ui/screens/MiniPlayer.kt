@@ -51,7 +51,7 @@ import com.isaivazhi.app.engine.PlaybackEngine
  *
  *   Row 1: art | title + artist + mode chip | favorite
  *   Row 2: draggable progress Slider
- *   Row 3: loop / prev / play-pause / neutral-skip / shuffle / dislike
+ *   Row 3: loop / shuffle / prev / play-pause / next / refresh / dislike
  *
  * Tapping anywhere on Row 1 (outside the buttons) expands to NowPlayingScreen.
  */
@@ -64,6 +64,8 @@ fun MiniPlayer(
     isFavorite: Boolean,
     isDisliked: Boolean,
     aiMode: Boolean,
+    /** Library has at least one embedding row — when false, mode chip shows Shuffle. */
+    hasEmbeddingsInLibrary: Boolean,
     hasEmbedding: Boolean,
     onToggleFavorite: () -> Unit,
     onToggleDislike: () -> Unit,
@@ -134,10 +136,12 @@ fun MiniPlayer(
                     )
                 }
             }
-            // Only show the AI / Shuffle mode chip when the current song
-            // has an embedding — songs without one already display a red
-            // dot before the title, so the AI chip would be misleading.
-            if (hasEmbedding) ModeChip(aiMode = aiMode)
+            // Up Next mode: Shuffle when the library has no embeddings; otherwise
+            // show AI/Shuffle for the current song only when it is embedded.
+            when {
+                !hasEmbeddingsInLibrary -> ModeChip(aiMode = false)
+                hasEmbedding -> ModeChip(aiMode = aiMode)
+            }
             IconButton(onClick = onToggleFavorite) {
                 Icon(
                     imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
@@ -179,7 +183,17 @@ fun MiniPlayer(
                     modifier = Modifier.size(22.dp),
                 )
             }
-            // Prev
+            // Shuffle (queue order)
+            IconButton(onClick = onToggleShuffle) {
+                Icon(
+                    imageVector = Icons.Filled.Shuffle,
+                    contentDescription = "Shuffle",
+                    tint = if (state.shuffleEnabled) MaterialTheme.colorScheme.primary
+                           else MaterialTheme.colorScheme.onBackground,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+            // Previous
             IconButton(onClick = onSkipPrev) {
                 Icon(
                     imageVector = Icons.Filled.SkipPrevious,
@@ -188,7 +202,7 @@ fun MiniPlayer(
                     modifier = Modifier.size(26.dp),
                 )
             }
-            // Play/Pause (primary, larger)
+            // Play/Pause (primary, larger — center slot)
             IconButton(onClick = onTogglePause) {
                 Icon(
                     imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
@@ -206,18 +220,8 @@ fun MiniPlayer(
                     modifier = Modifier.size(26.dp),
                 )
             }
-            // Shuffle
-            IconButton(onClick = onToggleShuffle) {
-                Icon(
-                    imageVector = Icons.Filled.Shuffle,
-                    contentDescription = "Shuffle",
-                    tint = if (state.shuffleEnabled) MaterialTheme.colorScheme.primary
-                           else MaterialTheme.colorScheme.onBackground,
-                    modifier = Modifier.size(22.dp),
-                )
-            }
-            // Refresh Up Next (AI) — only when caller supplied a handler.
-            // Greyed when no current song / no embeddings.
+            // Refresh upcoming queue using current mode:
+            // AI mode -> similarity recommendations, Shuffle mode -> random tail.
             if (onRefresh != null) {
                 IconButton(
                     onClick = onRefresh,
@@ -232,7 +236,7 @@ fun MiniPlayer(
                     } else {
                         Icon(
                             imageVector = Icons.Filled.Refresh,
-                            contentDescription = "Refresh Up Next",
+                            contentDescription = "Refresh upcoming queue",
                             tint = if (refreshEnabled) MaterialTheme.colorScheme.primary
                                    else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(22.dp),

@@ -1,55 +1,13 @@
-# IsaiVazhi (Kotlin/Compose rewrite, v2.x)
-
-# Android / Gradle build outputs
-native/build/
-native/app/build/
-native/.gradle/
-native/.idea/
-native/.kotlin/
-native/local.properties
-native/app/.cxx/
-native/captures/
-native/.externalNativeBuild/
-*.iml
-
-# IDE / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Claude Code state
-.claude/
-
-# Local logs / scratch
-logs.txt
-*.log
-crash_logs.txt
-debug.txt
-emulator_logcat*.txt
-
-# Large binaries — ship via GitHub Releases instead
-# The `releases/` folder is a staging area for Release assets; do not commit.
-releases/
-app-debug.apk
-*.pkl
-local_embeddings*.json
-music_audioset_epoch_15_esc_90.14.pt
-*.pt
-
-# CLAP ONNX model — not bundled. The on-device inference path is unused
-# (embeddings are produced via the Colab/local scripts and copied to the
-# app's SQLite store). If you need the encoder, download separately and
-# drop it into native/app/src/main/assets/.
-native/app/src/main/assets/clap_audio_encoder.onnx
-native/app/src/main/assets/clap_audio_encoder.onnx.data
-
-# Python helper / venv state
-__pycache__/
+.gradle/
+.kotlin/
+build/
+app/build/
+output/
+screenshots/
+songs_downloaded/
+tools/embeddings/.venv-embeddings/
+tools/embeddings/__pycache__/
+**/__pycache__/
 *.pyc
-.venv/
-venv/
-
-# Secrets — never commit
+local.properties
 PAT
-native/PAT

@@ -1,0 +1,9 @@
+# IsaiVazhi laptop embedding pipeline (GTX 1650 / CUDA 12.1)
+# Install PyTorch with CUDA first (see setup_laptop_embeddings.ps1), then:
+#   pip install -r requirements-embeddings.txt
+
+numpy==1.26.4
+laion-clap
+librosa
+soundfile
+mutagen

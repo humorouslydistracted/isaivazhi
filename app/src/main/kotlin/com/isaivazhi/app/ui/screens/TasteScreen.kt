@@ -67,11 +67,15 @@ fun TasteScreen(
     stats: Map<String, HistoryEngine.Stats>,
     signals: Map<String, TasteEngine.TasteSignal>,
     // Push #63: decorated signal map carrying chips (Favorite/Disliked/Mixed/
-    // Similarity/Top ±30/Short-listened/Rec-blocked/Neutral) and the
-    // hardBlockedFilenames set. The recommender call sites in MainActivity
-    // also consume `hardBlockedFilenames` so the displayed "Rec blocked"
-    // chip and the actual rec policy stay in lockstep.
+    // Similarity/Top ±30/Short-listened/Up-Next-excluded/Neutral).
     decoratedSignals: TasteEngine.DecoratedSignals,
+    /** Hard-block set used by Up Next at the current Negative guard slider (not display-only). */
+    upNextHardBlockedCount: Int = 0,
+    upNextSoftExcludedCount: Int = 0,
+    /** Union of hard + soft + disliked — same set passed to recommendUpcoming. */
+    upNextExcludedFilenames: Set<String> = emptySet(),
+    favoritesSet: Set<String>,
+    dislikedSet: Set<String>,
     timelineEvents: List<SignalTimelineEngine.Event>,
     engineSnapshot: EngineSnapshot,
     onBack: () -> Unit,
@@ -86,7 +90,7 @@ fun TasteScreen(
     onCopyTimelineText: (text: String) -> Unit,
     onCopyTimelineSummary: (text: String) -> Unit,
     onPlayOrderedList: (queue: List<Song>, startIndex: Int) -> Unit,
-    // Push #74: long-press the header to open the Activity Log overlay.
+    /** Long-press Taste header → Diagnostics (Activity tab). */
     onOpenActivityLog: (() -> Unit)? = null,
 ) {
     val ctx = LocalContext.current
@@ -105,22 +109,41 @@ fun TasteScreen(
     // taste signal, use the DecoratedRow (carries chips + recency-applied
     // breakdown). For songs with only HistoryEngine stats and no signal
     // entry, fall back to a synthetic SignalRowData with score = plays×avgFrac.
-    val rows: List<SignalRowData> = remember(songs, decoratedSignals, stats) {
+    val rows: List<SignalRowData> = remember(
+        songs,
+        decoratedSignals,
+        stats,
+        favoritesSet,
+        dislikedSet,
+        upNextExcludedFilenames,
+    ) {
         val decorRows = decoratedSignals.rows
         songs.map { song ->
-            val dec = decorRows[song.filename]
+            val fn = song.filename
+            val isFavorite = fn in favoritesSet
+            val isDisliked = fn in dislikedSet
+            val excludedFromUpNext = fn in upNextExcludedFilenames && !isDisliked
+            val dec = decorRows[fn]
             if (dec != null) {
                 val bd = dec.breakdown
+                var favoritePrior = dec.signal.favoritePrior
+                var dislikePrior = dec.signal.dislikePrior
+                if (isFavorite && favoritePrior < 0.001f) {
+                    favoritePrior = TasteEngine.MANUAL_FAVORITE_PRIOR_BASE
+                }
+                if (isDisliked && dislikePrior < 0.001f) {
+                    dislikePrior = TasteEngine.MANUAL_DISLIKE_PRIOR_BASE
+                }
                 SignalRowData(
                     song = song,
                     plays = dec.signal.plays,
                     avgFraction = dec.signal.avgFraction,
                     xScore = dec.signal.xScore,
                     similarityBoost = dec.signal.similarityBoost,
-                    favoritePrior = dec.signal.favoritePrior,
-                    dislikePrior = dec.signal.dislikePrior,
-                    isFavorite = dec.signal.isFavorite,
-                    isDisliked = dec.signal.isDisliked,
+                    favoritePrior = favoritePrior,
+                    dislikePrior = dislikePrior,
+                    isFavorite = isFavorite,
+                    isDisliked = isDisliked,
                     daysSince = daysSinceFrom(dec.signal.lastPlayedAt),
                     directScore = bd.directScore,
                     score = bd.score,
@@ -128,15 +151,44 @@ fun TasteScreen(
                     negativeWeight = bd.negativeWeight,
                     effectivePositive = bd.effectivePositive,
                     effectiveNegative = bd.effectiveNegative,
-                    isActive = dec.isActive,
+                    isActive = dec.isActive || isFavorite || isDisliked,
                     isMixed = dec.isMixed,
                     isShortListened = dec.isShortListened,
-                    isHardBlocked = dec.isHardRecommendationBlock,
+                    isHardBlocked = excludedFromUpNext,
                     inTopPositive30 = dec.inTopPositive30,
                     inTopNegative30 = dec.inTopNegative30,
                     inTop30 = dec.inTop30,
                     isSuspicious = dec.isSuspicious,
                     suspiciousReason = dec.suspiciousReason,
+                )
+            } else if (isFavorite || isDisliked) {
+                val favoritePrior = if (isFavorite) TasteEngine.MANUAL_FAVORITE_PRIOR_BASE else 0f
+                val dislikePrior = if (isDisliked) TasteEngine.MANUAL_DISLIKE_PRIOR_BASE else 0f
+                val direct = favoritePrior - dislikePrior
+                SignalRowData(
+                    song = song,
+                    plays = 0,
+                    avgFraction = 0f,
+                    xScore = 0f,
+                    similarityBoost = 0f,
+                    favoritePrior = favoritePrior,
+                    dislikePrior = dislikePrior,
+                    isFavorite = isFavorite,
+                    isDisliked = isDisliked,
+                    daysSince = null,
+                    directScore = direct,
+                    score = direct,
+                    positiveWeight = favoritePrior,
+                    negativeWeight = dislikePrior,
+                    effectivePositive = favoritePrior,
+                    effectiveNegative = dislikePrior,
+                    isActive = true,
+                    isMixed = false,
+                    isShortListened = false,
+                    isHardBlocked = excludedFromUpNext,
+                    inTopPositive30 = false,
+                    inTopNegative30 = false,
+                    inTop30 = false,
                 )
             } else {
                 val st = stats[song.filename]
@@ -164,7 +216,7 @@ fun TasteScreen(
                     isActive = active,
                     isMixed = false,
                     isShortListened = false,
-                    isHardBlocked = false,
+                    isHardBlocked = fn in upNextExcludedFilenames,
                     inTopPositive30 = false,
                     inTopNegative30 = false,
                     inTop30 = false,
@@ -174,7 +226,6 @@ fun TasteScreen(
     }
     val activeCount = remember(rows) { rows.count { it.isActive } }
     val totalCount = rows.size
-    val hardBlockedCount = decoratedSignals.hardBlockedFilenames.size
 
     // Push #63: strict positive/negative separation. "Top Positive" hides
     // negative-scoring songs entirely (not just sorts them to the bottom).
@@ -229,11 +280,27 @@ fun TasteScreen(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
             }
 
-            // Headline — Push #63: includes blocked-from-recs count.
+            // Headline — Up Next exclusion counts match Negative guard slider.
             item {
-                val blockedClause = if (hardBlockedCount > 0)
-                    " · $hardBlockedCount strong negative songs blocked from taste recs"
-                else ""
+                val guardPct = (tuning.negativeStrength * 100).toInt()
+                val blockedClause = buildString {
+                    if (upNextHardBlockedCount > 0 || upNextSoftExcludedCount > 0) {
+                        append(" · Up Next excludes")
+                        if (upNextHardBlockedCount > 0) {
+                            append(" $upNextHardBlockedCount strong negative")
+                            if (upNextHardBlockedCount == 1) append(" song") else append(" songs")
+                        }
+                        if (upNextSoftExcludedCount > 0) {
+                            if (upNextHardBlockedCount > 0) append(" and")
+                            append(" $upNextSoftExcludedCount mild negative")
+                            if (upNextSoftExcludedCount == 1) append(" song") else append(" songs")
+                        }
+                        append(" at $guardPct% Negative guard")
+                    }
+                    if (dislikedSet.isNotEmpty()) {
+                        append(" · ${dislikedSet.size} disliked always excluded")
+                    }
+                }
                 Text(
                     text = "$activeCount active signals across $totalCount embedded songs$blockedClause. " +
                         "Tap any row to start playback from that order.",
@@ -276,9 +343,9 @@ fun TasteScreen(
             }
             item {
                 TuningRow(
-                    label = "Skip strength",
+                    label = "Negative guard",
                     value = tuning.negativeStrength,
-                    description = "Higher = songs in your Negative list (X'd, disliked, repeat-skipped) pull recommendations farther away from their sound.",
+                    description = "Higher = Up Next avoids more songs you've skipped, X'd, or strongly disliked (harder negative filter). Lower = only the worst negatives are kept out; disliked songs are always excluded.",
                     onChange = onNegativeStrengthChange,
                     onReset = onNegativeStrengthReset,
                 )
@@ -466,9 +533,9 @@ fun TasteScreen(
             title = { Text("Reset engine?") },
             text = {
                 Column {
-                    Text("Clears: Up Next, playback history, taste profile summary, favorites, dislikes, X-score, session logs, and saved playback state.")
+                    Text("Clears: Up Next, playback history, X-score, session logs, similarity boost, and saved playback state.")
                     Spacer(Modifier.height(8.dp))
-                    Text("Keeps: song files, embeddings, playlists, and common logs.")
+                    Text("Keeps: song files, embeddings, playlists, and your liked and disliked songs.")
                     Spacer(Modifier.height(8.dp))
                     Text("Playback will stop. This cannot be undone.")
                 }
@@ -490,6 +557,7 @@ data class EngineSnapshot(
     val blendSession: String,
     val blendProfile: String,
     val blendMode: String,           // e.g. "Strong session blend"
+    val lastRefreshLabel: String? = null,
     val queueSize: Int,
     val queueMode: String,           // "AI" / "Shuffle"
     val embeddingsCovered: Int,
@@ -673,7 +741,7 @@ private fun EngineSnapshotGrid(snap: EngineSnapshot) {
                 modifier = Modifier.weight(1f),
                 key = "Current Blend",
                 value = "${snap.blendCurrent} / ${snap.blendSession} / ${snap.blendProfile}",
-                meta = snap.blendMode,
+                meta = snap.lastRefreshLabel ?: snap.blendMode,
             )
             EngineCard(
                 modifier = Modifier.weight(1f),
@@ -827,7 +895,7 @@ private fun SignalRowView(
                     val col = if (row.similarityBoost > 0f) ScorePositiveColor else ScoreNegativeColor
                     StatusChip("Similarity $sign${"%.2f".format(row.similarityBoost)}", col)
                 }
-                if (row.isHardBlocked) StatusChip("Rec blocked", ScoreNegativeColor)
+                if (row.isHardBlocked) StatusChip("Up Next excluded", ScoreNegativeColor)
                 if (row.isShortListened) StatusChip("Short-listened", ScoreNegativeColor)
                 if (row.isSuspicious) StatusChip("Review", Color(0xFFFBBF24)) // amber/warning
                 if (row.inTopPositive30) StatusChip("Top +30", ScorePositiveColor)

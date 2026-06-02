@@ -35,6 +35,9 @@ class PlaylistsEngine(private val appContext: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    private fun normalizeName(name: String): String =
+        name.trim().ifBlank { "New playlist" }
+
     init {
         scope.launch {
             try {
@@ -51,7 +54,7 @@ class PlaylistsEngine(private val appContext: Context) {
     fun create(name: String): Playlist {
         val pl = Playlist(
             id = java.util.UUID.randomUUID().toString(),
-            name = name.ifBlank { "Untitled" },
+            name = normalizeName(name),
             songFilenames = mutableListOf(),
         )
         val next = _playlists.value + pl
@@ -61,8 +64,9 @@ class PlaylistsEngine(private val appContext: Context) {
     }
 
     fun rename(id: String, newName: String) {
+        val normalized = normalizeName(newName)
         val next = _playlists.value.map {
-            if (it.id == id) it.copy(name = newName, updatedAt = System.currentTimeMillis())
+            if (it.id == id) it.copy(name = normalized, updatedAt = System.currentTimeMillis())
             else it
         }
         _playlists.value = next

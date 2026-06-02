@@ -149,8 +149,10 @@ class TasteEngine(private val appContext: Context) {
         // HARD_EXCLUDE_FLOOR (1.5) so a fresh dislike is reliably
         // blocked from recommendations. Halflife decay (every 2 plays)
         // still applies on top.
-        private const val FAVORITE_PRIOR_BASE = 1.5f
-        private const val DISLIKE_PRIOR_BASE = 2.5f
+        const val MANUAL_FAVORITE_PRIOR_BASE = 1.5f
+        const val MANUAL_DISLIKE_PRIOR_BASE = 2.5f
+        private const val FAVORITE_PRIOR_BASE = MANUAL_FAVORITE_PRIOR_BASE
+        private const val DISLIKE_PRIOR_BASE = MANUAL_DISLIKE_PRIOR_BASE
         private const val MANUAL_PRIOR_HALF_LIFE_PLAYS = 2f
         private const val MANUAL_PRIOR_MIN = 0.05f
 
@@ -169,9 +171,24 @@ class TasteEngine(private val appContext: Context) {
         )
         const val SIMILARITY_BOOST_MAX = 4.0f
 
-        // Hard-block thresholds (engine-state.js:20-21).
-        const val HARD_EXCLUDE_SHARE = 0.18f
-        const val HARD_EXCLUDE_FLOOR = 1.5f
+        // Hard-block thresholds — see [RecommendationPolicy].
+        const val HARD_EXCLUDE_SHARE = RecommendationPolicy.HARD_EXCLUDE_SHARE
+        const val HARD_EXCLUDE_FLOOR = RecommendationPolicy.HARD_EXCLUDE_FLOOR
+
+        /** Pure xScore update for playback events — used by [recordPlaybackEvent] and unit tests. */
+        fun nextXScoreAfterPlayback(beforeXScore: Float, fraction: Float, source: String): Float {
+            val frac = fraction.coerceIn(0f, 1f)
+            val isUserSkip = source == "next_button" || source == "prev_button"
+            val isSkip = frac < SKIP_THRESHOLD
+            val isFullListen = frac >= FULL_LISTEN_THRESHOLD
+            return when {
+                isSkip && isUserSkip ->
+                    (beforeXScore + USER_SKIP_NEGATIVE_STEP).coerceAtMost(NEG_SCORE_MAX)
+                isFullListen ->
+                    (beforeXScore - NEG_LISTEN_DECAY).coerceAtLeast(0f)
+                else -> beforeXScore
+            }
+        }
 
         // Decoration ranking window (engine-taste.js:644-660).
         private const val TOP_RANK_LIMIT = 30
@@ -275,6 +292,36 @@ class TasteEngine(private val appContext: Context) {
     fun resetSessionBias() = setSessionBias(DEFAULT_SESSION_BIAS)
     fun resetNegativeStrength() = setNegativeStrength(DEFAULT_NEGATIVE_STRENGTH)
 
+    /** Direct scores for policy (Negative guard slider). */
+    fun directScoresByFilename(): Map<String, Float> {
+        val dec = _decorated.value
+        if (dec.rows.isNotEmpty()) {
+            return dec.rows.mapValues { it.value.breakdown.directScore }
+        }
+        val now = System.currentTimeMillis()
+        return _signals.value.mapValues { (_, sig) ->
+            computeDirectScore(
+                plays = sig.plays,
+                avgFraction = sig.avgFraction,
+                xScore = sig.xScore,
+                favoritePrior = sig.favoritePrior,
+                dislikePrior = sig.dislikePrior,
+                similarityBoost = sig.similarityBoost,
+                lastPlayedAt = sig.lastPlayedAt,
+                xScoreUpdatedAt = sig.xScoreUpdatedAt,
+                similarityBoostUpdatedAt = sig.similarityBoostUpdatedAt,
+                lastUpdatedAt = sig.lastUpdatedAt,
+                now = now,
+            ).directScore
+        }
+    }
+
+    fun hardBlockedFilenamesForPolicy(negativeStrength: Float): Set<String> =
+        RecommendationPolicy.hardBlockedFilenames(directScoresByFilename(), negativeStrength)
+
+    fun softExcludedFilenamesForPolicy(negativeStrength: Float): Set<String> =
+        RecommendationPolicy.softExcludedFilenames(directScoresByFilename(), negativeStrength)
+
     fun signalFor(filename: String): TasteSignal = _signals.value[filename] ?: TasteSignal()
 
     /**
@@ -341,17 +388,8 @@ class TasteEngine(private val appContext: Context) {
             before.plays == 0 -> frac
             else -> ((before.avgFraction * before.plays) + frac) / newPlays
         }
-        val xScoreChanged = (isSkip && isUserSkip) || isFullListen
-        val newX = when {
-            // Push #66: only explicit Next/Prev button bumps xScore.
-            // Manual taps / background flushes / cold-start replays just
-            // record encounters without penalty.
-            isSkip && isUserSkip ->
-                (before.xScore + USER_SKIP_NEGATIVE_STEP).coerceAtMost(NEG_SCORE_MAX)
-            isFullListen ->
-                (before.xScore - NEG_LISTEN_DECAY).coerceAtLeast(0f)
-            else -> before.xScore
-        }
+        val newX = nextXScoreAfterPlayback(before.xScore, frac, source)
+        val xScoreChanged = newX != before.xScore
         // Push #73: stamp xScoreUpdatedAt only when xScore actually
         // changed. Stale timestamps would defeat the recency decay.
         val newXScoreUpdatedAt = if (xScoreChanged) now else before.xScoreUpdatedAt
@@ -610,6 +648,49 @@ class TasteEngine(private val appContext: Context) {
     }
 
     /**
+     * Atomic Reset Engine path: wipe playback-derived signals, then seed
+     * fresh entries for every manual favorite/dislike in one persist.
+     */
+    fun resetAllSignalsPreservingManual(favSet: Set<String>, disSet: Set<String>) {
+        processedPlaybackEventIds = emptySet()
+        val now = System.currentTimeMillis()
+        val toReapply = favSet + disSet
+        val newMap = HashMap<String, TasteSignal>(toReapply.size)
+        for (fn in toReapply) {
+            val isFavorite = fn in favSet
+            val isDisliked = fn in disSet
+            val newFavPrior = if (isFavorite) computeFavoritePrior(0) else 0f
+            val newDisPrior = if (isDisliked) computeDislikePrior(0) else 0f
+            val bd = computeDirectScore(
+                plays = 0,
+                avgFraction = 0f,
+                xScore = 0f,
+                favoritePrior = newFavPrior,
+                dislikePrior = newDisPrior,
+                similarityBoost = 0f,
+                lastPlayedAt = 0L,
+                lastUpdatedAt = now,
+                now = now,
+            )
+            newMap[fn] = TasteSignal(
+                favoritePrior = newFavPrior,
+                dislikePrior = newDisPrior,
+                isFavorite = isFavorite,
+                isDisliked = isDisliked,
+                directScore = bd.directScore,
+                lastUpdatedAt = now,
+            )
+        }
+        _signals.value = newMap
+        refreshDecorated()
+        scope.launch { persistSignals() }
+        android.util.Log.i(
+            "TasteEngine",
+            "resetAllSignalsPreservingManual fav=${favSet.size} dis=${disSet.size} reapply=${toReapply.size}"
+        )
+    }
+
+    /**
      * Push #69 — Capacitor parity (`_buildSuspiciousRecommendationData`):
      * detect songs with conflicting signals that warrant a user review.
      * Returns (isSuspicious, reason). Reason is empty when not suspicious.
@@ -695,20 +776,11 @@ class TasteEngine(private val appContext: Context) {
             .take(TOP_RANK_LIMIT)
             .map { it.fn }
             .toHashSet()
-        // Step 3: hard-block — top 18% of negatives by |directScore| with
-        // floor 1.5. (Filepath/embedding gate happens at Recommender call
-        // site; we just expose the filename set here.)
-        val negativeStrongRows = rows.filter { it.bd.directScore < 0f }
-            .sortedByDescending { abs(it.bd.directScore) }
-        val hardBlocked = HashSet<String>()
-        if (negativeStrongRows.isNotEmpty()) {
-            val cap = max(1, ceil(negativeStrongRows.size * HARD_EXCLUDE_SHARE).toInt())
-            for (i in 0 until minOf(cap, negativeStrongRows.size)) {
-                if (abs(negativeStrongRows[i].bd.directScore) >= HARD_EXCLUDE_FLOOR) {
-                    hardBlocked += negativeStrongRows[i].fn
-                }
-            }
-        }
+        // Step 3: hard-block at full Negative guard strength (display / legacy set).
+        val hardBlocked = RecommendationPolicy.hardBlockedFilenames(
+            rows.associate { it.fn to it.bd.directScore },
+            negativeStrength = 1f,
+        )
         // Step 4: build DecoratedRow entries.
         val out = HashMap<String, DecoratedRow>(rows.size)
         var posCount = 0

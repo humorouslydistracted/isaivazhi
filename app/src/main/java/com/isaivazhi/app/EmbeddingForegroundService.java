@@ -54,6 +54,7 @@ public class EmbeddingForegroundService extends Service {
     // the persisted-batch resumption path.
     public static final String ACTION_RESUME = "com.isaivazhi.app.EMBEDDING_RESUME";
     public static final String EXTRA_PATHS = "paths";
+    public static final String EXTRA_SPLIT_COUNT = "splitCount";
     public static final String EXTRA_PLAYBACK_ACTIVE = "playbackActive";
 
     private final CopyOnWriteArrayList<Messenger> clients = new CopyOnWriteArrayList<>();
@@ -78,6 +79,7 @@ public class EmbeddingForegroundService extends Service {
     // step ("Extracting audio model" / "Starting NPU/GPU" / "Falling back
     // to CPU") in the foreground notification and the AI banner.
     private volatile String initStepText = "";
+    private int batchSplitCount = 3;
     // Push #43: songs the user added (via per-row Embed or another Embed
     // Pending tap) while a batch was already in flight. Drained at the
     // end of the current batch into a new internal embedSongs call.
@@ -107,6 +109,8 @@ public class EmbeddingForegroundService extends Service {
 
         if (ACTION_START.equals(action)) {
             ArrayList<String> paths = intent.getStringArrayListExtra(EXTRA_PATHS);
+            batchSplitCount = EmbeddingWindowConfig.normalizeSplitCount(
+                    intent.getIntExtra(EXTRA_SPLIT_COUNT, batchSplitCount));
             playbackActiveHint = intent.getBooleanExtra(EXTRA_PLAYBACK_ACTIVE, playbackActiveHint);
             if (paths == null || paths.isEmpty()) {
                 if (!embeddingInProgress) stopSelf();
@@ -206,6 +210,7 @@ public class EmbeddingForegroundService extends Service {
                 broadcastStatus();
             });
         }
+        embeddingService.setSplitCount(batchSplitCount);
 
         embeddingInProgress = true;
         currentStep = 0;
@@ -523,6 +528,7 @@ public class EmbeddingForegroundService extends Service {
             }
             JSONObject payload = new JSONObject();
             payload.put("paths", arr);
+            payload.put("splitCount", batchSplitCount);
             File file = new File(getEmbeddingDataDir(), ACTIVE_BATCH_FILE);
             FileOutputStream fos = new FileOutputStream(file);
             fos.write(payload.toString().getBytes(StandardCharsets.UTF_8));
@@ -542,6 +548,8 @@ public class EmbeddingForegroundService extends Service {
             fis.close();
             if (read <= 0) return null;
             JSONObject payload = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            batchSplitCount = EmbeddingWindowConfig.normalizeSplitCount(
+                    payload.optInt("splitCount", batchSplitCount));
             JSONArray arr = payload.optJSONArray("paths");
             if (arr == null || arr.length() == 0) return null;
             ArrayList<String> paths = new ArrayList<>();

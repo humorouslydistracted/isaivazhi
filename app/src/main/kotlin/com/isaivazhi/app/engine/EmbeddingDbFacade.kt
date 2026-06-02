@@ -1,5 +1,7 @@
 package com.isaivazhi.app.engine
 
+import android.os.Handler
+import android.os.Looper
 import android.content.Context
 import com.isaivazhi.app.EmbeddingDbManager
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -16,6 +18,7 @@ import org.json.JSONObject
 class EmbeddingDbFacade(appContext: Context) {
 
     private val manager: EmbeddingDbManager = EmbeddingDbManager.get(appContext)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // Bugfix 2026-06-01h: in-memory vec cache. sqlite-vec uses mmap for its
     // vector index, and the kernel evicts those pages within 1-2s of the
@@ -127,6 +130,70 @@ class EmbeddingDbFacade(appContext: Context) {
         manager.migrateFromLegacyIfNeeded(cb)
     }
 
+    /** Re-ingest portable backup (IVZ .bin preferred, legacy JSON fallback). */
+    suspend fun forceReimportEmbeddings(): JSONObject? = awaitJsonObject { cb ->
+        manager.forceReimportEmbeddings(cb)
+    }
+
+    /** @deprecated Use [forceReimportEmbeddings]. */
+    suspend fun forceReimportLegacyJson(): JSONObject? = forceReimportEmbeddings()
+
+    /** Clear JVM heap caches after a full DB replace (import). */
+    fun clearVecHeapCache() {
+        vecHeapCache.clear()
+        hashToMetaCache.clear()
+        filenameToHashCache.clear()
+    }
+
+    suspend fun exportEmbeddingsBin(splitCount: Int = 3): JSONObject? = awaitJsonObject { cb ->
+        manager.exportEmbeddingsBin(EmbeddingSplitCount.normalize(splitCount), cb)
+    }
+
+    /**
+     * Link current library filepaths to imported embedding rows by matching
+     * basename / filename / artist+album when stored paths differ.
+     */
+    suspend fun relinkLibraryPaths(songs: List<Song>): JSONObject? {
+        val arr = org.json.JSONArray()
+        for (s in songs) {
+            val fp = s.filePath ?: continue
+            arr.put(
+                org.json.JSONObject().apply {
+                    put("filepath", fp)
+                    put("filename", s.filename)
+                    put("artist", s.artist)
+                    put("album", s.album)
+                },
+            )
+        }
+        return awaitJsonObject { cb -> manager.relinkLibraryPaths(arr, cb) }
+    }
+
+    /** filepath → content_hash for recommendation + pending checks. */
+    suspend fun contentHashByFilepath(): Map<String, String> {
+        val res = awaitJsonObject { cb -> manager.getPathIndexMap(cb) } ?: return emptyMap()
+        val paths = res.optJSONObject("paths") ?: return emptyMap()
+        val out = HashMap<String, String>(paths.length())
+        val keys = paths.keys()
+        while (keys.hasNext()) {
+            val fp = keys.next()
+            val hash = paths.optString(fp, "")
+            if (fp.isNotEmpty() && hash.isNotEmpty()) out[fp] = hash
+        }
+        return out
+    }
+
+    /** Attach content hashes from the path index so AI can use imported vectors. */
+    fun enrichSongsWithHashes(songs: List<Song>, hashByFilepath: Map<String, String>): List<Song> {
+        if (hashByFilepath.isEmpty()) return songs
+        return songs.map { s ->
+            val fp = s.filePath ?: return@map s
+            val hash = hashByFilepath[fp] ?: return@map s
+            if (s.contentHash == hash && s.hasEmbedding) s
+            else s.copy(contentHash = hash, hasEmbedding = true)
+        }
+    }
+
     suspend fun stats(): JSONObject? = awaitJsonObject { cb ->
         manager.stats(cb)
     }
@@ -154,6 +221,9 @@ class EmbeddingDbFacade(appContext: Context) {
     suspend fun exportLegacyMirror(): JSONObject? = awaitJsonObject { cb ->
         manager.exportLegacyMirror(cb)
     }
+
+    /** Fast portable backup (IVZ1 single file). Preferred over [exportLegacyMirror]. */
+    suspend fun exportPortableBin(): JSONObject? = exportEmbeddingsBin()
 
     /**
      * Batch fetch of vec FloatArrays by content hash. Used by the MMR rerank
@@ -436,10 +506,12 @@ class EmbeddingDbFacade(appContext: Context) {
         call: (EmbeddingDbManager.Callback<JSONObject>) -> Unit
     ): JSONObject? = suspendCancellableCoroutine { cont ->
         val cb = EmbeddingDbManager.Callback<JSONObject> { result, error ->
-            if (error != null) {
-                cont.resumeWithException(error)
-            } else {
-                cont.resume(result)
+            // EmbeddingDbManager callbacks arrive on EmbeddingDbWorker.
+            // Always resume on Main so callers can update Compose state.
+            mainHandler.post {
+                if (!cont.isActive) return@post
+                if (error != null) cont.resumeWithException(error)
+                else cont.resume(result)
             }
         }
         call(cb)
@@ -449,10 +521,10 @@ class EmbeddingDbFacade(appContext: Context) {
         call: (EmbeddingDbManager.Callback<Int>) -> Unit
     ): Int = suspendCancellableCoroutine { cont ->
         val cb = EmbeddingDbManager.Callback<Int> { result, error ->
-            if (error != null) {
-                cont.resumeWithException(error)
-            } else {
-                cont.resume(result ?: 0)
+            mainHandler.post {
+                if (!cont.isActive) return@post
+                if (error != null) cont.resumeWithException(error)
+                else cont.resume(result ?: 0)
             }
         }
         call(cb)

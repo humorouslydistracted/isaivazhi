@@ -3,6 +3,7 @@ package com.isaivazhi.app
 import android.app.Application
 import com.isaivazhi.app.engine.AppContainer
 import com.isaivazhi.app.engine.LibraryCache
+import com.isaivazhi.app.ui.hasAudioReadPermission
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -97,6 +98,13 @@ class IsaiVazhiApp : Application() {
         // to page back in.
         warmScope.launch {
             try {
+                if (!hasAudioReadPermission(this@IsaiVazhiApp)) {
+                    android.util.Log.i(
+                        "IsaiVazhiApp",
+                        "Skipping eager library load — audio permission not granted yet"
+                    )
+                    return@launch
+                }
                 val songs = LibraryCache.loadOrScan(this@IsaiVazhiApp)
                 container.library.value = songs
                 // Bugfix 2026-06-01h: populate filename→hash and hash→meta

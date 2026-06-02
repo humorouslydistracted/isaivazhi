@@ -1,0 +1,6 @@
+.venv-embeddings/
+laptop_config.json
+*.pt
+__pycache__/
+local_embeddings.json
+*.tmp

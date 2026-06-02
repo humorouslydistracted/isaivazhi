@@ -40,6 +40,7 @@ fun ViewAllScreen(
     onBack: () -> Unit,
     onPlay: (queue: List<Song>, startIndex: Int) -> Unit,
     onLongPress: (Song) -> Unit,
+    subtitleForSong: ((Song) -> String)? = null,
 ) {
     Box(
         modifier = Modifier
@@ -114,9 +115,11 @@ fun ViewAllScreen(
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Spacer(Modifier.height(2.dp))
+                            val subtitle = subtitleForSong?.invoke(song)
+                                ?: listOf(song.artist, song.album).filter { it.isNotBlank() }
+                                    .joinToString(" • ")
                             Text(
-                                text = listOf(song.artist, song.album).filter { it.isNotBlank() }
-                                    .joinToString(" • "),
+                                text = subtitle,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,

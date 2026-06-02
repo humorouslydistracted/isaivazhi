@@ -1,6 +1,7 @@
 package com.isaivazhi.app.engine
 
 import android.content.Context
+import com.isaivazhi.app.ui.hasAudioReadPermission
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -21,18 +22,35 @@ object LibraryCache {
 
     private const val CACHE_FILE = "song_library.json"
     private const val MAX_AGE_MS = 6L * 60L * 60L * 1000L  // 6 hours
+    @Volatile var lastLoadSource: String = "unknown"
+        private set
+    @Volatile var lastLoadElapsedMs: Long = 0L
+        private set
 
     suspend fun loadOrScan(ctx: Context, force: Boolean = false): List<Song> = withContext(Dispatchers.IO) {
+        val startMs = android.os.SystemClock.elapsedRealtime()
         if (!force) {
             val cached = readIfFresh(ctx)
             if (cached != null) {
+                lastLoadSource = "cache"
+                lastLoadElapsedMs = android.os.SystemClock.elapsedRealtime() - startMs
                 android.util.Log.i("LibraryCache", "Loaded ${cached.size} songs from cache")
                 return@withContext cached
             }
         }
         val scanned = LibraryScanner.scan(ctx)
-        runCatching { write(ctx, scanned) }
-            .onFailure { android.util.Log.w("LibraryCache", "save failed: ${it.message}") }
+        lastLoadSource = if (force) "forced_scan" else "scan"
+        lastLoadElapsedMs = android.os.SystemClock.elapsedRealtime() - startMs
+        val hasPermission = hasAudioReadPermission(ctx)
+        if (scanned.isNotEmpty() || hasPermission) {
+            runCatching { write(ctx, scanned) }
+                .onFailure { android.util.Log.w("LibraryCache", "save failed: ${it.message}") }
+        } else {
+            android.util.Log.i(
+                "LibraryCache",
+                "Skipping cache write: empty scan without audio permission"
+            )
+        }
         scanned
     }
 
@@ -72,7 +90,9 @@ object LibraryCache {
                     disliked = o.optBoolean("disliked", false),
                 )
             }
-            out
+            // Never trust an empty cache — it may have been written before
+            // the user granted storage permission.
+            if (out.isEmpty()) null else out
         }.getOrNull()
     }
 

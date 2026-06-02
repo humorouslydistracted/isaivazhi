@@ -2,7 +2,6 @@ package com.isaivazhi.app.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,7 +10,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
@@ -27,26 +25,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
 /**
- * Lightweight settings screen with the controls users need after onboarding:
- *   - re-import a local_embeddings.json
- *   - kick off background embedding for the full library
- *   - rescan MediaStore (invalidates the 6h library cache)
- *   - clear the album-art disk cache
- *   - stats: song count + embedding row count + DB size + sqlite-vec status
+ * App & device maintenance: restore embeddings after reinstall, clear caches.
+ * Embedding status and batch actions live on AI & Library; logs live on Logs.
  */
 @Composable
 fun SettingsScreen(
-    songCount: Int,
-    embeddingRows: Int,
-    embeddingDimText: String,
-    vecExtensionLoaded: Boolean,
     artCacheBytes: Long,
+    importInProgress: Boolean = false,
+    importStatus: String? = null,
     onBack: () -> Unit,
     onReimportEmbeddings: () -> Unit,
-    onEmbedAllNow: () -> Unit,
-    onRescanLibrary: () -> Unit,
     onClearArtCache: () -> Unit,
-    onOpenActivityLog: (() -> Unit)? = null,
+    onOpenAiLibrary: (() -> Unit)? = null,
+    onOpenLogs: (() -> Unit)? = null,
 ) {
     Box(
         modifier = Modifier
@@ -75,69 +66,80 @@ fun SettingsScreen(
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-                StatRow("Songs on device", songCount.toString())
-                StatRow("Embeddings in DB", "$embeddingRows ($embeddingDimText)")
-                StatRow("sqlite-vec extension", if (vecExtensionLoaded) "Loaded" else "Not loaded — fallback to NEON")
-                StatRow("Album-art cache", formatBytes(artCacheBytes))
-            }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-
-            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "Maintenance",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            )
             ActionRow(
-                title = "Import local_embeddings.json",
-                subtitle = "Pick a file from device to replace current embeddings.",
+                title = "Import isaivazhi_embeddings.bin",
+                subtitle = "Restore after reinstall. Export a backup from AI & Library first.",
                 onClick = onReimportEmbeddings,
+                enabled = !importInProgress,
             )
-            ActionRow(
-                title = "Embed full library now",
-                subtitle = "Runs ONNX in background for every song.",
-                onClick = onEmbedAllNow,
-            )
-            ActionRow(
-                title = "Rescan music library",
-                subtitle = "Discards the cache and re-walks MediaStore.",
-                onClick = onRescanLibrary,
+            EmbeddingsImportStatusRow(
+                inProgress = importInProgress,
+                statusMessage = importStatus,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
             ActionRow(
                 title = "Clear album-art cache",
-                subtitle = "Re-extracts art on next view.",
+                subtitle = "Album-art cache: ${formatBytes(artCacheBytes)}. Re-extracts art on next view.",
                 onClick = onClearArtCache,
             )
-            if (onOpenActivityLog != null) {
-                ActionRow(
-                    title = "Activity Log",
-                    subtitle = "Last 200 playback/taste/notification events with timestamps.",
-                    onClick = onOpenActivityLog,
+
+            if (onOpenAiLibrary != null || onOpenLogs != null) {
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.padding(top = 8.dp),
                 )
+                Text(
+                    text = "Go to",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+                if (onOpenAiLibrary != null) {
+                    ActionRow(
+                        title = "AI & Library",
+                        subtitle = "Embedding status, pending songs, and library health.",
+                        onClick = onOpenAiLibrary,
+                    )
+                }
+                if (onOpenLogs != null) {
+                    ActionRow(
+                        title = "Diagnostics",
+                        subtitle = "Activity, embedding batches, crashes, and startup.",
+                        onClick = onOpenLogs,
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-private fun StatRow(label: String, value: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onBackground)
-    }
-}
-
-@Composable
-private fun ActionRow(title: String, subtitle: String, onClick: () -> Unit) {
+private fun ActionRow(
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Text(
             text = title,
             style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onBackground,
+            color = if (enabled) {
+                MaterialTheme.colorScheme.onBackground
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
         )
         Spacer(Modifier.height(2.dp))
         Text(

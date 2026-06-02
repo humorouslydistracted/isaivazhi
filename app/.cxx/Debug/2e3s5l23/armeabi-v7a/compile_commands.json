@@ -1,0 +1,7 @@
+[
+{
+  "directory": "C:/Users/myuva/Documents/music_app_development/native/app/.cxx/Debug/2e3s5l23/armeabi-v7a",
+  "command": "C:\\Users\\myuva\\AppData\\Local\\Android\\Sdk\\ndk\\27.0.12077973\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=armv7-none-linux-androideabi24 --sysroot=C:/Users/myuva/AppData/Local/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/windows-x86_64/sysroot -Disaivazhi_native_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -std=c++14 -fno-limit-debug-info  -fPIC -O3 -ffast-math -funroll-loops -fvisibility=hidden -Wall -Wno-unused-parameter -mfpu=neon -o CMakeFiles\\isaivazhi_native.dir\\embedding_native.cpp.o -c C:\\Users\\myuva\\Documents\\music_app_development\\native\\app\\src\\main\\cpp\\embedding_native.cpp",
+  "file": "C:\\Users\\myuva\\Documents\\music_app_development\\native\\app\\src\\main\\cpp\\embedding_native.cpp"
+}
+]

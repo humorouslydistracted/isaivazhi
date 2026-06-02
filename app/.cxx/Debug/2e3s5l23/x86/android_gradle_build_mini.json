@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "C:\\Users\\myuva\\Documents\\music_app_development\\native\\app\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "C:\\Users\\myuva\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "C:\\Users\\myuva\\Documents\\music_app_development\\native\\app\\.cxx\\Debug\\2e3s5l23\\x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "C:\\Users\\myuva\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "C:\\Users\\myuva\\Documents\\music_app_development\\native\\app\\.cxx\\Debug\\2e3s5l23\\x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "isaivazhi_native::@6890427a1f51a3e7e1df": {
+      "artifactName": "isaivazhi_native",
+      "abi": "x86",
+      "output": "C:\\Users\\myuva\\Documents\\music_app_development\\native\\app\\build\\intermediates\\cxx\\Debug\\2e3s5l23\\obj\\x86\\libisaivazhi_native.so",
+      "runtimeFiles": []
+    }
+  }
+}

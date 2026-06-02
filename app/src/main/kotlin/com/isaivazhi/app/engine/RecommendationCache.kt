@@ -195,19 +195,22 @@ class RecommendationCache(
         val current = library.firstOrNull { it.filename == seedFilename } ?: return emptyList()
 
         val recMode = container.preferences.recMode.first()
-        val tuning = container.taste.tuning.value
-        val decoratedSignals = container.taste.decoratedSignals.value
-        val hardBlockedFilenames = decoratedSignals.hardBlockedFilenames
         val playbackState = container.playback.state.value
         val playNextSet = playbackState.playNextFilenames
         val excludeFns = playNextSet + seedFilename
-
-        val profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec
-
-        if (!recMode) {
+        val embeddingRows = runCatching {
+            container.embeddingDb.rowCount()
+        }.getOrDefault(0)
+        if (!recMode || embeddingRows == 0) {
             return library.filter { it.filePath != null && it.filename !in excludeFns }
                 .shuffled().take(50)
         }
+        val tuning = container.taste.tuning.value
+        val hardBlockedFilenames = container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
+        val softExcludedFilenames = container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength)
+        val dislikedFilenames = container.disliked.disliked.value
+
+        val profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec
 
         // Bugfix 2026-06-01e: do NOT wrap embedding-DB calls in runCatching.
         // runCatching catches CancellationException, which (in 06-01d) made
@@ -237,6 +240,8 @@ class RecommendationCache(
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = excludeFns,
                 hardBlockedFilenames = hardBlockedFilenames,
+                dislikedFilenames = dislikedFilenames,
+                softExcludedFilenames = softExcludedFilenames,
                 blendedQueryVec = blendedVec,
             )
         } catch (ce: CancellationException) {

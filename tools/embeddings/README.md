@@ -1,92 +1,71 @@
-# Embedding Tools
+# Embedding Tools (Bin-First)
 
-IsaiVazhi can run without embeddings, but its similarity-based recommendation
-features are best after generating CLAP audio embeddings for the local music
-library.
+All generators now target the same outcome:
 
-These scripts produce `local_embeddings.json`, the import format understood by
-the app's AI management page. They use LAION-CLAP HTSAT-base and mirror the
-mobile app's embedding logic:
+- `local_embeddings.json` (resume/checkpoint)
+- `isaivazhi_embeddings.bin` (**final import file for app**)
 
-- 48 kHz mono audio
-- three 10-second windows at 20%, 50%, and 80% of each track
-- averaged and L2-normalized 512-dimensional vectors
-- content hashes from the first 30 seconds of decoded audio
-- `_path_index` mappings so duplicate filenames and duplicate audio can be
-  handled safely
+Python baseline across environments: **3.12**.
 
-## Scripts
+## Minimal Inputs
 
-| Script | Use case |
-| --- | --- |
-| `kaggle_embedding_generator.py` | Kaggle notebook or Kaggle GPU session. |
-| `colab_embedding_generator.py` | Google Colab workflow with Drive mounted. |
-| `local_embedding_generator.py` | Laptop or desktop run, preferably with CUDA. |
-| `merge_local_embeddings.py` | Strictly validate and merge two generated JSON files. |
+Most users only need:
 
-## Kaggle
+1. `songs_dir` — where your songs are in that environment
+2. `splits` — `7` recommended for your quality-first one-time run
 
-1. Upload your music folder as a Kaggle dataset.
-2. Start a Kaggle notebook with GPU enabled.
-3. Install dependencies:
+`phone_base` defaults to `/storage/emulated/0/Music`.
+
+## Quick Start
+
+### Local (Windows / GTX 1650)
+
+Use the guided flow in **[LAPTOP_EMBED.md](LAPTOP_EMBED.md)**.
+
+### Kaggle (private dataset, GPU)
 
 ```bash
 pip install -q numpy==1.26.4 laion-clap librosa soundfile mutagen
+pip install -q torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+python tools/embeddings/kaggle_embedding_generator.py --songs-dir /kaggle/input/your-private-dataset --splits 7
 ```
 
-4. Run the generator:
+Output file: `/kaggle/working/isaivazhi_embeddings.bin`
+
+### Colab (GPU)
 
 ```bash
-python kaggle_embedding_generator.py \
-  --songs-dir /kaggle/input/my-music \
-  --output-dir /kaggle/working \
-  --phone-music-base /storage/emulated/0/songs_downloaded
+pip install -q numpy==1.26.4 laion-clap librosa soundfile mutagen
+pip install -q torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+python tools/embeddings/colab_embedding_generator.py --songs-dir /content/drive/MyDrive/isaivazhi_songs --splits 7
 ```
 
-Use `--songs-dir` as the folder whose relative paths should match the music
-folder on the phone. The script scans recursively, so album subfolders are fine.
+Output file: `/content/isaivazhi_embeddings.bin`
 
-## Colab
+## CPU Fallback
 
-Open `colab_embedding_generator.py` in Colab, set:
+If CUDA is unavailable, scripts continue on CPU and print a clear warning at startup.
 
-```python
-SONGS_DIR = "/content/drive/MyDrive/songs_downloaded"
-OUTPUT_DIR = "/content/drive/MyDrive/music_app"
-PHONE_MUSIC_BASE = "/storage/emulated/0/songs_downloaded"
-```
+## Split Count (3 / 5 / 7)
 
-Then run the cells. A GPU runtime is strongly recommended because the HTSAT-base
-checkpoint is large.
+Window centers are shared in `embedding_config.py`:
 
-## Local
+| Splits | Positions |
+| --- | --- |
+| 3 | 20%, 50%, 80% |
+| 5 | 1/6, 2/6, 3/6, 4/6, 5/6 |
+| 7 | 1/8 … 7/8 |
 
-Install dependencies in a virtual environment:
+Use the same split count in the app import/runtime.
+
+## Folder Rename Concern (Phone Path)
+
+Embeddings are based on audio content hash, not folder name.  
+`filepath` is stored for fast matching. If you later rename top-level folders, re-import + relink usually recovers mapping without full re-embed.
+
+## Convert Existing JSON (No Re-Embedding)
 
 ```bash
-pip install numpy==1.26.4 laion-clap librosa soundfile mutagen torch torchvision torchaudio
+cd tools/embeddings
+python json_to_ivz.py ../../local_embeddings.json ../../isaivazhi_embeddings.bin --splits 7 --verify
 ```
-
-For NVIDIA GPU support, install the CUDA PyTorch build that matches your driver:
-
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-Edit `SONGS_DIR` and `PHONE_MUSIC_BASE` in `local_embedding_generator.py`, then
-run:
-
-```bash
-python local_embedding_generator.py
-```
-
-## Import
-
-Copy `local_embeddings.json` to the phone and import it from the IsaiVazhi AI
-page. Advanced/manual app-private path:
-
-```text
-/storage/emulated/0/Android/data/com.isaivazhi.app.kt/files/
-```
-
-Generated checkpoints and embedding JSON files are intentionally ignored by Git.

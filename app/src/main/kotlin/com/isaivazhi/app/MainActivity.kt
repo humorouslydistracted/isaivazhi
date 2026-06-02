@@ -72,6 +72,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.isaivazhi.app.engine.ActivityLogEngine
 import com.isaivazhi.app.engine.AlbumArtRepository
 import com.isaivazhi.app.engine.AppContainer
 import com.isaivazhi.app.engine.ArtPrefetch
@@ -84,12 +85,12 @@ import com.isaivazhi.app.engine.signedDirectScore
 import com.isaivazhi.app.ui.rememberAudioPermissionGate
 import com.isaivazhi.app.ui.rememberDeleteSongHelper
 import com.isaivazhi.app.ui.rememberNotificationsPermissionGate
-import com.isaivazhi.app.ui.screens.ActivityLogScreen
 import com.isaivazhi.app.ui.screens.AiManagementScreen
 import com.isaivazhi.app.ui.screens.AlbumsScreen
 import com.isaivazhi.app.ui.screens.BrowseCategory
 import com.isaivazhi.app.ui.screens.BrowseScreen
-import com.isaivazhi.app.ui.screens.DebugLogsScreen
+import com.isaivazhi.app.ui.screens.LogsScreen
+import com.isaivazhi.app.ui.screens.LogsTab
 // Phase 4 (2026-06-01): DiscoverScreen / DiscoverSectionRef / EmbeddingStatusBanner
 // imports removed alongside the deleted Discover tab. The Similar-to-current
 // row in NowPlayingScreen now covers the only valued surface from Discover.
@@ -99,6 +100,7 @@ import com.isaivazhi.app.ui.screens.FavoritesScreen
 import com.isaivazhi.app.ui.screens.HistoryScreen
 import com.isaivazhi.app.ui.screens.MiniPlayer
 import com.isaivazhi.app.ui.screens.NowPlayingScreen
+import com.isaivazhi.app.ui.screens.EmbeddingsImportDialog
 import com.isaivazhi.app.ui.screens.OnboardingScreen
 import com.isaivazhi.app.ui.screens.PlaylistDetailScreen
 import com.isaivazhi.app.ui.screens.PlaylistsScreen
@@ -140,8 +142,7 @@ private sealed class Overlay {
     data object History : Overlay()
     data object Taste : Overlay()
     data object Ai : Overlay()
-    data object Debug : Overlay()
-    data object ActivityLog : Overlay()
+    data class Logs(val initialTab: LogsTab = LogsTab.Activity) : Overlay()
     data class PlaylistDetail(val playlistId: String) : Overlay()
     data class ViewAll(val category: BrowseCategory) : Overlay()
     // Phase 4 (2026-06-01): SectionViewAll removed with the Discover page.
@@ -283,11 +284,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        // Push #46: refresh the portable local_embeddings.json mirror
-        // when the user backgrounds the app. Catches any drift between
-        // the last batch's auto-export and "now" (e.g. embeddings that
-        // landed via :ai recovery while the user was idle). Atomic
-        // tmp+rename so a process kill while writing can't corrupt.
+        // Portable IVZ backup on background (fast ~5 MB write; no JSON float stringify).
         if (::container.isInitialized) {
             // Push #65: flush mid-song listening evidence into the
             // SignalTimeline before the process can be killed. Without
@@ -299,7 +296,10 @@ class MainActivity : ComponentActivity() {
             //  cold-start recovery reconciles the two."
             flushCurrentPlayback(reason = "app_background")
             CoroutineScope(Dispatchers.IO).launch {
-                runCatching { container.embeddingDb.exportLegacyMirror() }
+                runCatching {
+                    val splits = container.preferences.getEmbeddingSplitCount()
+                    container.embeddingDb.exportEmbeddingsBin(splits)
+                }
             }
         }
         super.onPause()
@@ -407,11 +407,24 @@ private fun AppRoot(container: AppContainer) {
     // every change so the app re-opens where they left off.
     val pagerState = rememberPagerState(pageCount = { Tab.entries.size })
     LaunchedEffect(Unit) {
-        val saved = runCatching { container.preferences.loadLastTab() }.getOrNull()
-        if (saved.isNullOrBlank()) return@LaunchedEffect
-        val target = Tab.entries.indexOfFirst { it.name == saved }
-        if (target >= 0 && target != pagerState.currentPage) {
-            runCatching { pagerState.scrollToPage(target) }
+        try {
+            val saved = runCatching { container.preferences.loadLastTab() }.getOrNull()
+            if (saved.isNullOrBlank()) return@LaunchedEffect
+            val target = Tab.entries.indexOfFirst { it.name == saved }
+            if (target >= 0 && target < Tab.entries.size && target != pagerState.currentPage) {
+                runCatching { pagerState.scrollToPage(target) }
+            } else {
+                // Saved tab is no longer valid (e.g. enum changed) — fall back
+                // to Songs so a bad value cannot cause a startup crash loop.
+                runCatching {
+                    pagerState.scrollToPage(0)
+                    container.preferences.saveLastTab(Tab.Songs.name)
+                }
+            }
+        } catch (t: Throwable) {
+            // Any unexpected failure during restore should not crash startup.
+            // Log via Android's default logger; DebugLogCapture will persist it.
+            android.util.Log.w("MainActivity", "last-tab restore failed: ${t.message}")
         }
     }
     LaunchedEffect(pagerState) {
@@ -432,6 +445,15 @@ private fun AppRoot(container: AppContainer) {
     var artCacheBytes by remember { mutableStateOf(0L) }
     var onboardingDismissed by remember { mutableStateOf(false) }
     var importMessage by remember { mutableStateOf<String?>(null) }
+    var importInProgress by remember { mutableStateOf(false) }
+    var exportBackupInProgress by remember { mutableStateOf(false) }
+    var exportBackupStatus by remember { mutableStateOf<String?>(null) }
+    var embeddingSplitCount by remember { mutableStateOf(3) }
+    var libraryEmbedSplitCount by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(Unit) {
+        embeddingSplitCount = container.preferences.getEmbeddingSplitCount()
+        libraryEmbedSplitCount = container.preferences.getLastEmbedSplitCount()
+    }
     var overlay by remember { mutableStateOf<Overlay>(Overlay.None) }
     var libraryMenuOpen by remember { mutableStateOf(false) }
     var menuSong by remember { mutableStateOf<Song?>(null) }
@@ -441,6 +463,7 @@ private fun AppRoot(container: AppContainer) {
     // (where tap already plays a section), the entry is hidden.
     var menuSongsTabIndex by remember { mutableStateOf<Int?>(null) }
     var albumToExpand by remember { mutableStateOf<String?>(null) }
+    var albumRevealRequestId by remember { mutableStateOf(0) }
     // Push #62: album-level long-press menu state. When non-null, the
     // AlbumMenuSheet renders with Play / Shuffle / Delete actions.
     var albumMenuTracks by remember { mutableStateOf<List<Song>?>(null) }
@@ -537,11 +560,27 @@ private fun AppRoot(container: AppContainer) {
     val historyStats by container.history.stats.collectAsState()
     val tuning by container.taste.tuning.collectAsState()
     val tasteSignals by container.taste.signals.collectAsState()
-    // Push #63: decorated signals (chips + hard-block set). Recommender
-    // call sites pass `hardBlockedFilenames` so strongly-negative songs
-    // (top 18%, floor 1.5) never land in Up Next or Discover sections.
+    // Push #63: decorated signals (chips + display hard-block set at full guard).
     val decoratedSignals by container.taste.decoratedSignals.collectAsState()
-    val hardBlockedFilenames = decoratedSignals.hardBlockedFilenames
+    val upNextHardBlocked = remember(tuning.negativeStrength, tasteSignals, decoratedSignals) {
+        container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
+    }
+    val upNextSoftExcluded = remember(tuning.negativeStrength, tasteSignals, decoratedSignals) {
+        container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength)
+    }
+    val upNextPolicyExcludes = remember(
+        tuning.negativeStrength,
+        tasteSignals,
+        decoratedSignals,
+        dislikedSet,
+    ) {
+        com.isaivazhi.app.engine.RecommendationPolicy.unionExcludes(
+            upNextHardBlocked,
+            upNextSoftExcluded,
+            dislikedSet,
+        )
+    }
+    var lastBlendInfo by remember { mutableStateOf<LastBlendInfo?>(null) }
     val timelineEvents by container.signalTimeline.events.collectAsState()
     // Push #57: filepaths the user marked "skip embedding" for. The AI
     // page's Pending list excludes these.
@@ -634,6 +673,15 @@ private fun AppRoot(container: AppContainer) {
     }
     val recModeFlow = container.preferences.recMode
     val recMode by recModeFlow.collectAsState(initial = true)
+    val hasEmbeddingsInLibrary = (embeddingsRowCount ?: 0) > 0
+    val effectiveRecMode = recMode && hasEmbeddingsInLibrary
+
+    LaunchedEffect(embeddingsRowCount) {
+        val count = embeddingsRowCount ?: return@LaunchedEffect
+        if (count == 0 && recMode) {
+            container.preferences.setRecMode(false)
+        }
+    }
 
     // Phase 4 (2026-06-01): mostSimilar / forYou / becauseYouPlayed /
     // unexploredClusters / freezeMostSimilar state removed alongside the
@@ -643,24 +691,123 @@ private fun AppRoot(container: AppContainer) {
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        if (uri == null) {
+            container.toaster.show("Import cancelled")
+            return@rememberLauncherForActivityResult
+        }
         coroutineScope.launch {
-            importMessage = "Importing…"
-            val result = EmbeddingsImport.importFromUri(ctx, uri)
-            if (!result.ok) { importMessage = "Import failed: ${result.error}"; return@launch }
-            importMessage = "Imported ${result.bytesCopied / 1024} KB. Ingesting…"
+            importInProgress = true
+            importMessage = "Copying file…"
+            container.activityLog.log("engine", "embed_import", "Import started")
+            container.embedding.logBuffer.append("import", "started from file picker")
             try {
-                val migrated = container.embeddingDb.migrateFromLegacy()
-                val rows = migrated?.optInt("rowCount", 0) ?: 0
+                val result = EmbeddingsImport.importFromUri(ctx, uri)
+                if (!result.ok) {
+                    val err = result.error ?: "unknown error"
+                    importMessage = "Import failed: $err"
+                    container.activityLog.log(
+                        "engine", "embed_import_failed", err,
+                        level = ActivityLogEngine.Level.ERROR,
+                    )
+                    container.embedding.logBuffer.append("import", "FAILED copy: $err")
+                    return@launch
+                }
+                importMessage = when (result.format) {
+                    EmbeddingsImport.PortableFormat.IVZ ->
+                        "Ingesting ${result.bytesCopied / 1024} KB — usually under a minute…"
+                    EmbeddingsImport.PortableFormat.LEGACY_JSON ->
+                        "Ingesting JSON ${result.bytesCopied / 1024} KB — may take 1–2 min…"
+                    else -> "Ingesting…"
+                }
+                val reimport = container.embeddingDb.forceReimportEmbeddings()
+                val rows = reimport?.optInt("rowCount", 0) ?: 0
+                val fileSplits = reimport?.optInt("splitCount", 3) ?: 3
+                val desiredSplits = container.preferences.getEmbeddingSplitCount()
+                if (rows > 0) {
+                    container.preferences.saveLastEmbedSplitCount(fileSplits)
+                    libraryEmbedSplitCount = fileSplits
+                }
+                if (rows > 0 && fileSplits != desiredSplits) {
+                    container.toaster.show(
+                        "Backup used $fileSplits splits; settings use $desiredSplits — re-embed for best match",
+                    )
+                }
+                val relink = container.embeddingDb.relinkLibraryPaths(songs)
+                val relinked = relink?.optInt("relinked", 0) ?: 0
+                val hashMap = container.embeddingDb.contentHashByFilepath()
+                songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                container.library.value = songs
+                container.embeddingDb.clearVecHeapCache()
+                container.embeddingDb.prewarmFromLibrary(songs)
+                container.embeddingDb.fullWarmFromDb()
+                container.recommendationCache.precomputeNow(reason = "import_done")
                 refreshDbStats(container) { rc, dim, ext, fns, fps ->
                     embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                     embeddedFilenames = fns
                     embeddedFilepaths = fps
                 }
-                importMessage = "Loaded $rows embeddings."
+                dupesRefreshTick++
+                val doneMessage = when {
+                    rows <= 0 -> "Import saved but no embeddings found in that file."
+                    relinked > 0 -> "Loaded $rows embeddings. Matched $relinked songs."
+                    else -> "Loaded $rows embeddings."
+                }
+                importMessage = doneMessage
                 onboardingDismissed = true
+                container.activityLog.log(
+                    "engine", "embed_import_done", doneMessage,
+                    data = mapOf("rows" to rows, "relinked" to relinked),
+                )
+                container.embedding.logBuffer.append("import", "done — $doneMessage")
             } catch (t: Throwable) {
-                importMessage = "Ingest failed: ${t.message}"
+                val err = t.message ?: t.javaClass.simpleName
+                importMessage = "Import failed: $err"
+                container.activityLog.log(
+                    "engine", "embed_import_failed", err,
+                    level = ActivityLogEngine.Level.ERROR,
+                )
+                container.embedding.logBuffer.append("import", "FAILED: $err")
+                android.util.Log.e("MainActivity", "embeddings import failed", t)
+            } finally {
+                importInProgress = false
+            }
+        }
+    }
+
+    val exportSaveLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri ->
+        coroutineScope.launch {
+            try {
+                if (uri == null) {
+                    exportBackupStatus = "Save cancelled"
+                    container.toaster.show(
+                        "Save cancelled — backup remains in app storage only"
+                    )
+                    return@launch
+                }
+                exportBackupStatus = "Writing to chosen location…"
+                container.toaster.show("Saving backup…")
+                val copy = EmbeddingsImport.copyBackupToUri(ctx, uri)
+                if (copy.ok) {
+                    val mb = copy.bytesCopied / 1024.0 / 1024.0
+                    val msg = "Saved embeddings backup (${"%.1f".format(mb)} MB)"
+                    exportBackupStatus = msg
+                    container.toaster.show(msg)
+                    container.embedding.logBuffer.append(
+                        "backup",
+                        "saved to user location: ${copy.bytesCopied} bytes",
+                    )
+                } else {
+                    exportBackupStatus = "Save failed: ${copy.error ?: "unknown"}"
+                    container.toaster.show("Save failed: ${copy.error ?: "unknown"}")
+                    container.embedding.logBuffer.append("backup", "save to user location FAILED: ${copy.error}")
+                }
+            } finally {
+                exportBackupInProgress = false
+                // Keep status visible briefly so user sees result after picker closes
+                kotlinx.coroutines.delay(2500)
+                exportBackupStatus = null
             }
         }
     }
@@ -682,6 +829,9 @@ private fun AppRoot(container: AppContainer) {
                     data = mapOf("permissionGranted" to permission.granted),
                 )
                 songs = LibraryCache.loadOrScan(ctx)
+                if (songs.isEmpty()) {
+                    songs = LibraryCache.loadOrScan(ctx, force = true)
+                }
                 // Bugfix 2026-06-01d: publish to container so the
                 // process-lifetime RecommendationCache can see the
                 // library even after the Activity is destroyed.
@@ -754,6 +904,15 @@ private fun AppRoot(container: AppContainer) {
             // call here when cache hit; cold first launch (no cache) still
             // runs it to populate sets for the initial AI page render.
             if (cached.rowCount <= 0) {
+                try {
+                    container.embeddingDb.relinkLibraryPaths(songs)
+                    val hashMap = container.embeddingDb.contentHashByFilepath()
+                    songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                    container.library.value = songs
+                    container.embeddingDb.prewarmFromLibrary(songs)
+                } catch (t: Throwable) {
+                    android.util.Log.w("MainActivity", "startup relink failed: ${t.message}")
+                }
                 refreshDbStats(container) { rc, dim, ext, fns, fps ->
                     embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                     embeddedFilenames = fns
@@ -774,10 +933,35 @@ private fun AppRoot(container: AppContainer) {
                     )
                 }
             } else {
+                // Cached row count skipped the heavy filepath fetch — but
+                // imported backups often have stale paths. Relink + load sets.
+                try {
+                    container.embeddingDb.relinkLibraryPaths(songs)
+                    val hashMap = container.embeddingDb.contentHashByFilepath()
+                    songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                    container.library.value = songs
+                    container.embeddingDb.prewarmFromLibrary(songs)
+                } catch (t: Throwable) {
+                    android.util.Log.w("MainActivity", "startup relink failed: ${t.message}")
+                }
+                refreshDbStats(container) { rc, dim, ext, fns, fps ->
+                    embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
+                    embeddedFilenames = fns
+                    embeddedFilepaths = fps
+                    container.activityLog.log(
+                        category = "engine",
+                        type = "PERF_DB_DONE",
+                        message = "refreshDbStats after cache-hit relink (rows=$rc filepaths=${fps.size})",
+                        data = mapOf(
+                            "rowCount" to rc,
+                            "embeddedFilepaths" to fps.size,
+                        ),
+                    )
+                }
                 container.activityLog.log(
                     category = "engine",
                     type = "PERF_DB_STATS_DEFERRED",
-                    message = "skip startup refreshDbStats (cached) — filenames/filepaths lazy-load on AI page open",
+                    message = "cache-hit startup: relinked paths then loaded filepath sets",
                     data = mapOf("cachedRowCount" to cached.rowCount),
                 )
             }
@@ -792,6 +976,7 @@ private fun AppRoot(container: AppContainer) {
                 "batchComplete: processed=${ev.processed} failed=${ev.failed} recoveredIntoDb=${ev.recoveredIntoDb} totalRows=${ev.totalRows}"
             )
             embeddingsRowCount = ev.totalRows
+            libraryEmbedSplitCount = container.preferences.getLastEmbedSplitCount()
             refreshDbStats(container) { rc, dim, ext, fns, fps ->
                 embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                 embeddedFilenames = fns
@@ -827,7 +1012,10 @@ private fun AppRoot(container: AppContainer) {
         container.history.awaitReady()
         container.activityLog.awaitReady()
         container.favorites.awaitReady()
+        container.disliked.awaitReady()
         container.reconcileNotificationFavoriteStorage()
+        container.reconcileCapacitorDislikedStorage()
+        container.reconcileManualTasteFlags()
         logLedgerState(container, "cold_start_before_drain")
         // Push #65/#66/#74: ingest pending playback evidence BEFORE preparing
         // resume playback. Three sources, each covering a different failure
@@ -1050,7 +1238,7 @@ private fun AppRoot(container: AppContainer) {
             .asSequence()
             .filter { it.value.plays > 0 && it.value.avgFraction >= 0.3f }
             .filter { it.key !in dislikedSet }
-            .filter { it.key !in hardBlockedFilenames }
+            .filter { it.key !in upNextHardBlocked }
             .sortedByDescending { it.value.plays * it.value.avgFraction }
             .take(30)
             .toList()
@@ -1106,6 +1294,15 @@ private fun AppRoot(container: AppContainer) {
     val fullQueueSongs: List<Song> = remember(byFilenameLookup, playbackState.queueFilenames) {
         playbackState.queueFilenames.mapNotNull { byFilenameLookup[it] }
     }
+    val recentHistorySongs: List<Song> = remember(historyEvents, byFilenameLookup, playbackState.currentMediaId) {
+        val cur = playbackState.currentMediaId
+        historyEvents.asSequence()
+            .mapNotNull { byFilenameLookup[it.filename] }
+            .filter { it.filename != cur }
+            .distinctBy { it.filename }
+            .take(10)
+            .toList()
+    }
 
     val isCurrentFavorite = playbackState.currentMediaId?.let { it in favoritesSet } ?: false
     val isCurrentDisliked = playbackState.currentMediaId?.let { it in dislikedSet } ?: false
@@ -1138,12 +1335,20 @@ private fun AppRoot(container: AppContainer) {
     // rapid skips don't thrash the embedding DB.
     var similarToCurrent by remember { mutableStateOf<List<Song>>(emptyList()) }
     var similarLoading by remember { mutableStateOf(false) }
+    var similarFrozen by remember { mutableStateOf(false) }
+    var similarSeedMediaId by remember { mutableStateOf<String?>(null) }
+    val similarSeedTitle = similarSeedMediaId?.let { id ->
+        songs.firstOrNull { it.filename == id }?.title?.takeIf { it.isNotBlank() } ?: id
+    }
     val refreshInProgress by container.playback.refreshBusy.collectAsState()
-    LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, songs.size) {
+    LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, songs.size, similarFrozen) {
         val mediaId = playbackState.currentMediaId
         if (mediaId == null || songs.isEmpty() || (embeddingsRowCount ?: 0) == 0) {
             similarToCurrent = emptyList()
             similarLoading = false
+            return@LaunchedEffect
+        }
+        if (similarFrozen && similarSeedMediaId != null && mediaId != similarSeedMediaId) {
             return@LaunchedEffect
         }
         val current = songs.firstOrNull { it.filename == mediaId } ?: run {
@@ -1162,7 +1367,21 @@ private fun AppRoot(container: AppContainer) {
             )
         }.getOrDefault(emptyList())
         similarToCurrent = results.map { it.song }
+        similarSeedMediaId = mediaId
         similarLoading = false
+    }
+
+    val queueAllSimilarAfterCurrent: () -> Unit = {
+        val mediaId = playbackState.currentMediaId
+        val toQueue = similarToCurrent.filter {
+            it.filePath != null && it.filename != mediaId
+        }
+        if (toQueue.isEmpty()) {
+            container.toaster.show("No similar songs to queue")
+        } else {
+            container.playback.playNextMany(toQueue)
+            container.toaster.show("Added ${toQueue.size} similar songs after current")
+        }
     }
 
     val refreshUpcomingWithAI: () -> Unit = refreshUpcomingWithAI@ {
@@ -1187,12 +1406,22 @@ private fun AppRoot(container: AppContainer) {
             val playNextSet = playbackState.playNextFilenames
             val byFn = songs.associateBy { it.filename }
             val playNextSongs = playNextSet.mapNotNull { byFn[it] }
-            val finalUpcoming = playNextSongs + cachedTail.filter { it.filename !in playNextSet && it.filename != mediaId }
+            val policyFilteredTail = com.isaivazhi.app.engine.RecommendationPolicy.filterSongsForUpNext(
+                cachedTail,
+                upNextPolicyExcludes,
+            )
+            val finalUpcoming = playNextSongs + policyFilteredTail.filter {
+                it.filename !in playNextSet && it.filename != mediaId
+            }
             container.activityLog.log(
                 category = "queue",
                 type = "REFRESH_CACHE_HIT",
-                message = "Served upcoming from RecommendationCache (size=${cachedTail.size})",
-                data = mapOf("tailSize" to cachedTail.size, "mediaId" to mediaId),
+                message = "Served upcoming from RecommendationCache (size=${cachedTail.size}, afterPolicy=${policyFilteredTail.size})",
+                data = mapOf(
+                    "tailSize" to cachedTail.size,
+                    "policyFilteredSize" to policyFilteredTail.size,
+                    "mediaId" to mediaId,
+                ),
             )
             container.toaster.show("Up Next refreshed")
             if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
@@ -1247,6 +1476,7 @@ private fun AppRoot(container: AppContainer) {
                     sessionBias = tuning.sessionBias,
                 )
             }.getOrNull()
+            blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
             val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
                 runCatching {
@@ -1254,7 +1484,9 @@ private fun AppRoot(container: AppContainer) {
                         current, songs, k = 50,
                         adventurous = tuning.adventurous,
                         extraExcludeFilenames = excludeFns,
-                        hardBlockedFilenames = hardBlockedFilenames,
+                        hardBlockedFilenames = upNextHardBlocked,
+                        dislikedFilenames = dislikedSet,
+                        softExcludedFilenames = upNextSoftExcluded,
                         blendedQueryVec = blendedVec,
                     )
                 }.getOrDefault(emptyList())
@@ -1336,6 +1568,7 @@ private fun AppRoot(container: AppContainer) {
         // tail. Context = LIBRARY so the queue-exhaust LE knows it's
         // allowed to keep appending fresh recs if the queue runs low.
         android.util.Log.i("CardTap", "playFromTap song=${song.filename} → LIBRARY single-song + AI tail")
+        container.playback.clearPlayNextMarker(song.filename)
         // Phase D (2026-06-01): force LOOP=OFF on AI-eligible queue starts
         // so the queue-exhaust LE can append fresh recommendations. Without
         // this, a user who once enabled REPEAT_ALL/ONE silently loops the
@@ -1373,6 +1606,7 @@ private fun AppRoot(container: AppContainer) {
                     sessionBias = tuning.sessionBias,
                 )
             }.getOrNull()
+            blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
             val tail: List<Song> = if (recMode && hasEmbeddings) {
                 runCatching {
@@ -1381,7 +1615,9 @@ private fun AppRoot(container: AppContainer) {
                         library = songs,
                         k = 50,
                         adventurous = tuning.adventurous,
-                        hardBlockedFilenames = hardBlockedFilenames,
+                        hardBlockedFilenames = upNextHardBlocked,
+                        dislikedFilenames = dislikedSet,
+                        softExcludedFilenames = upNextSoftExcluded,
                         blendedQueryVec = blendedVec,
                     ).drop(1)   // drop the current song; replaceUpcoming dedupes anyway
                 }.getOrElse {
@@ -1483,18 +1719,12 @@ private fun AppRoot(container: AppContainer) {
     // NEXT build (next tap, next pull-to-refresh, queue-exhaust append).
     // Never an already-active queue.
 
-    // Push #45 perf: REMOVED the push #42 Tier 3L soft-refresh
-    // LaunchedEffect. It mutated the queue (`replaceUpcoming`) on every
-    // qualified-listen transition, triggering a recomposition cascade
-    // (Discover sections, Up Next, MiniPlayer all re-collected). Even
-    // for non-qualifying skips (the common case in logs.txt: rapid
-    // neutral_skip with frac=0), the LE still fired, allocated state,
-    // and re-ran on the next transition. Plus, the replaceUpcoming it
-    // triggered did an `associateBy` over the 2500-song library each
-    // time. The user's preferred queue-stability model is "queue is
-    // sacred between explicit user actions"; soft refresh contradicts
-    // that. The pull-to-refresh button still gives fresh recommendations
-    // on demand (push #44 randomized anchors).
+    // Push #67: soft-refresh of the Up Next tail is active again (see
+    // LaunchedEffect on sessionListened below). Push #45 had removed an
+    // older, overly aggressive version that ran on every transition;
+    // the current one debounces, requires 2+ session listens, and only
+    // runs when the upcoming queue has more than 5 tracks. Explicit
+    // Refresh still replaces the tail on demand.
 
     // Push #42 Tier 2G: queue-exhaust recommender append. When the
     // current song is the LAST one in the queue AND repeat mode is OFF
@@ -1576,6 +1806,7 @@ private fun AppRoot(container: AppContainer) {
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
+        blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
         val blendedVec = blendedTriple?.first
         val tail = runCatching {
             container.recommender.recommendUpcoming(
@@ -1584,7 +1815,9 @@ private fun AppRoot(container: AppContainer) {
                 k = 50,
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = excludeFns,
-                hardBlockedFilenames = hardBlockedFilenames,
+                hardBlockedFilenames = upNextHardBlocked,
+                dislikedFilenames = dislikedSet,
+                softExcludedFilenames = upNextSoftExcluded,
                 blendedQueryVec = blendedVec,
             )
         }.getOrDefault(emptyList())
@@ -1626,6 +1859,7 @@ private fun AppRoot(container: AppContainer) {
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
+        blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
         val blendedVec = blendedTriple?.first ?: return@LaunchedEffect
         val newTail = runCatching {
             container.recommender.softRefreshUpcomingTail(
@@ -1635,7 +1869,9 @@ private fun AppRoot(container: AppContainer) {
                 blendedQueryVec = blendedVec,
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = upcomingFilenames.toSet(),
-                hardBlockedFilenames = hardBlockedFilenames,
+                hardBlockedFilenames = upNextHardBlocked,
+                dislikedFilenames = dislikedSet,
+                softExcludedFilenames = upNextSoftExcluded,
             )
         }.getOrDefault(emptyList())
         if (newTail.isNotEmpty() && newTail != upcomingSongs) {
@@ -1649,8 +1885,13 @@ private fun AppRoot(container: AppContainer) {
     val isMenuSongFavorite = menuSong?.filename?.let { it in favoritesSet } ?: false
     val isMenuSongDisliked = menuSong?.filename?.let { it in dislikedSet } ?: false
     // Push #59: filepath-based embedding membership check (was filename).
-    val isMenuSongEmbedded = menuSong?.filePath?.let { it in embeddedFilepaths } ?: false
+    val isMenuSongEmbedded = com.isaivazhi.app.ui.songHasEmbedding(
+        filePath = menuSong?.filePath,
+        embeddingsRowCount = embeddingsRowCount,
+        embeddedFilepaths = embeddedFilepaths,
+    )
     val menuSongStats = menuSong?.filename?.let { historyStats[it] }
+    val menuSongTasteSignal = menuSong?.filename?.let { tasteSignals[it] }
 
     BackHandler(enabled = overlay !is Overlay.None) {
         overlay = when (overlay) {
@@ -1702,12 +1943,12 @@ private fun AppRoot(container: AppContainer) {
                             DropdownMenuItem(text = { Text("Taste") },
                                 leadingIcon = { Icon(Icons.Filled.Tune, contentDescription = null) },
                                 onClick = { libraryMenuOpen = false; overlay = Overlay.Taste })
-                            DropdownMenuItem(text = { Text("AI / Embeddings") },
+                            DropdownMenuItem(text = { Text("AI & Library") },
                                 leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
                                 onClick = { libraryMenuOpen = false; overlay = Overlay.Ai })
-                            DropdownMenuItem(text = { Text("Debug Logs") },
+                            DropdownMenuItem(text = { Text("Diagnostics") },
                                 leadingIcon = { Icon(Icons.Filled.BugReport, contentDescription = null) },
-                                onClick = { libraryMenuOpen = false; overlay = Overlay.Debug })
+                                onClick = { libraryMenuOpen = false; overlay = Overlay.Logs() })
                             DropdownMenuItem(text = { Text("Settings") },
                                 leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                                 onClick = { libraryMenuOpen = false; overlay = Overlay.Settings })
@@ -1731,15 +1972,13 @@ private fun AppRoot(container: AppContainer) {
                         currentSongFilePath = currentSongFilePath,
                         isFavorite = isCurrentFavorite,
                         isDisliked = isCurrentDisliked,
-                        aiMode = recMode,
-                        // Push #60: include the empty-set guard so the MiniPlayer
-                        // doesn't briefly flash a red dot for every song during
-                        // the app-start window where the DB hasn't loaded yet
-                        // (embeddedFilepaths starts empty). Matches the same
-                        // guard used by SongsScreen / AlbumsScreen / Discover.
-                        hasEmbedding = currentSongFilePath?.let {
-                            embeddedFilepaths.isEmpty() || it in embeddedFilepaths
-                        } ?: true,
+                        aiMode = effectiveRecMode,
+                        hasEmbeddingsInLibrary = hasEmbeddingsInLibrary,
+                        hasEmbedding = com.isaivazhi.app.ui.songHasEmbedding(
+                            filePath = currentSongFilePath,
+                            embeddingsRowCount = embeddingsRowCount,
+                            embeddedFilepaths = embeddedFilepaths,
+                        ),
                         onToggleFavorite = {
                             playbackState.currentMediaId?.let { fn ->
                                 val wasFav = fn in favoritesSet
@@ -1777,8 +2016,7 @@ private fun AppRoot(container: AppContainer) {
                         onToggleShuffle = { container.playback.toggleShuffle() },
                         onSeek = { container.playback.seekTo(it) },
                         onRefresh = refreshUpcomingWithAI,
-                        refreshEnabled = playbackState.currentMediaId != null &&
-                            (embeddingsRowCount ?: 0) > 0 && recMode,
+                        refreshEnabled = playbackState.currentMediaId != null,
                         refreshInProgress = refreshInProgress,
                     )
                     NavigationBar {
@@ -1813,7 +2051,15 @@ private fun AppRoot(container: AppContainer) {
                 embeddingsRowCount == 0 &&
                 !onboardingDismissed
             when {
-                !permission.granted -> PermissionGateUi(onRequest = permission.request)
+                !permission.granted -> PermissionGateUi(
+                    onRequest = permission.request,
+                    onOpenSettings = {
+                        val intent = android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        ).setData(android.net.Uri.parse("package:${ctx.packageName}"))
+                        runCatching { ctx.startActivity(intent) }
+                    },
+                )
                 // Push #55: explicit notification permission step. Falls
                 // between audio permission and onboarding so the user has
                 // already committed to "yes, I'm setting this app up"
@@ -1839,19 +2085,21 @@ private fun AppRoot(container: AppContainer) {
                     OnboardingScreen(
                         songCount = songs.size,
                         estimatedEmbedTimeSec = estimateEmbedTime(songs.size, embeddingStatus.activeBackend),
-                        onImportEmbeddings = { importLauncher.launch(arrayOf("application/json", "*/*")) },
+                        importInProgress = importInProgress,
+                        importStatus = importMessage,
+                        onImportEmbeddings = {
+                            if (!importInProgress) {
+                                importLauncher.launch(arrayOf("application/json", "*/*"))
+                            }
+                        },
                         onEmbedInBackground = {
                             container.embedding.embedSongs(songs); onboardingDismissed = true
                         },
-                        onContinueWithoutEmbeddings = { onboardingDismissed = true },
+                        onContinueWithoutEmbeddings = {
+                            onboardingDismissed = true
+                            coroutineScope.launch { container.preferences.setRecMode(false) }
+                        },
                     )
-                    if (importMessage != null) {
-                        Box(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                            Text(text = importMessage!!,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
                 }
                 else -> HorizontalPager(
                     state = pagerState,
@@ -1865,7 +2113,9 @@ private fun AppRoot(container: AppContainer) {
                         Tab.Songs -> SongsScreen(
                             songs = songs,
                             currentMediaId = playbackState.currentMediaId,
+                            permissionGranted = permission.granted,
                             embeddedFilepaths = embeddedFilepaths,
+                            embeddingsRowCount = embeddingsRowCount,
                             // Push #37: tap a song from Songs tab → same
                             // behaviour as Discover card (plays this song +
                             // AI builds 50 recommended songs behind it).
@@ -1888,7 +2138,9 @@ private fun AppRoot(container: AppContainer) {
                             songs = songs,
                             currentMediaId = playbackState.currentMediaId,
                             embeddedFilepaths = embeddedFilepaths,
-                            initialExpandedAlbum = albumToExpand.also { albumToExpand = null },
+                            embeddingsRowCount = embeddingsRowCount,
+                            initialExpandedAlbum = albumToExpand,
+                            revealRequestId = albumRevealRequestId,
                             // Push #42 Tier 2F: Album tap = SECTION tap. Queue
                             // becomes [tappedTrack..lastTrack] of the album (or
                             // all tracks shuffled if shuffle is on). Recommender
@@ -1911,9 +2163,11 @@ private fun AppRoot(container: AppContainer) {
                         )
                         Tab.UpNext -> UpNextScreen(
                             queue = fullQueueSongs,
+                            recentHistory = recentHistorySongs,
                             currentMediaId = playbackState.currentMediaId,
                             currentIndex = playbackState.queueIndex,
-                            aiMode = recMode,
+                            aiMode = effectiveRecMode,
+                            aiModeEnabled = hasEmbeddingsInLibrary,
                             onToggleMode = { aiMode ->
                                 coroutineScope.launch { container.preferences.setRecMode(aiMode) }
                                 val mediaId = playbackState.currentMediaId ?: return@UpNextScreen
@@ -1938,6 +2192,7 @@ private fun AppRoot(container: AppContainer) {
                                             sessionBias = tuning.sessionBias,
                                         )
                                     }.getOrNull()
+                                    blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
                                     val blendedVec = blendedTriple?.first
                                     val newTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
@@ -1945,7 +2200,9 @@ private fun AppRoot(container: AppContainer) {
                                                 current, songs, k = 50,
                                                 adventurous = tuning.adventurous,
                                                 extraExcludeFilenames = excludeFns,
-                                                hardBlockedFilenames = hardBlockedFilenames,
+                                                hardBlockedFilenames = upNextHardBlocked,
+                                                dislikedFilenames = dislikedSet,
+                                                softExcludedFilenames = upNextSoftExcluded,
                                                 blendedQueryVec = blendedVec,
                                             )
                                         }.getOrDefault(emptyList())
@@ -1991,6 +2248,10 @@ private fun AppRoot(container: AppContainer) {
                                 playlists = playlistsList,
                                 onOpenCategory = { cat -> overlay = Overlay.ViewAll(cat) },
                                 onCreatePlaylist = { name -> container.playlists.create(name) },
+                                onRenamePlaylist = { id, name ->
+                                    container.playlists.rename(id, name)
+                                    container.toaster.show("Playlist renamed")
+                                },
                                 onOpenPlaylist = { id -> overlay = Overlay.PlaylistDetail(id) },
                                 onDeletePlaylist = { id -> container.playlists.delete(id) },
                                 contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
@@ -2052,16 +2313,31 @@ private fun AppRoot(container: AppContainer) {
             onSkipNext = { container.playback.skipNext(neutral = true) },
             onSeek = { container.playback.seekTo(it) },
             onRefresh = refreshUpcomingWithAI,
-            refreshEnabled = playbackState.currentMediaId != null &&
-                (embeddingsRowCount ?: 0) > 0 && recMode,
+            refreshEnabled = playbackState.currentMediaId != null && effectiveRecMode,
             refreshInProgress = refreshInProgress,
             similarSongs = similarToCurrent,
             similarLoading = similarLoading,
+            similarFrozen = similarFrozen,
+            similarSeedTitle = similarSeedTitle,
+            queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
             onSimilarTap = { song -> playFromTap(song) },
+            onSimilarPlayNext = { song ->
+                container.playback.playNext(song)
+                container.toaster.show("Playing next")
+            },
             onSimilarLongPress = { song ->
                 menuPlaylistContext = null
                 menuSongsTabIndex = null
                 menuSong = song
+            },
+            onQueueAllSimilar = queueAllSimilarAfterCurrent,
+            onToggleSimilarFrozen = {
+                if (similarFrozen) {
+                    similarFrozen = false
+                } else {
+                    similarFrozen = true
+                    similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
+                }
             },
         )
     }
@@ -2083,24 +2359,22 @@ private fun AppRoot(container: AppContainer) {
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         SettingsScreen(
-            songCount = songs.size,
-            embeddingRows = embeddingsRowCount ?: 0,
-            embeddingDimText = if (embeddingsDim > 0) "${embeddingsDim}-D" else "empty",
-            vecExtensionLoaded = vecExtLoaded,
             artCacheBytes = artCacheBytes,
+            importInProgress = importInProgress,
+            importStatus = importMessage,
             onBack = { overlay = Overlay.None },
-            onReimportEmbeddings = { importLauncher.launch(arrayOf("application/json", "*/*")) },
-            onEmbedAllNow = { container.embedding.embedSongs(songs); overlay = Overlay.None },
-            onRescanLibrary = {
-                coroutineScope.launch { songs = LibraryCache.invalidate(ctx) }
-                overlay = Overlay.None
+            onReimportEmbeddings = {
+                if (!importInProgress) {
+                    importLauncher.launch(arrayOf("application/json", "*/*"))
+                }
             },
             onClearArtCache = {
                 AlbumArtRepository.clearDiskCache(ctx)
                 AlbumArtRepository.trimMemory()
                 coroutineScope.launch { artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) } }
             },
-            onOpenActivityLog = { overlay = Overlay.ActivityLog },
+            onOpenAiLibrary = { overlay = Overlay.Ai },
+            onOpenLogs = { overlay = Overlay.Logs() },
         )
     }
 
@@ -2132,6 +2406,10 @@ private fun AppRoot(container: AppContainer) {
             songs = songs,
             onBack = { overlay = Overlay.None },
             onCreate = { container.playlists.create(it) },
+            onRename = { id, name ->
+                container.playlists.rename(id, name)
+                container.toaster.show("Playlist renamed")
+            },
             onDelete = { container.playlists.delete(it) },
             onOpenPlaylist = { overlay = Overlay.PlaylistDetail(it) },
         )
@@ -2181,11 +2459,17 @@ private fun AppRoot(container: AppContainer) {
             stats = historyStats,
             signals = tasteSignals,
             decoratedSignals = decoratedSignals,
+            upNextHardBlockedCount = upNextHardBlocked.size,
+            upNextSoftExcludedCount = upNextSoftExcluded.size,
+            upNextExcludedFilenames = upNextPolicyExcludes,
+            favoritesSet = favoritesSet,
+            dislikedSet = dislikedSet,
             timelineEvents = timelineEvents,
             engineSnapshot = buildEngineSnapshot(
                 tuning = tuning,
+                lastBlend = lastBlendInfo,
                 queueSize = playbackState.queueFilenames.size,
-                aiMode = recMode,
+                aiMode = effectiveRecMode,
                 embeddingsCovered = embeddedFilenames.size,
                 embeddingsTotal = songs.count { it.filePath != null },
                 nowPlayingTitle = playbackState.title,
@@ -2202,7 +2486,7 @@ private fun AppRoot(container: AppContainer) {
             },
             onNegativeStrengthChange = {
                 container.taste.setNegativeStrength(it)
-                container.toaster.show("Skip strength: ${(it * 100).toInt()}%")
+                container.toaster.show("Negative guard: ${(it * 100).toInt()}%")
             },
             onAdventurousReset = {
                 container.taste.resetAdventurous()
@@ -2214,7 +2498,7 @@ private fun AppRoot(container: AppContainer) {
             },
             onNegativeStrengthReset = {
                 container.taste.resetNegativeStrength()
-                container.toaster.show("Skip strength reset to ${(TasteEngine.DEFAULT_NEGATIVE_STRENGTH * 100).toInt()}%")
+                container.toaster.show("Negative guard reset to ${(TasteEngine.DEFAULT_NEGATIVE_STRENGTH * 100).toInt()}%")
             },
             onResetSongStats = { fn ->
                 container.history.resetStatsForSong(fn)
@@ -2237,7 +2521,7 @@ private fun AppRoot(container: AppContainer) {
             },
             // Push #74: long-press the Taste Signal header to open the
             // Activity Log overlay.
-            onOpenActivityLog = { overlay = Overlay.ActivityLog },
+            onOpenActivityLog = { overlay = Overlay.Logs(LogsTab.Activity) },
         )
     }
 
@@ -2258,6 +2542,15 @@ private fun AppRoot(container: AppContainer) {
     // be bumped from inside that callback.
     LaunchedEffect(overlay, dupesRefreshTick) {
         if (overlay is Overlay.Ai) {
+            try {
+                container.embeddingDb.relinkLibraryPaths(songs)
+                val hashMap = container.embeddingDb.contentHashByFilepath()
+                songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                container.library.value = songs
+                container.embeddingDb.prewarmFromLibrary(songs)
+            } catch (t: Throwable) {
+                android.util.Log.w("MainActivity", "AI-page relink failed: ${t.message}")
+            }
             refreshDbStats(container) { rc, dim, ext, fns, fps ->
                 embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                 embeddedFilenames = fns
@@ -2325,6 +2618,14 @@ private fun AppRoot(container: AppContainer) {
             embeddingsDim = embeddingsDim,
             vecExtensionLoaded = vecExtLoaded,
             status = embeddingStatus,
+            embeddingSplitCount = embeddingSplitCount,
+            libraryEmbedSplitCount = libraryEmbedSplitCount,
+            onEmbeddingSplitCountChange = { count ->
+                coroutineScope.launch {
+                    container.preferences.setEmbeddingSplitCount(count)
+                    embeddingSplitCount = count
+                }
+            },
             embeddedFilenames = embeddedFilenames,
             embeddedFilepaths = embeddedFilepaths,
             // Push #57: skip set + skip/un-skip callbacks. Pending list
@@ -2341,7 +2642,6 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Re-added to pending")
                 container.embedding.logBuffer.append("skip", "user un-skipped: $filepath")
             },
-            logLines = embeddingLogs,
             staleFilenames = staleFilenames,
             onRemoveStale = { fns ->
                 container.embedding.removeStaleEmbeddings(fns) { _ ->
@@ -2388,7 +2688,7 @@ private fun AppRoot(container: AppContainer) {
                 // line so the user can tell what rescan actually did.
                 val beforeSongs = songs.size
                 val beforeEmbedded = embeddedFilenames.size
-                container.toaster.show("Rescanning library…")
+                container.toaster.show("Scanning library…")
                 container.embedding.logBuffer.append("rescan", "started (library=$beforeSongs, embedded=$beforeEmbedded)")
                 coroutineScope.launch {
                     songs = LibraryCache.invalidate(ctx)
@@ -2409,7 +2709,7 @@ private fun AppRoot(container: AppContainer) {
                         songDelta < 0 -> "${-songDelta} removed"
                         else -> "no change"
                     }
-                    val msg = "Rescan: $beforeSongs → $afterSongs songs ($deltaText)"
+                    val msg = "Scan: $beforeSongs → $afterSongs songs ($deltaText)"
                     container.toaster.show(msg)
                     container.embedding.logBuffer.append("rescan", "done — $msg")
                     // Refresh duplicates view too, in case rescan
@@ -2422,36 +2722,53 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Embedding stopped")
                 container.embedding.logBuffer.append("stop", "user stopped embedding")
             },
-            onClearLog = {
-                container.embedding.logBuffer.clear()
-                container.toaster.show("Logs cleared")
-            },
-            // Push #46: manual one-shot export of the SQLite embeddings
-            // into a portable `local_embeddings.json` mirror file. Useful
-            // right before a reinstall — copy the JSON off the device,
-            // install the fresh APK, drop the JSON back, app's
-            // migrateFromLegacyIfNeeded() ingests it on first launch.
+            // Manual one-shot IVZ backup (isaivazhi_embeddings.bin).
             onExportBackup = {
-                container.toaster.show("Exporting embeddings backup…")
+                if (exportBackupInProgress) {
+                    container.toaster.show("Export already in progress…")
+                } else {
+                exportBackupInProgress = true
+                val rowHint = embeddingsRowCount ?: 0
+                exportBackupStatus = "Preparing backup — reading $rowHint embeddings…"
                 container.embedding.logBuffer.append("backup", "manual export started")
-                coroutineScope.launch(Dispatchers.IO) {
-                    val res = runCatching { container.embeddingDb.exportLegacyMirror() }.getOrNull()
-                    val rows = res?.optInt("rowCount", 0) ?: 0
-                    val bytes = res?.optLong("bytes", 0L) ?: 0L
-                    val mb = bytes / 1024.0 / 1024.0
-                    val mbStr = "%.1f".format(mb)
-                    if (res != null) {
-                        container.toaster.show("Backup ready — $rows rows, $mbStr MB")
+                coroutineScope.launch {
+                    try {
+                        val splits = container.preferences.getEmbeddingSplitCount()
+                        val res = runCatching {
+                            container.embeddingDb.exportEmbeddingsBin(splits)
+                        }.getOrNull()
+                        val rows = res?.optInt("rowCount", 0) ?: 0
+                        val bytes = res?.optLong("bytes", 0L) ?: 0L
+                        val mbStr = "%.1f".format(bytes / 1024.0 / 1024.0)
+                        if (res == null || rows <= 0) {
+                            exportBackupStatus = "Export failed — no embeddings in database"
+                            container.toaster.show("Backup failed — no embeddings to export")
+                            container.embedding.logBuffer.append("backup", "manual export FAILED")
+                            exportBackupInProgress = false
+                            kotlinx.coroutines.delay(3000)
+                            exportBackupStatus = null
+                            return@launch
+                        }
                         container.embedding.logBuffer.append(
                             "backup",
-                            "manual export complete — $rows rows, $bytes bytes ($mbStr MB)"
+                            "manual export complete — $rows rows, $bytes bytes ($mbStr MB)",
                         )
-                    } else {
-                        container.toaster.show("Backup failed")
-                        container.embedding.logBuffer.append("backup", "manual export FAILED")
+                        exportBackupStatus = "Ready — choose where to save ($rows songs, $mbStr MB)"
+                        exportSaveLauncher.launch(EmbeddingsImport.BIN_FILENAME)
+                    } catch (t: Throwable) {
+                        val err = t.message ?: t.javaClass.simpleName
+                        exportBackupStatus = "Export failed: $err"
+                        container.toaster.show("Export failed: $err")
+                        container.embedding.logBuffer.append("backup", "manual export FAILED: $err")
+                        exportBackupInProgress = false
+                        kotlinx.coroutines.delay(3000)
+                        exportBackupStatus = null
                     }
                 }
+                }
             },
+            exportBackupInProgress = exportBackupInProgress,
+            exportBackupStatus = exportBackupStatus,
             // Push #51: Duplicates section wiring. Grouping is now
             // filepath-based (push #51 SQL change), play lookup goes
             // strictly through filepath — no filename fallback (the
@@ -2507,19 +2824,33 @@ private fun AppRoot(container: AppContainer) {
         )
     }
 
-    AnimatedVisibility(visible = overlay is Overlay.Debug,
-        enter = slideInVertically(initialOffsetY = { it }),
-        exit = slideOutVertically(targetOffsetY = { it })) {
-        DebugLogsScreen(onBack = { overlay = Overlay.None })
-    }
+    val showOnboardingImportUi = permission.granted &&
+        songs.isNotEmpty() &&
+        (embeddingsRowCount ?: 0) == 0 &&
+        !onboardingDismissed
+    EmbeddingsImportDialog(
+        visible = (importInProgress || !importMessage.isNullOrBlank()) && !showOnboardingImportUi,
+        inProgress = importInProgress,
+        statusMessage = importMessage,
+        onDismiss = { importMessage = null },
+    )
 
-    AnimatedVisibility(visible = overlay is Overlay.ActivityLog,
+    val logsOverlay = overlay as? Overlay.Logs
+    AnimatedVisibility(visible = logsOverlay != null,
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
-        ActivityLogScreen(
-            activityLog = container.activityLog,
-            onBack = { overlay = Overlay.None },
-        )
+        if (logsOverlay != null) {
+            LogsScreen(
+                activityLog = container.activityLog,
+                embeddingLogLines = embeddingLogs,
+                onClearEmbeddingLog = {
+                    container.embedding.logBuffer.clear()
+                    container.toaster.show("Embedding log cleared")
+                },
+                initialTab = logsOverlay.initialTab,
+                onBack = { overlay = Overlay.None },
+            )
+        }
     }
 
     val viewAllCat = (overlay as? Overlay.ViewAll)?.category
@@ -2550,6 +2881,12 @@ private fun AppRoot(container: AppContainer) {
                     )
                 },
                 onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
+                subtitleForSong = if (viewAllCat == BrowseCategory.MostPlayed) {
+                    { song ->
+                        val plays = historyStats[song.filename]?.plays ?: 0
+                        "Played $plays ${if (plays == 1) "time" else "times"}"
+                    }
+                } else null,
             )
         }
     }
@@ -2569,12 +2906,16 @@ private fun AppRoot(container: AppContainer) {
             isFavorite = isMenuSongFavorite,
             isDisliked = isMenuSongDisliked,
             hasEmbedding = isMenuSongEmbedded,
+            currentSplitCount = embeddingSplitCount,
             currentPlaylistName = playlistCtxName,
             songStats = menuSongStats,
+            tasteSignal = menuSongTasteSignal,
             playlists = playlistsList,
             onDismiss = { menuSong = null; menuPlaylistContext = null },
-            onPlayOnly = { container.playback.playOnly(sheetSong) },
-            onPlayNext = { container.playback.playNext(sheetSong) },
+            onPlayNext = {
+                container.playback.playNext(sheetSong)
+                container.toaster.show("Added to play next")
+            },
             onToggleFavorite = {
                 val fn = sheetSong.filename
                 val wasFav = fn in favoritesSet
@@ -2607,8 +2948,8 @@ private fun AppRoot(container: AppContainer) {
                 val plName = playlistsList.firstOrNull { it.id == plId }?.name ?: "playlist"
                 container.toaster.show("Added to \"$plName\"")
             },
-            onCreatePlaylistAndAdd = {
-                val pl = container.playlists.create("New playlist")
+            onCreatePlaylistAndAdd = { name ->
+                val pl = container.playlists.create(name)
                 container.playlists.addSong(pl.id, sheetSong.filename)
                 container.toaster.show("Created playlist \"${pl.name}\" and added song")
             },
@@ -2623,17 +2964,12 @@ private fun AppRoot(container: AppContainer) {
             onViewDetails = { /* dialog shown inside SongMenuSheet */ },
             onViewAlbum = {
                 albumToExpand = sheetSong.album.ifBlank { "Unknown album" }
+                albumRevealRequestId += 1
                 coroutineScope.launch { pagerState.animateScrollToPage(Tab.Albums.ordinal) }
             },
-            onToggleEmbedding = {
-                // No engine-level "remove embedding" yet — best-effort: kick off
-                // an embed for the song to ensure it lands in the DB. Removal
-                // requires an EmbeddingDb.deleteByFilename method that doesn't
-                // exist yet; toast-only for now.
-                // Push #59: filepath-based embedded check (was filename).
-                if (sheetSong.filePath != null && sheetSong.filePath !in embeddedFilepaths) {
-                    container.embedding.embedSongs(listOf(sheetSong))
-                }
+            onResetTasteSignal = {
+                container.taste.resetSignalForSong(sheetSong.filename)
+                container.toaster.show("Taste signal reset")
             },
             // Push #40 Tier 1C: explicit "Embed this song" entry. Always
             // fires an embed for the song regardless of current state.
@@ -3108,8 +3444,14 @@ private fun ingestPendingEvidence(
     container.history.recordCompleted(mediaId, System.currentTimeMillis(), frac)
 }
 
+private data class LastBlendInfo(
+    val weights: com.isaivazhi.app.engine.Recommender.BlendWeights,
+    val label: String,
+)
+
 private fun buildEngineSnapshot(
     tuning: com.isaivazhi.app.engine.TasteEngine.Tuning,
+    lastBlend: LastBlendInfo?,
     queueSize: Int,
     aiMode: Boolean,
     embeddingsCovered: Int,
@@ -3117,19 +3459,36 @@ private fun buildEngineSnapshot(
     nowPlayingTitle: String,
     nowPlayingArtist: String,
 ): EngineSnapshot {
-    // Multi-timescale blend ratios. Same shape as the Capacitor app's getInsights():
-    //   currentSong portion = 1 - sessionBias (when sessionBias=0 you're 100% current)
-    //   session portion     = sessionBias * 0.7
-    //   profile portion     = sessionBias * 0.3
-    val currentPortion = (1f - tuning.sessionBias).coerceIn(0f, 1f)
-    val sessionPortion = (tuning.sessionBias * 0.7f).coerceIn(0f, 1f)
-    val profilePortion = (tuning.sessionBias * 0.3f).coerceIn(0f, 1f)
-    val mode = when {
-        tuning.sessionBias < 0.2f -> "Current-song heavy"
-        tuning.sessionBias > 0.7f -> "Strong session blend"
-        else -> "Balanced"
-    }
     val pct: (Float) -> String = { v -> "${(v * 100).toInt()}%" }
+    val currentPortion: Float
+    val sessionPortion: Float
+    val profilePortion: Float
+    val mode: String
+    val lastRefreshLabel: String?
+    if (lastBlend != null) {
+        val w = lastBlend.weights
+        val total = (w.wCurrent + w.wSession + w.wProfile).coerceAtLeast(0.001f)
+        currentPortion = w.wCurrent / total
+        sessionPortion = w.wSession / total
+        profilePortion = w.wProfile / total
+        mode = when {
+            currentPortion >= 0.55f -> "Current-song heavy"
+            sessionPortion >= 0.45f -> "Strong session blend"
+            profilePortion >= 0.45f -> "Profile heavy"
+            else -> "Balanced"
+        }
+        lastRefreshLabel = "Last refresh: ${lastBlend.label} (${pct(currentPortion)} / ${pct(sessionPortion)} / ${pct(profilePortion)})"
+    } else {
+        currentPortion = (1f - tuning.sessionBias).coerceIn(0f, 1f)
+        sessionPortion = (tuning.sessionBias * 0.7f).coerceIn(0f, 1f)
+        profilePortion = (tuning.sessionBias * 0.3f).coerceIn(0f, 1f)
+        mode = when {
+            tuning.sessionBias < 0.2f -> "Current-song heavy"
+            tuning.sessionBias > 0.7f -> "Strong session blend"
+            else -> "Balanced (no Up Next refresh yet)"
+        }
+        lastRefreshLabel = null
+    }
     val coveragePct = if (embeddingsTotal > 0) (embeddingsCovered * 100 / embeddingsTotal).toString() + "%"
     else "0%"
     return EngineSnapshot(
@@ -3137,6 +3496,7 @@ private fun buildEngineSnapshot(
         blendSession = pct(sessionPortion),
         blendProfile = pct(profilePortion),
         blendMode = mode,
+        lastRefreshLabel = lastRefreshLabel,
         queueSize = queueSize,
         queueMode = if (aiMode) "AI" else "Shuffle",
         embeddingsCovered = embeddingsCovered,
@@ -3185,7 +3545,9 @@ private fun refreshDbStats(
         // for the DB worker (saves ~18s on the user's device where the
         // first DB call pays the full sqlite-vec init cost).
         runCatching { container.preferences.saveCachedEmbedStats(rc, dim, vecExt) }
-        onResult(rc, dim, vecExt, filenames, filepaths)
+        kotlinx.coroutines.withContext(Dispatchers.Main) {
+            onResult(rc, dim, vecExt, filenames, filepaths)
+        }
     }
 }
 
@@ -3219,7 +3581,9 @@ private fun refreshEmbeddingRowCount(
             ),
         )
         runCatching { container.preferences.saveCachedEmbedStats(rc, dim, vecExt) }
-        onResult(rc, dim, vecExt)
+        kotlinx.coroutines.withContext(Dispatchers.Main) {
+            onResult(rc, dim, vecExt)
+        }
     }
 }
 
@@ -3242,7 +3606,7 @@ private fun fallbackShuffleQueue(library: List<Song>, current: Song, k: Int): Li
 }
 
 @Composable
-private fun PermissionGateUi(onRequest: () -> Unit) {
+private fun PermissionGateUi(onRequest: () -> Unit, onOpenSettings: () -> Unit) {
     Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
@@ -3256,6 +3620,10 @@ private fun PermissionGateUi(onRequest: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(20.dp))
             Button(onClick = onRequest) { Text("Grant access") }
+            Spacer(Modifier.height(8.dp))
+            androidx.compose.material3.TextButton(onClick = onOpenSettings) {
+                Text("Open app settings")
+            }
         }
     }
 }

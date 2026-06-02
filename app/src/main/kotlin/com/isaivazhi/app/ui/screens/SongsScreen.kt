@@ -25,27 +25,36 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.ui.songHasEmbedding
 
 @Composable
 fun SongsScreen(
     songs: List<Song>,
     currentMediaId: String?,
+    permissionGranted: Boolean = true,
     // Push #59: red-dot lookup switched from filename to filepath. The
     // filename-based check in earlier pushes misclassified songs whose
     // MediaStore DISPLAY_NAME differs from the on-disk filename — they
     // showed a red "not embedded" dot even though they WERE embedded.
     embeddedFilepaths: Set<String> = emptySet(),
+    embeddingsRowCount: Int? = null,
     onSongTap: (Song) -> Unit,
     onSongLongPress: (Song) -> Unit = {},
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     if (songs.isEmpty()) {
+        val emptyMessage = when {
+            !permissionGranted ->
+                "Grant storage permission to scan your music library."
+            else ->
+                "No songs found on this device. Open Settings → Rescan music library to try again."
+        }
         Box(
             modifier = Modifier.fillMaxSize().padding(24.dp),
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = "No songs found. Grant storage permission to scan your library.",
+                text = emptyMessage,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -64,7 +73,11 @@ fun SongsScreen(
             SongRow(
                 song = song,
                 isCurrent = song.filename == currentMediaId,
-                hasEmbedding = embeddedFilepaths.isEmpty() || song.filePath in embeddedFilepaths,
+                hasEmbedding = songHasEmbedding(
+                    filePath = song.filePath,
+                    embeddingsRowCount = embeddingsRowCount,
+                    embeddedFilepaths = embeddedFilepaths,
+                ),
                 onClick = { onSongTap(song) },
                 onLongClick = { onSongLongPress(song) },
             )

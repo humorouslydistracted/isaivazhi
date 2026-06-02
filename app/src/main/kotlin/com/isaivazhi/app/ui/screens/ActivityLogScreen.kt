@@ -1,10 +1,7 @@
 package com.isaivazhi.app.ui.screens
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,35 +12,23 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.ActivityLogEngine
@@ -53,94 +38,24 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Push #74: in-app human-readable activity log. Mirrors the Capacitor debug
- * screen ("engine.activity"). Shows the last 200 entries from
- * [ActivityLogEngine] with category-coloured chips and an inline JSON detail
- * panel when a row is tapped.
- *
- * Reachable from Settings → Activity Log and from a long-press on the Taste
- * page header.
+ * Activity tab: full rolling activity log (playback, taste, queue, engine, UI) — no sub-filters.
  */
 @Composable
-fun ActivityLogScreen(
+fun ActivityLogPane(
     activityLog: ActivityLogEngine,
-    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
-    val ctx = LocalContext.current
     val entries by activityLog.entries.collectAsState()
-    var selectedCategory by remember { mutableStateOf("all") }
     val expanded = remember { mutableStateOf<Set<Long>>(emptySet()) }
 
-    val categories = listOf("all", "playback", "engine", "taste", "queue", "notification", "ui")
-    val filtered = remember(entries, selectedCategory) {
-        if (selectedCategory == "all") entries else entries.filter { it.category == selectedCategory }
-    }
-
-    Column(
-        Modifier
-            .fillMaxSize()
-            .systemBarsPadding()
-            .background(MaterialTheme.colorScheme.background)
-    ) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-            }
-            Text(
-                "Activity Log",
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.weight(1f),
-            )
-            IconButton(onClick = {
-                val text = filtered.joinToString("\n") { formatLine(it) }
-                val cm = ctx.getSystemService(ClipboardManager::class.java)
-                cm?.setPrimaryClip(ClipData.newPlainText("activity_log", text))
-            }) {
-                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy all")
-            }
-            IconButton(onClick = { activityLog.clear() }) {
-                Icon(Icons.Filled.Delete, contentDescription = "Clear")
-            }
-        }
-
-        HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            for (cat in categories) {
-                FilterChip(
-                    selected = selectedCategory == cat,
-                    onClick = { selectedCategory = cat },
-                    label = {
-                        val count = if (cat == "all") entries.size else entries.count { it.category == cat }
-                        Text("$cat ($count)", style = MaterialTheme.typography.labelSmall)
-                    },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = categoryColor(cat).copy(alpha = 0.25f),
-                    ),
-                )
-            }
-        }
-
-        HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
-
-        if (filtered.isEmpty()) {
-            Box(
-                Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center,
-            ) {
+    Column(modifier = modifier.background(MaterialTheme.colorScheme.background)) {
+        if (entries.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    "No entries yet — start playing music or change a setting.",
+                    "No events yet — play music, change taste, or use the library.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp),
                 )
             }
         } else {
@@ -148,7 +63,7 @@ fun ActivityLogScreen(
                 contentPadding = PaddingValues(vertical = 4.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                items(filtered, key = { it.timestamp.toString() + ":" + it.type + ":" + it.message.hashCode() }) { entry ->
+                items(entries, key = { it.timestamp.toString() + ":" + it.type + ":" + it.message.hashCode() }) { entry ->
                     EntryRow(
                         entry = entry,
                         isExpanded = entry.timestamp in expanded.value,
@@ -159,6 +74,63 @@ fun ActivityLogScreen(
                                 expanded.value + entry.timestamp
                             }
                         },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Embedding tab: ONNX batch trace from [com.isaivazhi.app.engine.LogBuffer]. */
+@Composable
+fun EmbeddingLogPane(
+    logLines: List<String>,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(logLines.size) {
+        if (logLines.isNotEmpty()) listState.animateScrollToItem(0)
+    }
+
+    Column(modifier = modifier.background(MaterialTheme.colorScheme.background)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (logLines.isEmpty()) "No lines yet"
+                else "${logLines.size} lines — batch progress from AI & Library",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+        }
+
+        HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+
+        if (logLines.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    "Start an embedding batch from AI & Library to see progress here.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp),
+                )
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                contentPadding = PaddingValues(vertical = 4.dp, horizontal = 8.dp),
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                val total = logLines.size
+                items(total) { i ->
+                    Text(
+                        text = logLines[total - 1 - i],
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(vertical = 1.dp),
                     )
                 }
             }
@@ -192,7 +164,7 @@ private fun EntryRow(
             Spacer(Modifier.width(8.dp))
             Box(
                 Modifier
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
                     .background(typeColor.copy(alpha = 0.25f))
                     .padding(horizontal = 6.dp, vertical = 2.dp),
             ) {
@@ -223,21 +195,12 @@ private fun EntryRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(start = 24.dp, top = 4.dp, bottom = 4.dp, end = 8.dp)
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f), androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
                     .padding(8.dp),
             )
         }
     }
     HorizontalDivider(thickness = 0.25.dp, color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
-}
-
-private fun formatLine(entry: ActivityLogEngine.Entry): String {
-    val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(entry.timestamp))
-    val type = entry.type.padEnd(12).take(12)
-    val base = "[$ts]  $type  ${entry.message}"
-    if (entry.data.isBlank()) return base
-    val data = runCatching { JSONObject(entry.data).toString() }.getOrDefault(entry.data)
-    return "$base | data=$data"
 }
 
 private fun categoryColor(category: String): Color = when (category) {

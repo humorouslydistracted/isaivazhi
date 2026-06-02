@@ -1,0 +1,7 @@
+# ninja log v5
+450	1040	8020722030449758	C:/Users/myuva/Documents/music_app_development/native/app/build/intermediates/cxx/Debug/2e3s5l23/obj/x86/libisaivazhi_native.so	f01d2e7c28e32724
+5	449	8020722024595083	CMakeFiles/isaivazhi_native.dir/embedding_native.cpp.o	c4f3c8e8cbf9fa04
+1	23	0	clean	5337371ae59de7b8
+1	27	0	clean	5337371ae59de7b8
+8	529	8020737624241341	CMakeFiles/isaivazhi_native.dir/embedding_native.cpp.o	c4f3c8e8cbf9fa04
+530	1018	8020737629067412	C:/Users/myuva/Documents/music_app_development/native/app/build/intermediates/cxx/Debug/2e3s5l23/obj/x86/libisaivazhi_native.so	f01d2e7c28e32724

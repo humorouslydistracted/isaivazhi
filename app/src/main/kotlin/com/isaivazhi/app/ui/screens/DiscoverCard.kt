@@ -100,6 +100,7 @@ fun DiscoverCardRow(
     currentMediaId: String?,
     // Push #59: filepath-based red-dot lookup (was filename).
     embeddedFilepaths: Set<String> = emptySet(),
+    embeddingsRowCount: Int? = null,
     onTap: (Song, Int) -> Unit,
     onLongPress: (Song) -> Unit,
 ) {
@@ -113,7 +114,11 @@ fun DiscoverCardRow(
                 song = song,
                 similarity = sim,
                 isCurrent = song.filename == currentMediaId,
-                hasEmbedding = embeddedFilepaths.isEmpty() || song.filePath in embeddedFilepaths,
+                hasEmbedding = com.isaivazhi.app.ui.songHasEmbedding(
+                    filePath = song.filePath,
+                    embeddingsRowCount = embeddingsRowCount,
+                    embeddedFilepaths = embeddedFilepaths,
+                ),
                 onClick = { onTap(song, index) },
                 onLongClick = { onLongPress(song) },
             )
