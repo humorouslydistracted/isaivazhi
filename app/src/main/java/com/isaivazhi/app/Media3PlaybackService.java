@@ -292,6 +292,11 @@ public class Media3PlaybackService extends MediaSessionService {
                         insertAfterCurrent(items);
                         return success();
                     }
+                    case PlaybackCommandContract.CMD_INSERT_BEFORE_CURRENT_AND_PLAY: {
+                        ArrayList<PlaybackQueueItem> items = PlaybackQueueItem.fromCommandBundle(safeArgs);
+                        insertBeforeCurrentAndPlay(items);
+                        return success();
+                    }
                     case PlaybackCommandContract.CMD_APPEND_TO_QUEUE: {
                         ArrayList<PlaybackQueueItem> items = PlaybackQueueItem.fromCommandBundle(safeArgs);
                         appendToQueue(items);
@@ -538,14 +543,13 @@ public class Media3PlaybackService extends MediaSessionService {
         }
     }
 
-    private void replaceUpcoming(List<PlaybackQueueItem> items) {
+    private void replaceUpcoming(@Nullable List<PlaybackQueueItem> upcomingItems) {
         synchronized (queueLock) {
-            // 2026-05-11 #15: log entry state + incoming items for full trace.
+            int incomingSize = upcomingItems != null ? upcomingItems.size() : 0;
             StringBuilder incomingIds = new StringBuilder();
-            int incomingSize = items != null ? items.size() : 0;
             for (int i = 0; i < Math.min(5, incomingSize); i++) {
                 if (i > 0) incomingIds.append(',');
-                incomingIds.append(items.get(i).songId);
+                incomingIds.append(upcomingItems.get(i).songId);
             }
             long currentSongId = (currentIndex >= 0 && currentIndex < queue.size())
                     ? queue.get(currentIndex).songId : -1L;
@@ -556,14 +560,14 @@ public class Media3PlaybackService extends MediaSessionService {
                     + " incomingFirstIds=[" + incomingIds + "]");
             if (currentIndex == C.INDEX_UNSET || currentIndex >= queue.size()) {
                 Log.w(TAG, "replaceUpcoming: no usable current, falling back to setQueue");
-                setQueue(items, 0, 0L);
+                setQueue(upcomingItems, 0, 0L);
                 return;
             }
 
             PlaybackQueueItem current = queue.get(currentIndex);
             ArrayList<PlaybackQueueItem> rebuilt = new ArrayList<>();
             rebuilt.add(current);
-            if (items != null) rebuilt.addAll(items);
+            if (upcomingItems != null) rebuilt.addAll(upcomingItems);
             queue = rebuilt;
 
             int oldIndex = currentIndex;
@@ -575,10 +579,9 @@ public class Media3PlaybackService extends MediaSessionService {
                 player.removeMediaItems(0, oldIndex);
             }
             currentIndex = 0;
-            if (items != null && !items.isEmpty()) {
-                player.addMediaItems(1, PlaybackQueueItem.toMediaItems(items));
+            if (upcomingItems != null && !upcomingItems.isEmpty()) {
+                player.addMediaItems(1, PlaybackQueueItem.toMediaItems(upcomingItems));
             }
-            // Log final queue state after the rebuild.
             StringBuilder finalIds = new StringBuilder();
             for (int i = 0; i < Math.min(5, queue.size()); i++) {
                 if (i > 0) finalIds.append(',');
@@ -589,6 +592,34 @@ public class Media3PlaybackService extends MediaSessionService {
                     + " firstIds=[" + finalIds + "]"
                     + " normalizedFromIndex=" + oldIndex + ")");
             emitQueueChanged();
+        }
+    }
+
+    private void insertBeforeCurrent(List<PlaybackQueueItem> items) {
+        synchronized (queueLock) {
+            if (currentIndex == C.INDEX_UNSET || queue.isEmpty()) {
+                setQueue(items, 0, 0L);
+                return;
+            }
+            if (items == null || items.isEmpty()) return;
+            queue.addAll(currentIndex, items);
+            player.addMediaItems(currentIndex, PlaybackQueueItem.toMediaItems(items));
+            emitQueueChanged();
+        }
+    }
+
+    private void insertBeforeCurrentAndPlay(List<PlaybackQueueItem> items) {
+        synchronized (queueLock) {
+            if (items == null || items.isEmpty()) return;
+            insertBeforeCurrent(items);
+            if (currentIndex == C.INDEX_UNSET || currentIndex >= queue.size()) return;
+            TransitionSnapshot snapshot = captureTransitionSnapshot("history_prev", -1f);
+            currentPlaybackInstanceId = nextPlaybackInstanceId();
+            resetPlayedProgress(0L);
+            suppressUpcomingTransition(currentIndex);
+            player.seekToDefaultPosition(currentIndex);
+            player.play();
+            emitCurrentChanged(snapshot);
         }
     }
 

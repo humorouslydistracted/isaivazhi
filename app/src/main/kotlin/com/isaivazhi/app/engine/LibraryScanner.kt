@@ -2,6 +2,7 @@ package com.isaivazhi.app.engine
 
 import android.content.Context
 import android.database.Cursor
+import android.media.MediaMetadataRetriever
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
@@ -44,6 +45,7 @@ object LibraryScanner {
                 MediaStore.Audio.Media.ALBUM,
                 MediaStore.Audio.Media.DATA,
                 MediaStore.Audio.Media.DATE_MODIFIED,
+                MediaStore.Audio.Media.DURATION,
             )
             val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0"
             val sortOrder = "${MediaStore.Audio.Media.DISPLAY_NAME} ASC"
@@ -65,9 +67,99 @@ object LibraryScanner {
             if (dir.isDirectory) collectRecursive(dir, seenPaths, songs)
         }
 
-        // Stable ordering by display name; preserve cursor order otherwise.
-        Log.i(TAG, "Library scan: ${songs.size} songs")
-        songs.mapIndexed { i, s -> s.copy(id = i) }
+        val withIds = songs.mapIndexed { i, s -> s.copy(id = i) }
+        Log.i(TAG, "Library scan: ${withIds.size} songs")
+        enrichDurations(ctx, withIds)
+    }
+
+    /**
+     * Fills [Song.durationMs] from MediaStore (bulk) and, for remaining gaps,
+     * [MediaMetadataRetriever] on the file path (filesystem-only entries).
+     */
+    fun enrichDurations(ctx: Context, songs: List<Song>): List<Song> {
+        if (songs.isEmpty()) return songs
+        val missing = songs.count { it.durationMs <= 0L && !it.filePath.isNullOrBlank() }
+        if (missing == 0) return songs
+        val (byPath, byFilename) = loadMediaStoreDurations(ctx)
+        var filled = 0
+        val out = songs.map { song ->
+            if (song.durationMs > 0L) return@map song
+            var dur = song.filePath?.let { byPath[it] } ?: 0L
+            if (dur <= 0L) dur = byFilename[song.filename] ?: 0L
+            if (dur <= 0L && !song.filePath.isNullOrBlank()) {
+                dur = readDurationFromFile(song.filePath)
+            }
+            if (dur > 0L) {
+                filled++
+                song.copy(durationMs = dur)
+            } else {
+                song
+            }
+        }
+        if (filled > 0) {
+            Log.i(TAG, "enrichDurations: filled $filled / $missing missing durations")
+        }
+        return out
+    }
+
+    private fun loadMediaStoreDurations(ctx: Context): Pair<Map<String, Long>, Map<String, Long>> {
+        val byPath = HashMap<String, Long>()
+        val byFilename = HashMap<String, Long>()
+        try {
+            val projection = arrayOf(
+                MediaStore.Audio.Media.DISPLAY_NAME,
+                MediaStore.Audio.Media.DATA,
+                MediaStore.Audio.Media.DURATION,
+            )
+            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else {
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            }
+            ctx.contentResolver.query(
+                uri,
+                projection,
+                "${MediaStore.Audio.Media.IS_MUSIC} != 0",
+                null,
+                null,
+            )?.use { c ->
+                val idxName = c.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
+                val idxData = c.getColumnIndex(MediaStore.Audio.Media.DATA)
+                val idxDur = c.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                while (c.moveToNext()) {
+                    if (idxDur < 0) continue
+                    val dur = c.getLong(idxDur)
+                    if (dur <= 0L) continue
+                    if (idxData >= 0) {
+                        c.getString(idxData)?.takeIf { it.isNotBlank() }?.let { byPath[it] = dur }
+                    }
+                    if (idxName >= 0) {
+                        c.getString(idxName)?.takeIf { it.isNotBlank() }?.let { name ->
+                            byFilename.putIfAbsent(name, dur)
+                        }
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "loadMediaStoreDurations failed: ${t.message}")
+        }
+        return byPath to byFilename
+    }
+
+    private fun readDurationFromFile(path: String): Long {
+        if (path.isBlank()) return 0L
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(path)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.coerceAtLeast(0L)
+                ?: 0L
+        } catch (t: Throwable) {
+            0L
+        } finally {
+            runCatching { retriever.release() }
+        }
     }
 
     /** MediaStore date columns are seconds; filesystem uses milliseconds. */
@@ -85,6 +177,7 @@ object LibraryScanner {
         val idxAlbum = c.getColumnIndex(MediaStore.Audio.Media.ALBUM)
         val idxData = c.getColumnIndex(MediaStore.Audio.Media.DATA)
         val idxModified = c.getColumnIndex(MediaStore.Audio.Media.DATE_MODIFIED)
+        val idxDuration = c.getColumnIndex(MediaStore.Audio.Media.DURATION)
 
         while (c.moveToNext()) {
             val filename = c.getString(idxName) ?: continue
@@ -108,6 +201,7 @@ object LibraryScanner {
                 album = (if (idxAlbum >= 0) c.getString(idxAlbum) else null) ?: "",
                 filePath = path,
                 dateModified = if (idxModified >= 0) normalizeToEpochMs(c.getLong(idxModified)) else 0L,
+                durationMs = if (idxDuration >= 0) c.getLong(idxDuration).coerceAtLeast(0L) else 0L,
             )
         }
     }

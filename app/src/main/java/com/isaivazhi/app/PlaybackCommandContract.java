@@ -13,6 +13,8 @@ public final class PlaybackCommandContract {
     static final String CMD_PLAY_AUDIO = "isaivazhi.playback.PLAY_AUDIO";
     static final String CMD_REPLACE_UPCOMING = "isaivazhi.playback.REPLACE_UPCOMING";
     static final String CMD_INSERT_AFTER_CURRENT = "isaivazhi.playback.INSERT_AFTER_CURRENT";
+    /** Insert at current index and start playback on the first inserted item. */
+    static final String CMD_INSERT_BEFORE_CURRENT_AND_PLAY = "isaivazhi.playback.INSERT_BEFORE_CURRENT_AND_PLAY";
     static final String CMD_APPEND_TO_QUEUE = "isaivazhi.playback.APPEND_TO_QUEUE";
     static final String CMD_CLEAR_QUEUE_AFTER_CURRENT = "isaivazhi.playback.CLEAR_QUEUE_AFTER_CURRENT";
     static final String CMD_PLAY_INDEX = "isaivazhi.playback.PLAY_INDEX";
@@ -48,6 +50,8 @@ public final class PlaybackCommandContract {
 
     static final String KEY_ITEMS = "items";
     static final String KEY_ITEMS_JSON = "itemsJson";
+    /** Optional played prefix for CMD_REPLACE_UPCOMING (oldest-first back stack). */
+    static final String KEY_PREFIX_ITEMS_JSON = "prefixItemsJson";
     static final String KEY_START_INDEX = "startIndex";
     static final String KEY_SEEK_TO_MS = "seekToMs";
     static final String KEY_POSITION_MS = "positionMs";
@@ -83,6 +87,7 @@ public final class PlaybackCommandContract {
                 .add(command(CMD_PLAY_AUDIO))
                 .add(command(CMD_REPLACE_UPCOMING))
                 .add(command(CMD_INSERT_AFTER_CURRENT))
+                .add(command(CMD_INSERT_BEFORE_CURRENT_AND_PLAY))
                 .add(command(CMD_APPEND_TO_QUEUE))
                 .add(command(CMD_CLEAR_QUEUE_AFTER_CURRENT))
                 .add(command(CMD_PLAY_INDEX))

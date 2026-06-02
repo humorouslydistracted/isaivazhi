@@ -21,6 +21,7 @@ import java.io.File
 object LibraryCache {
 
     private const val CACHE_FILE = "song_library.json"
+    private const val CACHE_VERSION = 2
     private const val MAX_AGE_MS = 6L * 60L * 60L * 1000L  // 6 hours
     @Volatile var lastLoadSource: String = "unknown"
         private set
@@ -70,6 +71,10 @@ object LibraryCache {
         }
         return runCatching {
             val json = JSONObject(f.readText(Charsets.UTF_8))
+            if (json.optInt("cacheVersion", 1) < CACHE_VERSION) {
+                android.util.Log.i("LibraryCache", "cache schema v${json.optInt("cacheVersion", 1)} < $CACHE_VERSION, rescanning")
+                return null
+            }
             val arr = json.optJSONArray("songs") ?: return null
             val out = ArrayList<Song>(arr.length())
             for (i in 0 until arr.length()) {
@@ -88,11 +93,17 @@ object LibraryCache {
                     embeddingIndex = if (o.has("embeddingIndex") && !o.isNull("embeddingIndex"))
                         o.optInt("embeddingIndex") else null,
                     disliked = o.optBoolean("disliked", false),
+                    durationMs = o.optLong("durationMs", 0L),
                 )
             }
             // Never trust an empty cache — it may have been written before
             // the user granted storage permission.
-            if (out.isEmpty()) null else out
+            if (out.isEmpty()) return null
+            val enriched = LibraryScanner.enrichDurations(ctx, out)
+            if (enriched.zip(out).any { (a, b) -> a.durationMs != b.durationMs }) {
+                runCatching { write(ctx, enriched) }
+            }
+            enriched
         }.getOrNull()
     }
 
@@ -111,9 +122,11 @@ object LibraryCache {
             o.put("hasEmbedding", s.hasEmbedding)
             if (s.embeddingIndex != null) o.put("embeddingIndex", s.embeddingIndex) else o.put("embeddingIndex", JSONObject.NULL)
             o.put("disliked", s.disliked)
+            o.put("durationMs", s.durationMs)
             arr.put(o)
         }
         val root = JSONObject().apply {
+            put("cacheVersion", CACHE_VERSION)
             put("songs", arr)
             put("savedAt", System.currentTimeMillis())
         }

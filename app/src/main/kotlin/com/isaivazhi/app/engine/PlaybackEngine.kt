@@ -67,6 +67,10 @@ class PlaybackEngine(
     @Volatile
     var pendingTransitionSource: String = "auto_advance"
 
+    /** Set from MainActivity so history-backed Prev can resolve filenames to [Song]. */
+    @Volatile
+    var resolveSongByFilename: ((String) -> Song?)? = null
+
     /**
      * Push #70: the kind of content currently loaded as the queue. Drives
      * the queue-exhaust LE's "should I append AI?" decision and threads
@@ -120,6 +124,8 @@ class PlaybackEngine(
         const val CMD_SET_QUEUE = "isaivazhi.playback.SET_QUEUE"
         const val CMD_APPEND_TO_QUEUE = "isaivazhi.playback.APPEND_TO_QUEUE"
         const val CMD_INSERT_AFTER_CURRENT = "isaivazhi.playback.INSERT_AFTER_CURRENT"
+        const val CMD_INSERT_BEFORE_CURRENT_AND_PLAY =
+            "isaivazhi.playback.INSERT_BEFORE_CURRENT_AND_PLAY"
         const val CMD_REPLACE_UPCOMING = "isaivazhi.playback.REPLACE_UPCOMING"
         const val CMD_PLAY_INDEX = "isaivazhi.playback.PLAY_INDEX"
         const val CMD_NEXT_TRACK = "isaivazhi.playback.NEXT_TRACK"
@@ -578,12 +584,7 @@ class PlaybackEngine(
         ctrl.sendCustomCommand(SessionCommand(action, Bundle.EMPTY), args)
     }
 
-    private fun queueCommandArgs(
-        songs: List<Song>,
-        startIndex: Int = 0,
-        seekToMs: Long = 0L,
-        playWhenReady: Boolean = true,
-    ): Bundle {
+    private fun songsToJsonArray(songs: List<Song>): JSONArray {
         val arr = JSONArray()
         for (song in songs) {
             val path = song.filePath ?: continue
@@ -597,8 +598,17 @@ class PlaybackEngine(
                     .put(KEY_ALBUM, song.album)
             )
         }
+        return arr
+    }
+
+    private fun queueCommandArgs(
+        songs: List<Song>,
+        startIndex: Int = 0,
+        seekToMs: Long = 0L,
+        playWhenReady: Boolean = true,
+    ): Bundle {
         return Bundle().apply {
-            putString(KEY_ITEMS_JSON, arr.toString())
+            putString(KEY_ITEMS_JSON, songsToJsonArray(songs).toString())
             putInt(KEY_START_INDEX, startIndex)
             putLong(KEY_SEEK_TO_MS, seekToMs.coerceAtLeast(0L))
             putBoolean(KEY_PLAY_WHEN_READY, playWhenReady)
@@ -912,15 +922,45 @@ class PlaybackEngine(
 
     fun skipPrev() {
         pendingTransitionSource = "prev_button"
-        // Push #39: service-side snapshot replaces the Kotlin-side
-        // pre-transition fields.
         val cur = _state.value
         val livePos = _livePosition.value
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val curIdx = ctrl.currentMediaItemIndex.coerceAtLeast(0)
+            val atQueueHead = curIdx <= 0 && livePos <= 3000L
+            val curFilename = cur.currentMediaId
+            if (atQueueHead && !curFilename.isNullOrBlank()) {
+                val prevFn = history?.mostRecentListenBefore(curFilename)
+                val prevSong = prevFn?.let { fn -> resolveSongByFilename?.invoke(fn) }
+                if (prevSong != null && !prevSong.filePath.isNullOrEmpty()) {
+                    sendPlaybackCommand(
+                        ctrl,
+                        CMD_INSERT_BEFORE_CURRENT_AND_PLAY,
+                        queueCommandArgs(listOf(prevSong)),
+                    )
+                    val insertAt = curIdx.coerceAtMost(cur.queueFilenames.size)
+                    val nextFilenames = cur.queueFilenames.toMutableList().also {
+                        it.add(insertAt, prevSong.filename)
+                    }
+                    _state.value = cur.copy(
+                        queueFilenames = nextFilenames,
+                        queueIndex = insertAt,
+                        currentMediaId = prevSong.filename,
+                        title = prevSong.title,
+                        artist = prevSong.artist,
+                        album = prevSong.album,
+                    )
+                    _livePosition.value = 0L
+                    persistQueue(nextFilenames, insertAt)
+                    android.util.Log.i(
+                        "QueueOp",
+                        "skipPrev history: inserted ${prevSong.filename} at $insertAt",
+                    )
+                    return@launch
+                }
+            }
             sendPlaybackCommand(ctrl, CMD_PREV_TRACK)
         }
-        // Optimistic update for the prev-track case so the UI doesn't lag.
         if (livePos <= 3000L && cur.queueIndex > 0) {
             _state.value = cur.copy(queueIndex = cur.queueIndex - 1)
         }
@@ -1277,22 +1317,81 @@ class PlaybackEngine(
         if (song.filePath.isNullOrEmpty()) return
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            val insertAt = (ctrl.currentMediaItemIndex + 1).coerceAtLeast(0)
-            sendPlaybackCommand(ctrl, CMD_INSERT_AFTER_CURRENT, queueCommandArgs(listOf(song)))
+            val count = ctrl.mediaItemCount
+            if (count <= 0) return@launch
+            val curIdx = ctrl.currentMediaItemIndex.coerceIn(0, count - 1)
+            val targetIdx = curIdx + 1
             val cur = _state.value
-            val nextFilenames = cur.queueFilenames.toMutableList().also {
-                if (insertAt <= it.size) it.add(insertAt, song.filename) else it.add(song.filename)
+            val fn = song.filename
+            val from = cur.queueFilenames.indexOf(fn)
+            val newPlayNextSet = cur.playNextFilenames + fn
+
+            when {
+                from == curIdx -> return@launch
+                from == targetIdx -> {
+                    _state.value = cur.copy(playNextFilenames = newPlayNextSet)
+                    android.util.Log.i("QueueOp", "playNext: already at $targetIdx $fn")
+                }
+                from >= 0 && targetIdx < count -> {
+                    val moveTo = if (from < targetIdx) targetIdx - 1 else targetIdx
+                    if (from !in 0 until count || moveTo !in 0 until count) return@launch
+                    ctrl.moveMediaItem(from, moveTo)
+                    val list = cur.queueFilenames.toMutableList()
+                    if (from in list.indices) {
+                        val item = list.removeAt(from)
+                        list.add(moveTo.coerceIn(0, list.size), item)
+                    }
+                    val newCurIdx = ctrl.currentMediaItemIndex
+                    _state.value = cur.copy(
+                        queueFilenames = list,
+                        queueIndex = newCurIdx,
+                        playNextFilenames = newPlayNextSet,
+                    )
+                    android.util.Log.i(
+                        "QueueOp",
+                        "playNext: moved $fn from $from to $moveTo; playNextSet size=${newPlayNextSet.size}",
+                    )
+                    persistQueue(list, newCurIdx)
+                }
+                from >= 0 -> {
+                    // Song is after current at queue end — remove then insert after current.
+                    ctrl.removeMediaItem(from)
+                    val list = cur.queueFilenames.toMutableList().also {
+                        if (from in it.indices) it.removeAt(from)
+                    }
+                    val curIdxAfter = ctrl.currentMediaItemIndex.coerceAtLeast(0)
+                    sendPlaybackCommand(ctrl, CMD_INSERT_AFTER_CURRENT, queueCommandArgs(listOf(song)))
+                    val insertAt = (curIdxAfter + 1).coerceAtMost(list.size)
+                    list.add(insertAt, fn)
+                    val newCurIdx = ctrl.currentMediaItemIndex
+                    _state.value = cur.copy(
+                        queueFilenames = list,
+                        queueIndex = newCurIdx,
+                        playNextFilenames = newPlayNextSet,
+                    )
+                    android.util.Log.i(
+                        "QueueOp",
+                        "playNext: relocated $fn from $from to after current; playNextSet size=${newPlayNextSet.size}",
+                    )
+                    persistQueue(list, newCurIdx)
+                }
+                else -> {
+                    sendPlaybackCommand(ctrl, CMD_INSERT_AFTER_CURRENT, queueCommandArgs(listOf(song)))
+                    val insertAt = targetIdx.coerceAtMost(cur.queueFilenames.size)
+                    val nextFilenames = cur.queueFilenames.toMutableList().also {
+                        if (insertAt <= it.size) it.add(insertAt, fn) else it.add(fn)
+                    }
+                    _state.value = cur.copy(
+                        queueFilenames = nextFilenames,
+                        playNextFilenames = newPlayNextSet,
+                    )
+                    android.util.Log.i(
+                        "QueueOp",
+                        "playNext: inserted $fn at $insertAt; playNextSet size=${newPlayNextSet.size}",
+                    )
+                    persistQueue(nextFilenames, ctrl.currentMediaItemIndex)
+                }
             }
-            val newPlayNextSet = cur.playNextFilenames + song.filename
-            _state.value = cur.copy(
-                queueFilenames = nextFilenames,
-                playNextFilenames = newPlayNextSet,
-            )
-            android.util.Log.i(
-                "QueueOp",
-                "playNext: inserted ${song.filename} at $insertAt; playNextSet size=${newPlayNextSet.size}"
-            )
-            persistQueue(nextFilenames, ctrl.currentMediaItemIndex)
         }
     }
 
@@ -1360,11 +1459,6 @@ class PlaybackEngine(
             if (curIdx < 0 || totalBefore == 0) return@launch
             val curState = _state.value
             val curFilename = curState.currentMediaId
-            // IMPORTANT: Keep Kotlin queue shape aligned with the service's
-            // CMD_REPLACE_UPCOMING behavior. Service normalizes queue to
-            // [current] + incoming upcoming and sets currentIndex=0.
-            // If Kotlin keeps older prefix items, UI indices diverge from
-            // Media3 indices and taps can play the wrong song.
             val seen = HashSet<String>()
             curFilename?.let { seen += it }
             val nextSongs = newUpcoming.filter {
@@ -1375,20 +1469,60 @@ class PlaybackEngine(
                 if (curFilename != null) add(curFilename)
                 addAll(nextSongs.map { it.filename })
             }
-            val nextIdx = 0
             val resolvedContext = newContext ?: curState.queueContext
             android.util.Log.i(
                 "QueueOp",
                 "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +
                     "ctx=${curState.queueContext}→$resolvedContext playNextSet=${curState.playNextFilenames.size}"
             )
-            _state.value = curState.copy(
-                queueFilenames = nextFilenames,
-                queueIndex = nextIdx,
-                queueContext = resolvedContext,
-            )
-            persistQueue(nextFilenames, nextIdx)
+            syncQueueStateAfterReplace(ctrl, curState, nextFilenames, curFilename, resolvedContext)
         }
+    }
+
+    /**
+     * Align Kotlin queue index/filenames with Media3 after replaceUpcoming.
+     * Service normalizes to [current] + upcoming at index 0.
+     */
+    private fun syncQueueStateAfterReplace(
+        ctrl: MediaController,
+        curState: PlaybackState,
+        nextFilenames: List<String>,
+        curFilename: String?,
+        resolvedContext: QueueContext,
+    ) {
+        val actualIdx = ctrl.currentMediaItemIndex.coerceAtLeast(0)
+        val actualMediaId = mediaIdToFilename(ctrl.currentMediaItem?.mediaId)
+        var queueIndex = actualIdx
+        if (!curFilename.isNullOrBlank()) {
+            val expectedIdx = nextFilenames.indexOf(curFilename)
+            if (expectedIdx >= 0) {
+                queueIndex = expectedIdx
+            }
+        }
+        if (!curFilename.isNullOrBlank() &&
+            nextFilenames.getOrNull(queueIndex) != curFilename
+        ) {
+            android.util.Log.w(
+                "QueueOp",
+                "replaceUpcoming index mismatch: queueIndex=$queueIndex " +
+                    "actualIdx=$actualIdx actualMediaId=$actualMediaId expected=$curFilename",
+            )
+            val fixIdx = nextFilenames.indexOf(curFilename)
+            if (fixIdx >= 0) {
+                queueIndex = fixIdx
+                sendPlaybackCommand(
+                    ctrl,
+                    CMD_PLAY_INDEX,
+                    Bundle().apply { putInt(KEY_INDEX, fixIdx) },
+                )
+            }
+        }
+        _state.value = curState.copy(
+            queueFilenames = nextFilenames,
+            queueIndex = queueIndex,
+            queueContext = resolvedContext,
+        )
+        persistQueue(nextFilenames, queueIndex)
     }
 
     private fun buildMediaItem(song: Song): MediaItem =

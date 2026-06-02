@@ -14,6 +14,7 @@ data class Song(
     val filePath: String?,        // null if file was deleted but metadata kept
     val artPath: String? = null,
     val dateModified: Long = 0L,
+    val durationMs: Long = 0L,
     val contentHash: String? = null,
     val hasEmbedding: Boolean = false,
     val embeddingIndex: Int? = null,

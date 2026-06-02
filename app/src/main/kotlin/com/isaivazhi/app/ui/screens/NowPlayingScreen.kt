@@ -184,22 +184,6 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(12.dp))
 
-                if (similarLoading || similarSongs.isNotEmpty()) {
-                    SimilarSongsRow(
-                        songs = similarSongs,
-                        loading = similarLoading,
-                        frozen = similarFrozen,
-                        seedTitle = similarSeedTitle,
-                        queueAllEnabled = queueAllSimilarEnabled,
-                        onTap = onSimilarTap,
-                        onPlayNext = onSimilarPlayNext,
-                        onLongPress = onSimilarLongPress,
-                        onQueueAll = onQueueAllSimilar,
-                        onToggleFrozen = onToggleSimilarFrozen,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                }
-
                 SecondaryControlsRow(
                     state = state,
                     isFavorite = isFavorite,
@@ -215,6 +199,22 @@ fun NowPlayingScreen(
                 )
 
                 Spacer(Modifier.height(12.dp))
+
+                if (similarLoading || similarSongs.isNotEmpty()) {
+                    SimilarSongsRow(
+                        songs = similarSongs,
+                        loading = similarLoading,
+                        frozen = similarFrozen,
+                        seedTitle = similarSeedTitle,
+                        queueAllEnabled = queueAllSimilarEnabled,
+                        onTap = onSimilarTap,
+                        onPlayNext = onSimilarPlayNext,
+                        onLongPress = onSimilarLongPress,
+                        onQueueAll = onQueueAllSimilar,
+                        onToggleFrozen = onToggleSimilarFrozen,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
             }
         }
     }

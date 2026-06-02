@@ -35,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.ui.formatDuration
 import com.isaivazhi.app.ui.songHasEmbedding
 
 @Composable
@@ -198,7 +199,7 @@ private fun AlbumTrackRow(
             .fillMaxWidth()
             .combinedClickable(onClick = onTap, onLongClick = onLongPress)
             .background(rowBg)
-            .padding(start = 36.dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -208,18 +209,36 @@ private fun AlbumTrackRow(
             modifier = Modifier.width(28.dp),
         )
         Spacer(Modifier.width(8.dp))
-        if (!hasEmbedding) {
-            NoEmbeddingDot()
-            Spacer(Modifier.width(6.dp))
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (!hasEmbedding) {
+                    NoEmbeddingDot()
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(
+                    text = track.title.ifBlank { track.filename },
+                    style = MaterialTheme.typography.titleSmall,
+                    color = if (isCurrent) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = track.artist.ifBlank { "Unknown artist" },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
+        Spacer(Modifier.width(8.dp))
         Text(
-            text = track.title.ifBlank { track.filename },
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (isCurrent) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onBackground,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
+            text = formatDuration(track.durationMs),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }

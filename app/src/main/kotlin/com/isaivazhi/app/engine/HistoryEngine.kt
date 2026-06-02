@@ -76,6 +76,12 @@ class HistoryEngine(private val appContext: Context) {
         readyDeferred.await()
     }
 
+    /** Most recently listened filename before [excludeFilename] (MR-first events). */
+    fun mostRecentListenBefore(excludeFilename: String): String? =
+        _events.value.asSequence()
+            .map { it.filename }
+            .firstOrNull { it != excludeFilename }
+
     fun recordStart(filename: String) {
         // If there's an existing in-flight song with no end-record, treat it
         // as fully played (assume Media3 transitioned cleanly) — this guards
