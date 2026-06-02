@@ -26,7 +26,11 @@ Most users only need:
 
 ### Local (Windows / GTX 1650)
 
-Use the guided flow in **[LAPTOP_EMBED.md](LAPTOP_EMBED.md)**.
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\embeddings\setup_laptop_embeddings.ps1
+# Copy laptop_config.example.json to laptop_config.json and set songs_dir
+powershell -ExecutionPolicy Bypass -File tools\embeddings\run_laptop_embeddings.ps1
+```
 
 ### Kaggle (private dataset, GPU)
 

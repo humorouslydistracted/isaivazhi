@@ -122,8 +122,7 @@ They are **not** in git (GitHub file size limit). Download from the dedicated
 release tag **[onnx-model-v1](https://github.com/humorouslydistracted/isaivazhi/releases/tag/onnx-model-v1)**
 or run `scripts/fetch_onnx_assets.ps1` / `scripts/fetch_onnx_assets.sh`.
 
-Details: [app/src/main/assets/README.md](app/src/main/assets/README.md) ·
-Maintainers: [docs/ONNX_MODEL_RELEASE.md](docs/ONNX_MODEL_RELEASE.md)
+Details: [app/src/main/assets/README.md](app/src/main/assets/README.md)
 
 Debug APK:
 

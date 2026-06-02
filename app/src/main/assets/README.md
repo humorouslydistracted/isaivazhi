@@ -47,4 +47,4 @@ $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
 
 When you replace the ONNX export, publish a new assets release (`onnx-model-v2`, …)
 and update `ONNX_MODEL_TAG` in `scripts/fetch_onnx_assets.ps1` and
-`scripts/fetch_onnx_assets.sh`. See `docs/ONNX_MODEL_RELEASE.md`.
+`scripts/fetch_onnx_assets.sh`.
