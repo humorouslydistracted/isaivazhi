@@ -70,6 +70,14 @@ object LibraryScanner {
         songs.mapIndexed { i, s -> s.copy(id = i) }
     }
 
+    /** MediaStore date columns are seconds; filesystem uses milliseconds. */
+    private fun normalizeToEpochMs(epoch: Long): Long =
+        when {
+            epoch <= 0L -> 0L
+            epoch < 1_000_000_000_000L -> epoch * 1000L
+            else -> epoch
+        }
+
     private fun ingestCursor(c: Cursor, seen: MutableSet<String>, out: MutableList<Song>) {
         val idxName = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
         val idxTitle = c.getColumnIndex(MediaStore.Audio.Media.TITLE)
@@ -99,7 +107,7 @@ object LibraryScanner {
                 artist = (if (idxArtist >= 0) c.getString(idxArtist) else null) ?: "",
                 album = (if (idxAlbum >= 0) c.getString(idxAlbum) else null) ?: "",
                 filePath = path,
-                dateModified = if (idxModified >= 0) c.getLong(idxModified) else 0L,
+                dateModified = if (idxModified >= 0) normalizeToEpochMs(c.getLong(idxModified)) else 0L,
             )
         }
     }

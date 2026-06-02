@@ -2538,8 +2538,6 @@ private fun AppRoot(container: AppContainer) {
     // Push #61: audio-duplicate groups — different filepaths sharing one
     // content_hash via T_PATH. Surfaces "same song stored twice on disk".
     var audioDuplicateGroups by remember { mutableStateOf<List<com.isaivazhi.app.engine.EmbeddingDbFacade.AudioDuplicateGroup>>(emptyList()) }
-    var audioDuplicatesScanning by remember { mutableStateOf(false) }
-    var nearDuplicateScanSkipped by remember { mutableStateOf(false) }
     // dupesRefreshTick declared earlier (near deleteSongHelper) so it can
     // be bumped from inside that callback.
     LaunchedEffect(overlay, dupesRefreshTick) {
@@ -2558,20 +2556,21 @@ private fun AppRoot(container: AppContainer) {
                 embeddedFilenames = fns
                 embeddedFilepaths = fps
             }
-            nearDuplicateScanSkipped = container.embeddingDb.isNearDuplicateScanSkipped(
-                container.embeddingDb.vecCacheSize.coerceAtLeast(embeddingsRowCount ?: 0),
-            )
-            audioDuplicatesScanning = true
+            // Push #56 diagnostic removed — its job (identifying that the
+            // remaining Pending entries were legacy-imported rows with
+            // empty T_EMB.filepath) is done; the push #55 UNION fix
+            // resolved the mismatch and the only remaining Pending entry
+            // is a real codec failure (Ayiram Thamarai.flac). The
+            // diagnostic DB methods (EmbeddingDb.diagnoseByFilename etc.)
+            // are kept for future debugging but no caller invokes them.
+            // Duplicates only exist when rowCount > distinct filenames,
+            // but querying is cheap — just run it. The Duplicates
+            // section hides itself when the list is empty.
             try {
                 duplicateRows = container.embedding.getDuplicates()
                 audioDuplicateGroups = container.embedding.getAudioDuplicates()
             } catch (t: Throwable) {
                 android.util.Log.w("MainActivity", "load duplicates failed: ${t.message}")
-            } finally {
-                audioDuplicatesScanning = false
-                nearDuplicateScanSkipped = container.embeddingDb.isNearDuplicateScanSkipped(
-                    container.embeddingDb.vecCacheSize,
-                )
             }
         }
     }
@@ -2804,8 +2803,6 @@ private fun AppRoot(container: AppContainer) {
             },
             // Push #61: Audio Duplicates section wiring.
             audioDuplicateGroups = audioDuplicateGroups,
-            audioDuplicatesScanning = audioDuplicatesScanning,
-            nearDuplicateScanSkipped = nearDuplicateScanSkipped,
             onPlayAudioDup = { filepath ->
                 val match = songsByFilepath[filepath]
                 if (match != null) {

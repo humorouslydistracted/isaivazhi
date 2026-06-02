@@ -4,9 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import android.content.Context
 import com.isaivazhi.app.EmbeddingDbManager
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import org.json.JSONObject
@@ -331,34 +329,17 @@ class EmbeddingDbFacade(appContext: Context) {
         val similarity: Float,
     )
 
-    enum class AudioDuplicateMatchKind {
-        EXACT_HASH,
-        NEAR_EMBEDDING,
-    }
-
     /**
-     * Push #61: a group of filepaths sharing the same audio identity — either
-     * identical first-30s PCM ([EXACT_HASH]) or highly similar CLAP embeddings
-     * ([NEAR_EMBEDDING], e.g. re-encoded copies).
+     * Push #61: a group of filepaths whose audio collapses to the same
+     * content_hash. T_EMB only stores one row per hash, but T_PATH keeps
+     * filepath→hash mappings for all duplicates so we can surface them.
      */
     data class AudioDuplicateGroup(
         val contentHash: String,
         val filepaths: List<String>,
-        val matchKind: AudioDuplicateMatchKind = AudioDuplicateMatchKind.EXACT_HASH,
-        val minSimilarity: Float? = null,
     )
 
-    /** True when the library is too large for an on-device O(n²) similarity scan. */
-    fun isNearDuplicateScanSkipped(representativeCount: Int): Boolean =
-        representativeCount > NearDuplicateScanner.MAX_REPRESENTATIVES
-
     suspend fun getAudioDuplicates(): List<AudioDuplicateGroup> {
-        val exact = loadExactHashDuplicateGroups()
-        val near = findNearEmbeddingDuplicateGroups()
-        return mergeAudioDuplicateGroups(exact, near)
-    }
-
-    private suspend fun loadExactHashDuplicateGroups(): List<AudioDuplicateGroup> {
         val res = awaitJsonObject { cb -> manager.getAudioDuplicateGroups(cb) } ?: return emptyList()
         val arr = res.optJSONArray("groups") ?: return emptyList()
         val out = ArrayList<AudioDuplicateGroup>(arr.length())
@@ -371,67 +352,9 @@ class EmbeddingDbFacade(appContext: Context) {
                 val s = fpsArr.optString(j, "")
                 if (s.isNotEmpty()) fps += s
             }
-            if (hash.isNotEmpty() && fps.size >= 2) {
-                out += AudioDuplicateGroup(
-                    contentHash = hash,
-                    filepaths = fps,
-                    matchKind = AudioDuplicateMatchKind.EXACT_HASH,
-                )
-            }
+            if (hash.isNotEmpty() && fps.size >= 2) out += AudioDuplicateGroup(hash, fps)
         }
         return out
-    }
-
-    suspend fun findNearEmbeddingDuplicateGroups(
-        threshold: Float = NearDuplicateScanner.DEFAULT_THRESHOLD,
-    ): List<AudioDuplicateGroup> = withContext(Dispatchers.Default) {
-        if (vecHeapCache.size < 2) {
-            fullWarmFromDb()
-        }
-        val hashToVec = HashMap<String, FloatArray>(vecHeapCache.size)
-        for ((hash, vec) in vecHeapCache) {
-            if (hash.isNotEmpty() && vec.isNotEmpty()) hashToVec[hash] = vec
-        }
-        if (hashToVec.size < 2) return@withContext emptyList()
-        if (isNearDuplicateScanSkipped(hashToVec.size)) return@withContext emptyList()
-
-        val hashToPaths = contentHashByFilepath()
-            .entries
-            .groupBy({ it.value }, { it.key })
-            .mapValues { (_, paths) -> paths.filter { it.isNotEmpty() }.distinct().sorted() }
-
-        val clusters = NearDuplicateScanner.scan(
-            NearDuplicateScanner.ScanInput(hashToVec, hashToPaths),
-            threshold,
-        )
-        clusters.mapNotNull { c ->
-            if (c.filepaths.size < 2) return@mapNotNull null
-            AudioDuplicateGroup(
-                contentHash = c.representativeHash,
-                filepaths = c.filepaths,
-                matchKind = AudioDuplicateMatchKind.NEAR_EMBEDDING,
-                minSimilarity = c.minSimilarity,
-            )
-        }
-    }
-
-    private fun mergeAudioDuplicateGroups(
-        exact: List<AudioDuplicateGroup>,
-        near: List<AudioDuplicateGroup>,
-    ): List<AudioDuplicateGroup> {
-        val merged = ArrayList<AudioDuplicateGroup>(exact.size + near.size)
-        merged.addAll(exact)
-        val exactPathSets = exact.map { it.filepaths.toSet() }
-        for (n in near) {
-            val fpSet = n.filepaths.toSet()
-            if (exactPathSets.any { it == fpSet }) continue
-            if (exact.any { e -> fpSet.all { fp -> fp in e.filepaths } && e.filepaths.size >= 2 }) continue
-            merged += n
-        }
-        return merged.sortedWith(
-            compareByDescending<AudioDuplicateGroup> { it.filepaths.size }
-                .thenBy { it.contentHash },
-        )
     }
 
     /**

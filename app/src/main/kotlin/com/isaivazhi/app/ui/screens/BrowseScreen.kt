@@ -331,6 +331,11 @@ private fun TileArtCell(path: String?, modifier: Modifier = Modifier) {
     }
 }
 
+/** Songs with on-disk paths, newest file modification first. */
+fun lastAddedSongs(songs: List<Song>): List<Song> =
+    songs.filter { it.filePath != null }
+        .sortedWith(compareByDescending<Song> { it.dateModified }.thenBy { it.filename })
+
 /** Compute the 7 browse tiles in display order. */
 fun buildBrowseTiles(
     songs: List<Song>,
@@ -351,8 +356,7 @@ fun buildBrowseTiles(
         .mapNotNull { byFilename[it.filename] }
 
     val neverPlayed = songs.filter { it.filename !in historyStats.keys && it.filePath != null }
-    val lastAddedAll = songs.filter { it.filePath != null }
-        .sortedByDescending { it.id }
+    val lastAddedAll = lastAddedSongs(songs)
     val favSongs = songs.filter { it.filename in favorites }
     val disSongs = songs.filter { it.filename in disliked }
 
@@ -388,7 +392,7 @@ fun browseCategorySongs(
             .distinctBy { it.filename }
             .mapNotNull { byFilename[it.filename] }
         BrowseCategory.NeverPlayed -> songs.filter { it.filename !in historyStats.keys && it.filePath != null }
-        BrowseCategory.LastAdded -> songs.filter { it.filePath != null }.sortedByDescending { it.id }
+        BrowseCategory.LastAdded -> lastAddedSongs(songs)
         BrowseCategory.Favorites -> songs.filter { it.filename in favorites }
         BrowseCategory.Disliked -> songs.filter { it.filename in disliked }
     }

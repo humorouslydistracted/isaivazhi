@@ -346,41 +346,33 @@ final class EmbeddingDb {
 
     java.util.List<AudioDupGroup> getAudioDuplicateGroups() {
         SQLiteDatabase db = getReadableDatabase();
-        java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>> byHash =
-                new java.util.LinkedHashMap<>();
+        java.util.LinkedHashMap<String, AudioDupGroup> byHash = new java.util.LinkedHashMap<>();
         Cursor c = db.rawQuery(
-                "SELECT content_hash, filepath FROM (" +
-                        "  SELECT content_hash, filepath FROM " + T_PATH +
-                        "  WHERE filepath != '' AND content_hash != ''" +
-                        "  UNION" +
-                        "  SELECT content_hash, filepath FROM " + T_EMB +
-                        "  WHERE filepath != '' AND content_hash != ''" +
-                        ") ORDER BY content_hash ASC, filepath ASC",
+                "SELECT content_hash, filepath FROM " + T_PATH +
+                        " WHERE content_hash IN (" +
+                        "  SELECT content_hash FROM " + T_PATH +
+                        "  WHERE filepath != ''" +
+                        "  GROUP BY content_hash HAVING COUNT(*) > 1)" +
+                        " ORDER BY content_hash ASC, filepath ASC",
                 null);
         try {
             while (c.moveToNext()) {
                 String hash = c.getString(0);
                 String fp = c.getString(1);
                 if (hash == null || hash.isEmpty() || fp == null || fp.isEmpty()) continue;
-                java.util.LinkedHashSet<String> paths = byHash.get(hash);
-                if (paths == null) {
-                    paths = new java.util.LinkedHashSet<>();
-                    byHash.put(hash, paths);
+                AudioDupGroup g = byHash.get(hash);
+                if (g == null) {
+                    g = new AudioDupGroup();
+                    g.contentHash = hash;
+                    g.filepaths = new java.util.ArrayList<>();
+                    byHash.put(hash, g);
                 }
-                paths.add(fp);
+                g.filepaths.add(fp);
             }
         } finally {
             c.close();
         }
-        java.util.List<AudioDupGroup> out = new java.util.ArrayList<>();
-        for (java.util.Map.Entry<String, java.util.LinkedHashSet<String>> e : byHash.entrySet()) {
-            if (e.getValue().size() < 2) continue;
-            AudioDupGroup g = new AudioDupGroup();
-            g.contentHash = e.getKey();
-            g.filepaths = new java.util.ArrayList<>(e.getValue());
-            out.add(g);
-        }
-        return out;
+        return new java.util.ArrayList<>(byHash.values());
     }
 
     /**
