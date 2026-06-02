@@ -1,3 +1,0 @@
-C:/Users/myuva/Documents/music_app_development/native/app/.cxx/Debug/2e3s5l23/arm64-v8a/CMakeFiles/isaivazhi_native.dir
-C:/Users/myuva/Documents/music_app_development/native/app/.cxx/Debug/2e3s5l23/arm64-v8a/CMakeFiles/edit_cache.dir
-C:/Users/myuva/Documents/music_app_development/native/app/.cxx/Debug/2e3s5l23/arm64-v8a/CMakeFiles/rebuild_cache.dir
