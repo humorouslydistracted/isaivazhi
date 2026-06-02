@@ -14,3 +14,14 @@ PAT
 # On-device CLAP ONNX (large) — fetch from GitHub Release onnx-model-v1; see app/src/main/assets/README.md
 app/src/main/assets/clap_audio_encoder.onnx
 app/src/main/assets/clap_audio_encoder.onnx.data
+
+# Native build artifacts
+app/.cxx/
+**/.cxx/
+
+# Local embedding outputs at repo root
+isaivazhi_embeddings.bin
+local_embeddings.json
+
+# Local archives
+*.zip

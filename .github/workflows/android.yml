@@ -25,11 +25,10 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Configure local.properties
-        run: echo "sdk.dir=$ANDROID_HOME" > native/local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: Make Gradle executable
-        run: chmod +x native/gradlew
+        run: chmod +x gradlew
 
       - name: Build
-        working-directory: native
         run: ./gradlew :app:assembleDebug
