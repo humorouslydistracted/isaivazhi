@@ -433,12 +433,13 @@ class PlaybackEngine(
             } else {
                 prevState.playNextFilenames
             }
+            val newQueueIndex = ctrl?.currentMediaItemIndex ?: prevState.queueIndex
             _state.value = prevState.copy(
                 currentMediaId = newMediaId,
                 title = md?.title?.toString() ?: "",
                 artist = md?.artist?.toString() ?: "",
                 album = md?.albumTitle?.toString() ?: "",
-                queueIndex = ctrl?.currentMediaItemIndex ?: prevState.queueIndex,
+                queueIndex = newQueueIndex,
                 playNextFilenames = updatedPlayNext,
             )
             // Reset live position/duration for the new track. duration may be
@@ -480,6 +481,9 @@ class PlaybackEngine(
         }
 
         override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+            // Kotlin-side shuffle keeps native shuffle OFF; don't mirror
+            // `false` back into UI state when we explicitly disable native mode.
+            if (!shuffleModeEnabled) return
             _state.value = _state.value.copy(shuffleEnabled = shuffleModeEnabled)
         }
 
@@ -996,8 +1000,9 @@ class PlaybackEngine(
      * never reorders. Tap Next → Media3 picks a random next; UI shows a
      * different "next" → user perceives this as "random song bug".
      *
-     * Fix: shuffle the queue list ITSELF in Kotlin AND mirror to Media3
-     * via `controller.moveMediaItem`. Keep `Media3.shuffleModeEnabled = false`.
+     * Fix: shuffle the upcoming tail via `replaceUpcoming` so the service
+     * queue, ExoPlayer playlist, and Kotlin `queueFilenames` all share the
+     * same order. Keep `Media3.shuffleModeEnabled = false`.
      * After toggling on, the visible Up Next IS the playback order. Tap
      * Next → Media3 advances linearly → plays whatever is shown as next.
      *
@@ -1017,47 +1022,49 @@ class PlaybackEngine(
             // Ensure Media3 native shuffle is OFF — we manage shuffle ourselves
             // so the visible Up Next list IS the playback order.
             ctrl.shuffleModeEnabled = false
+            val curState = _state.value
             val curIdx = ctrl.currentMediaItemIndex
             val total = ctrl.mediaItemCount
+            val curListBefore = curState.queueFilenames
             // Tail = positions [curIdx+1 .. total-1]. Need ≥ 2 to shuffle.
             if (curIdx < 0 || total - (curIdx + 1) < 2) return@launch
             val tailStart = curIdx + 1
-            val tailSize = total - tailStart
-            // Generate a random permutation by Fisher-Yates over the tail
-            // indices, then apply each swap via Media3's moveMediaItem.
-            // moveMediaItem doesn't re-create MediaItems — it just
-            // reorders the existing list, which is exactly what we want.
-            val perm = (0 until tailSize).toMutableList().also { it.shuffle() }
-            // Translate the permutation into a series of swap operations.
-            // Naive but correct: track current positions in a working
-            // array and apply moves until the array matches `perm`.
-            val cur = IntArray(tailSize) { it }
-            val pos = IntArray(tailSize) { it }   // pos[origIdx] = currentSlot
-            for (slot in 0 until tailSize) {
-                val targetOrig = perm[slot]
-                val curSlot = pos[targetOrig]
-                if (curSlot == slot) continue
-                val from = tailStart + curSlot
-                val to = tailStart + slot
-                ctrl.moveMediaItem(from, to)
-                // Update bookkeeping
-                val displaced = cur[slot]
-                cur[slot] = targetOrig
-                cur[curSlot] = displaced
-                pos[targetOrig] = slot
-                pos[displaced] = curSlot
+            val tailFilenames = when {
+                curListBefore.size == total -> curListBefore.subList(tailStart, total)
+                else -> readControllerFilenames(ctrl).drop(tailStart)
             }
-            // Mirror the new order into Kotlin queueFilenames.
-            val curList = _state.value.queueFilenames
-            if (curList.size == total) {
-                val head = curList.subList(0, tailStart)
-                val oldTail = curList.subList(tailStart, total)
-                val newTail = perm.map { oldTail[it] }
-                val nextFilenames = head + newTail
-                _state.value = _state.value.copy(queueFilenames = nextFilenames, queueIndex = curIdx)
-                persistQueue(nextFilenames, curIdx)
+            if (tailFilenames.size < 2) return@launch
+            val shuffledSongs = tailFilenames.shuffled().mapNotNull { fn ->
+                resolveSongByFilename?.invoke(fn)
+            }.filter { !it.filePath.isNullOrEmpty() }
+            if (shuffledSongs.size < 2) return@launch
+            // Rebuild via replaceUpcoming so the service queue, ExoPlayer, and
+            // Kotlin queueFilenames all share the same shuffled tail order.
+            // The old moveMediaItem+perm path desynced the UI from playback.
+            val curFilename = curState.currentMediaId
+            val seen = HashSet<String>()
+            curFilename?.let { seen += it }
+            val nextSongs = shuffledSongs.filter { seen.add(it.filename) }
+            sendPlaybackCommand(ctrl, CMD_REPLACE_UPCOMING, queueCommandArgs(nextSongs))
+            val nextFilenames = buildList {
+                if (curFilename != null) add(curFilename)
+                addAll(nextSongs.map { it.filename })
             }
-            android.util.Log.i("PlaybackEngine", "shuffle: tail randomized ($tailSize songs)")
+            syncQueueStateAfterReplace(
+                ctrl, curState, nextFilenames, curFilename, curState.queueContext,
+            )
+            android.util.Log.i(
+                "PlaybackEngine",
+                "shuffle: tail randomized via replaceUpcoming (${tailFilenames.size} songs)",
+            )
+        }
+    }
+
+    private fun readControllerFilenames(ctrl: MediaController): List<String> {
+        val total = ctrl.mediaItemCount
+        if (total <= 0) return emptyList()
+        return (0 until total).mapNotNull { i ->
+            runCatching { mediaIdToFilename(ctrl.getMediaItemAt(i).mediaId) }.getOrNull()
         }
     }
 
