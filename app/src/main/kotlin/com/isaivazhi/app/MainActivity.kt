@@ -1225,11 +1225,12 @@ private fun AppRoot(container: AppContainer) {
         }
     }
     // Recompute profileVec when historyStats changes substantially.
-    // Fingerprint = sorted top-30 filenames joined; if it changes,
-    // recompute via forYouByProfileVector helper (which already builds
-    // the centroid internally) — but we need the raw vec, so use a
-    // dedicated helper. For now we compute inline.
-    LaunchedEffect(historyStats.size, embeddingsRowCount) {
+    // Key on total plays (not just size) so the centroid updates as
+    // existing songs accumulate more listens, not only when new songs
+    // appear for the first time. The 300ms debounce + fingerprint guard
+    // below prevent unnecessary DB work on every single play event.
+    val profileVecTotalPlays = remember(historyStats) { historyStats.values.sumOf { it.plays } }
+    LaunchedEffect(profileVecTotalPlays, embeddingsRowCount) {
         if (songs.isEmpty()) return@LaunchedEffect
         if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(300)
@@ -1246,7 +1247,12 @@ private fun AppRoot(container: AppContainer) {
         val anchorSongs = topPlays.mapNotNull { byFilename[it.key] }
             .filter { !it.contentHash.isNullOrBlank() && it.filePath in embeddedFilepaths }
         if (anchorSongs.isEmpty()) return@LaunchedEffect
-        val fingerprint = anchorSongs.map { it.filename }.sorted().joinToString("|").hashCode().toString()
+        // Include rounded play/fraction weights so the centroid rebuilds
+        // when existing top-30 songs accumulate significantly more listens,
+        // not only when the set of top-30 filenames itself changes.
+        val fingerprint = topPlays.take(30)
+            .joinToString("|") { (fn, st) -> "$fn:${st.plays}:${"%.1f".format(st.avgFraction)}" }
+            .hashCode().toString()
         val current = runCatching { container.preferences.loadProfileVec() }.getOrNull()
         if (current?.fingerprint == fingerprint && cachedProfileVec != null) return@LaunchedEffect
         // Build centroid.
@@ -1833,6 +1839,15 @@ private fun AppRoot(container: AppContainer) {
         val mediaId = playbackState.currentMediaId ?: return@LaunchedEffect
         val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
         if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
+        // Never soft-refresh finite sections (album / browse). The queue-
+        // exhaust LE already guards these; the soft-refresh must mirror that
+        // rule or it will silently re-sort and replace album tracks.
+        val ctx = playbackState.queueContext
+        if (ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM ||
+            ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION
+        ) return@LaunchedEffect
+        // Respect the AI / Shuffle toggle — soft-refresh is AI-only.
+        if (!recMode) return@LaunchedEffect
         // Debounce so rapid-fire transitions don't thrash the recommender.
         kotlinx.coroutines.delay(750)
         // Verify state didn't change during the debounce.

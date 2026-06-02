@@ -990,26 +990,29 @@ fun computeDirectScore(
 
     // Legacy data may have xScoreUpdatedAt == 0; fall back to
     // lastUpdatedAt so old persisted skips fade reasonably instead of
-    // being treated as "today."
+    // being treated as "today." When both are zero (Capacitor-migrated
+    // signals with no timestamps at all), treat the xScore as 90 days
+    // old so ancient skips decay heavily (xRecencyMult ≈ 0.125) rather
+    // than carrying full weight indefinitely.
     val xRefTs = when {
         xScoreUpdatedAt > 0L -> xScoreUpdatedAt
         lastUpdatedAt > 0L -> lastUpdatedAt
-        else -> 0L
+        else -> now - (90L * TasteEngine.PROFILE_DAY_MS)
     }
-    val xRecencyMult = if (xRefTs > 0L) {
+    val xRecencyMult = run {
         val days = (now - xRefTs).toFloat() / TasteEngine.PROFILE_DAY_MS
         0.5f.pow(days / TasteEngine.PROFILE_HALF_LIFE_DAYS).coerceIn(0f, 1f)
-    } else 1f
+    }
 
     val simRefTs = when {
         similarityBoostUpdatedAt > 0L -> similarityBoostUpdatedAt
         lastUpdatedAt > 0L -> lastUpdatedAt
-        else -> 0L
+        else -> now - (90L * TasteEngine.PROFILE_DAY_MS)
     }
-    val simRecencyMult = if (simRefTs > 0L) {
+    val simRecencyMult = run {
         val days = (now - simRefTs).toFloat() / TasteEngine.PROFILE_DAY_MS
         0.5f.pow(days / TasteEngine.PROFILE_HALF_LIFE_DAYS).coerceIn(0f, 1f)
-    } else 1f
+    }
 
     val effectiveX = xScore * xRecencyMult
     val effectiveBoost = similarityBoost * simRecencyMult

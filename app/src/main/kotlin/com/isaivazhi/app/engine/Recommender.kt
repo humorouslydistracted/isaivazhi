@@ -66,18 +66,25 @@ class Recommender(
         sessionBias: Float = 0.5f,
     ): Triple<FloatArray?, BlendWeights, String> {
         val byFilename = library.associateBy { it.filename }
-        // Build session vec from non-skip listened entries with frac >= 0.3.
-        val sessionHashes = sessionListened
-            .filter { it.fraction >= 0.30f }
-            .mapNotNull { byFilename[it.filename]?.contentHash }
-            .distinct()
+        // Build session vec weighted by listen depth (fraction). Songs heard
+        // more completely pull the session centroid harder than songs barely
+        // past the 0.30 gate. If the same song was heard multiple times this
+        // session, its fractions are summed as its total weight.
+        val sessionWeightsByHash = LinkedHashMap<String, Float>()
+        for (entry in sessionListened) {
+            if (entry.fraction < 0.30f) continue
+            val hash = byFilename[entry.filename]?.contentHash ?: continue
+            sessionWeightsByHash[hash] = (sessionWeightsByHash[hash] ?: 0f) + entry.fraction
+        }
         val currentVec = if (!currentSongHash.isNullOrBlank()) {
             embeddingDb.getVecsByHashes(listOf(currentSongHash))[currentSongHash]
         } else null
-        val sessionVecs = if (sessionHashes.isNotEmpty()) {
-            embeddingDb.getVecsByHashes(sessionHashes)
+        val sessionVecs = if (sessionWeightsByHash.isNotEmpty()) {
+            embeddingDb.getVecsByHashes(sessionWeightsByHash.keys.toList())
         } else emptyMap()
-        val sessionVec = if (sessionVecs.isNotEmpty()) avgVec(sessionVecs.values.toList()) else null
+        val sessionVec = if (sessionVecs.isNotEmpty())
+            weightedAvgVec(sessionVecs, sessionWeightsByHash)
+        else null
         val hasCurrent = currentVec != null
         val hasSession = sessionVec != null
         val hasProfile = profileVec != null && profileVec.isNotEmpty()
@@ -129,6 +136,35 @@ class Recommender(
         if (count == 0) return null
         for (i in 0 until dim) out[i] /= count
         // Normalize.
+        var n2 = 0f
+        for (i in 0 until dim) n2 += out[i] * out[i]
+        val inv = if (n2 > 0f) 1f / sqrt(n2) else 0f
+        for (i in 0 until dim) out[i] *= inv
+        return out
+    }
+
+    /**
+     * Weighted average of embedding vectors keyed by content hash.
+     * [weights] maps contentHash → scalar weight (e.g. cumulative fraction).
+     * Hashes missing from [vecs] are skipped. Result is L2-normalised.
+     */
+    private fun weightedAvgVec(
+        vecs: Map<String, FloatArray>,
+        weights: Map<String, Float>,
+    ): FloatArray? {
+        val dim = vecs.values.firstOrNull()?.size ?: return null
+        if (dim == 0) return null
+        val out = FloatArray(dim)
+        var totalWeight = 0f
+        for ((hash, w) in weights) {
+            if (w <= 0f) continue
+            val v = vecs[hash] ?: continue
+            if (v.size != dim) continue
+            for (i in 0 until dim) out[i] += v[i] * w
+            totalWeight += w
+        }
+        if (totalWeight <= 0f) return null
+        for (i in 0 until dim) out[i] /= totalWeight
         var n2 = 0f
         for (i in 0 until dim) n2 += out[i] * out[i]
         val inv = if (n2 > 0f) 1f / sqrt(n2) else 0f

@@ -101,7 +101,10 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
         val isSkip = frac < TasteEngine.SKIP_THRESHOLD
         val cls = if (isSkip) SignalTimelineEngine.Classification.SKIP
             else SignalTimelineEngine.Classification.LISTEN
-        val isManual = source == "next_button" || source == "prev_button" ||
+        // Mirror PlaybackEngine's definition exactly: next/prev are
+        // intentional skip gestures (isManual=false so session.skips
+        // increments); tap-to-jump sources are manual (no skip penalty).
+        val isManual = source.startsWith("manual_") || source == "song_tap" ||
             source == "queue_tap" || source == "neutral_skip"
         val sessionPair = container.session.recordEvent(
             fraction = frac,
@@ -188,9 +191,22 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
         return when (action.lowercase()) {
             "next_button", "user_next", "native_user_next" -> "next_button"
             "prev_button", "user_prev" -> "prev_button"
+            // history_prev is emitted by insertBeforeCurrentAndPlay (Prev at queue
+            // head pulls a song from history). In the live path pendingTransitionSource
+            // is "prev_button", so ledger replay must match.
+            "history_prev" -> "prev_button"
             "neutral_skip" -> "neutral_skip"
             "queue_tap", "user_jump" -> "queue_tap"
+            // User tapped a song directly (Songs list, album, etc.).
+            // Must map explicitly so ledger-replayed song-tap events
+            // are classified as manual (no xScore skip penalty) rather
+            // than falling through to "background_recovery".
+            "song_tap", "manual_tap", "manual_x" -> "song_tap"
             "auto_advance" -> "auto_advance"
+            // queue_update fires on MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED
+            // (queue rebuilt while a song was playing). Not a user skip — treat as
+            // an automatic advance so no xScore penalty accumulates.
+            "queue_update" -> "auto_advance"
             "queue_end" -> "queue_end"
             "user_dismiss" -> "user_dismiss"
             else -> "background_recovery"
