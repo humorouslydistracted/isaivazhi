@@ -1294,6 +1294,15 @@ private fun AppRoot(container: AppContainer) {
     val fullQueueSongs: List<Song> = remember(byFilenameLookup, playbackState.queueFilenames) {
         playbackState.queueFilenames.mapNotNull { byFilenameLookup[it] }
     }
+    val recentHistorySongs: List<Song> = remember(historyEvents, byFilenameLookup, playbackState.currentMediaId) {
+        val cur = playbackState.currentMediaId
+        historyEvents.asSequence()
+            .mapNotNull { byFilenameLookup[it.filename] }
+            .filter { it.filename != cur }
+            .distinctBy { it.filename }
+            .take(10)
+            .toList()
+    }
 
     val isCurrentFavorite = playbackState.currentMediaId?.let { it in favoritesSet } ?: false
     val isCurrentDisliked = playbackState.currentMediaId?.let { it in dislikedSet } ?: false
@@ -2154,6 +2163,7 @@ private fun AppRoot(container: AppContainer) {
                         )
                         Tab.UpNext -> UpNextScreen(
                             queue = fullQueueSongs,
+                            recentHistory = recentHistorySongs,
                             currentMediaId = playbackState.currentMediaId,
                             currentIndex = playbackState.queueIndex,
                             aiMode = effectiveRecMode,

@@ -58,6 +58,7 @@ import sh.calvin.reorderable.rememberReorderableLazyListState
 @Composable
 fun UpNextScreen(
     queue: List<Song>,
+    recentHistory: List<Song> = emptyList(),
     currentMediaId: String?,
     currentIndex: Int,
     aiMode: Boolean,
@@ -72,7 +73,15 @@ fun UpNextScreen(
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     val safeIndex = currentIndex.coerceAtLeast(0)
-    val previously = if (safeIndex > 0) queue.subList(0, safeIndex.coerceAtMost(queue.size)) else emptyList()
+    // Show true recently played history when available (HistoryEngine-backed),
+    // otherwise fall back to queue-prefix behavior.
+    val previously = if (recentHistory.isNotEmpty()) {
+        recentHistory
+    } else if (safeIndex > 0) {
+        queue.subList(0, safeIndex.coerceAtMost(queue.size))
+    } else {
+        emptyList()
+    }
     val current = queue.getOrNull(safeIndex)
     val upcoming = if (safeIndex + 1 < queue.size) queue.subList(safeIndex + 1, queue.size) else emptyList()
     val visiblePrev = previously.takeLast(10)

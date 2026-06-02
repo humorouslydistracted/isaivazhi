@@ -1360,25 +1360,26 @@ class PlaybackEngine(
             if (curIdx < 0 || totalBefore == 0) return@launch
             val curState = _state.value
             val curFilename = curState.currentMediaId
-            val safeQueueIndex = if (curState.queueFilenames.isEmpty()) 0
-            else curState.queueIndex.coerceIn(0, curState.queueFilenames.lastIndex)
-            val prefix = if (curState.queueFilenames.isNotEmpty()) {
-                curState.queueFilenames.take(safeQueueIndex + 1)
-            } else {
-                listOfNotNull(curFilename)
-            }
-            // De-dupe newUpcoming against existing prefix and itself.
-            val seen = prefix.toHashSet()
+            // IMPORTANT: Keep Kotlin queue shape aligned with the service's
+            // CMD_REPLACE_UPCOMING behavior. Service normalizes queue to
+            // [current] + incoming upcoming and sets currentIndex=0.
+            // If Kotlin keeps older prefix items, UI indices diverge from
+            // Media3 indices and taps can play the wrong song.
+            val seen = HashSet<String>()
+            curFilename?.let { seen += it }
             val nextSongs = newUpcoming.filter {
                 !it.filePath.isNullOrEmpty() && seen.add(it.filename)
             }
             sendPlaybackCommand(ctrl, CMD_REPLACE_UPCOMING, queueCommandArgs(nextSongs))
-            val nextFilenames = prefix + nextSongs.map { it.filename }
-            val nextIdx = (prefix.size - 1).coerceAtLeast(0)
+            val nextFilenames = buildList {
+                if (curFilename != null) add(curFilename)
+                addAll(nextSongs.map { it.filename })
+            }
+            val nextIdx = 0
             val resolvedContext = newContext ?: curState.queueContext
             android.util.Log.i(
                 "QueueOp",
-                "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} prefix=${prefix.size} " +
+                "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +
                     "ctx=${curState.queueContext}→$resolvedContext playNextSet=${curState.playNextFilenames.size}"
             )
             _state.value = curState.copy(
