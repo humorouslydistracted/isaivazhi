@@ -1360,29 +1360,33 @@ class PlaybackEngine(
             if (curIdx < 0 || totalBefore == 0) return@launch
             val curState = _state.value
             val curFilename = curState.currentMediaId
-            // De-dupe newUpcoming against current and itself.
-            val seen = HashSet<String>()
-            curFilename?.let { seen += it }
+            val safeQueueIndex = if (curState.queueFilenames.isEmpty()) 0
+            else curState.queueIndex.coerceIn(0, curState.queueFilenames.lastIndex)
+            val prefix = if (curState.queueFilenames.isNotEmpty()) {
+                curState.queueFilenames.take(safeQueueIndex + 1)
+            } else {
+                listOfNotNull(curFilename)
+            }
+            // De-dupe newUpcoming against existing prefix and itself.
+            val seen = prefix.toHashSet()
             val nextSongs = newUpcoming.filter {
                 !it.filePath.isNullOrEmpty() && seen.add(it.filename)
             }
             sendPlaybackCommand(ctrl, CMD_REPLACE_UPCOMING, queueCommandArgs(nextSongs))
-            val nextFilenames = buildList {
-                if (curFilename != null) add(curFilename)
-                addAll(nextSongs.map { it.filename })
-            }
+            val nextFilenames = prefix + nextSongs.map { it.filename }
+            val nextIdx = (prefix.size - 1).coerceAtLeast(0)
             val resolvedContext = newContext ?: curState.queueContext
             android.util.Log.i(
                 "QueueOp",
-                "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +
+                "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} prefix=${prefix.size} " +
                     "ctx=${curState.queueContext}→$resolvedContext playNextSet=${curState.playNextFilenames.size}"
             )
             _state.value = curState.copy(
                 queueFilenames = nextFilenames,
-                queueIndex = 0,
+                queueIndex = nextIdx,
                 queueContext = resolvedContext,
             )
-            persistQueue(nextFilenames, 0)
+            persistQueue(nextFilenames, nextIdx)
         }
     }
 

@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PlaylistPlay
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -30,6 +31,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -50,10 +52,18 @@ fun PlaylistsScreen(
     songs: List<Song>,
     onBack: () -> Unit,
     onCreate: (name: String) -> Unit,
+    onRename: (id: String, name: String) -> Unit,
     onDelete: (id: String) -> Unit,
     onOpenPlaylist: (id: String) -> Unit,
 ) {
     var showCreateDialog by remember { mutableStateOf(false) }
+    var renamePlaylistId by remember { mutableStateOf<String?>(null) }
+    var renameDraft by remember { mutableStateOf("") }
+    var pendingDeletePlaylistId by remember { mutableStateOf<String?>(null) }
+    val inputColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = MaterialTheme.colorScheme.error,
+        unfocusedBorderColor = MaterialTheme.colorScheme.primary,
+    )
 
     Box(
         modifier = Modifier
@@ -139,7 +149,17 @@ fun PlaylistsScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                            IconButton(onClick = { onDelete(pl.id) }) {
+                            IconButton(onClick = {
+                                renamePlaylistId = pl.id
+                                renameDraft = pl.name
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Filled.Edit,
+                                    contentDescription = "Rename",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(onClick = { pendingDeletePlaylistId = pl.id }) {
                                 Icon(
                                     imageVector = Icons.Filled.DeleteOutline,
                                     contentDescription = "Delete",
@@ -164,6 +184,7 @@ fun PlaylistsScreen(
                     onValueChange = { name = it },
                     placeholder = { Text("Playlist name") },
                     singleLine = true,
+                    colors = inputColors,
                 )
             },
             confirmButton = {
@@ -174,6 +195,51 @@ fun PlaylistsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showCreateDialog = false }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (renamePlaylistId != null) {
+        AlertDialog(
+            onDismissRequest = { renamePlaylistId = null },
+            title = { Text("Rename playlist") },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it },
+                    placeholder = { Text("Playlist name") },
+                    singleLine = true,
+                    colors = inputColors,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val id = renamePlaylistId ?: return@TextButton
+                    val name = renameDraft.trim().ifBlank { "New playlist" }
+                    onRename(id, name)
+                    renamePlaylistId = null
+                }) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renamePlaylistId = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (pendingDeletePlaylistId != null) {
+        val playlistName = playlists.firstOrNull { it.id == pendingDeletePlaylistId }?.name ?: "this playlist"
+        AlertDialog(
+            onDismissRequest = { pendingDeletePlaylistId = null },
+            title = { Text("Delete playlist?") },
+            text = { Text("Delete \"$playlistName\"? This removes the playlist entry but does not delete song files.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDeletePlaylistId?.let { onDelete(it) }
+                    pendingDeletePlaylistId = null
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeletePlaylistId = null }) { Text("Cancel") }
             },
         )
     }

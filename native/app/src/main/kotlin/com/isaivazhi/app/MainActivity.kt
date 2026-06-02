@@ -407,11 +407,24 @@ private fun AppRoot(container: AppContainer) {
     // every change so the app re-opens where they left off.
     val pagerState = rememberPagerState(pageCount = { Tab.entries.size })
     LaunchedEffect(Unit) {
-        val saved = runCatching { container.preferences.loadLastTab() }.getOrNull()
-        if (saved.isNullOrBlank()) return@LaunchedEffect
-        val target = Tab.entries.indexOfFirst { it.name == saved }
-        if (target >= 0 && target != pagerState.currentPage) {
-            runCatching { pagerState.scrollToPage(target) }
+        try {
+            val saved = runCatching { container.preferences.loadLastTab() }.getOrNull()
+            if (saved.isNullOrBlank()) return@LaunchedEffect
+            val target = Tab.entries.indexOfFirst { it.name == saved }
+            if (target >= 0 && target < Tab.entries.size && target != pagerState.currentPage) {
+                runCatching { pagerState.scrollToPage(target) }
+            } else {
+                // Saved tab is no longer valid (e.g. enum changed) — fall back
+                // to Songs so a bad value cannot cause a startup crash loop.
+                runCatching {
+                    pagerState.scrollToPage(0)
+                    container.preferences.saveLastTab(Tab.Songs.name)
+                }
+            }
+        } catch (t: Throwable) {
+            // Any unexpected failure during restore should not crash startup.
+            // Log via Android's default logger; DebugLogCapture will persist it.
+            android.util.Log.w("MainActivity", "last-tab restore failed: ${t.message}")
         }
     }
     LaunchedEffect(pagerState) {
@@ -450,6 +463,7 @@ private fun AppRoot(container: AppContainer) {
     // (where tap already plays a section), the entry is hidden.
     var menuSongsTabIndex by remember { mutableStateOf<Int?>(null) }
     var albumToExpand by remember { mutableStateOf<String?>(null) }
+    var albumRevealRequestId by remember { mutableStateOf(0) }
     // Push #62: album-level long-press menu state. When non-null, the
     // AlbumMenuSheet renders with Play / Shuffle / Delete actions.
     var albumMenuTracks by remember { mutableStateOf<List<Song>?>(null) }
@@ -1868,6 +1882,7 @@ private fun AppRoot(container: AppContainer) {
         embeddedFilepaths = embeddedFilepaths,
     )
     val menuSongStats = menuSong?.filename?.let { historyStats[it] }
+    val menuSongTasteSignal = menuSong?.filename?.let { tasteSignals[it] }
 
     BackHandler(enabled = overlay !is Overlay.None) {
         overlay = when (overlay) {
@@ -1992,8 +2007,7 @@ private fun AppRoot(container: AppContainer) {
                         onToggleShuffle = { container.playback.toggleShuffle() },
                         onSeek = { container.playback.seekTo(it) },
                         onRefresh = refreshUpcomingWithAI,
-                        refreshEnabled = playbackState.currentMediaId != null &&
-                            effectiveRecMode,
+                        refreshEnabled = playbackState.currentMediaId != null,
                         refreshInProgress = refreshInProgress,
                     )
                     NavigationBar {
@@ -2116,7 +2130,8 @@ private fun AppRoot(container: AppContainer) {
                             currentMediaId = playbackState.currentMediaId,
                             embeddedFilepaths = embeddedFilepaths,
                             embeddingsRowCount = embeddingsRowCount,
-                            initialExpandedAlbum = albumToExpand.also { albumToExpand = null },
+                            initialExpandedAlbum = albumToExpand,
+                            revealRequestId = albumRevealRequestId,
                             // Push #42 Tier 2F: Album tap = SECTION tap. Queue
                             // becomes [tappedTrack..lastTrack] of the album (or
                             // all tracks shuffled if shuffle is on). Recommender
@@ -2223,6 +2238,10 @@ private fun AppRoot(container: AppContainer) {
                                 playlists = playlistsList,
                                 onOpenCategory = { cat -> overlay = Overlay.ViewAll(cat) },
                                 onCreatePlaylist = { name -> container.playlists.create(name) },
+                                onRenamePlaylist = { id, name ->
+                                    container.playlists.rename(id, name)
+                                    container.toaster.show("Playlist renamed")
+                                },
                                 onOpenPlaylist = { id -> overlay = Overlay.PlaylistDetail(id) },
                                 onDeletePlaylist = { id -> container.playlists.delete(id) },
                                 contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
@@ -2377,6 +2396,10 @@ private fun AppRoot(container: AppContainer) {
             songs = songs,
             onBack = { overlay = Overlay.None },
             onCreate = { container.playlists.create(it) },
+            onRename = { id, name ->
+                container.playlists.rename(id, name)
+                container.toaster.show("Playlist renamed")
+            },
             onDelete = { container.playlists.delete(it) },
             onOpenPlaylist = { overlay = Overlay.PlaylistDetail(it) },
         )
@@ -2848,6 +2871,12 @@ private fun AppRoot(container: AppContainer) {
                     )
                 },
                 onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
+                subtitleForSong = if (viewAllCat == BrowseCategory.MostPlayed) {
+                    { song ->
+                        val plays = historyStats[song.filename]?.plays ?: 0
+                        "Played $plays ${if (plays == 1) "time" else "times"}"
+                    }
+                } else null,
             )
         }
     }
@@ -2867,11 +2896,12 @@ private fun AppRoot(container: AppContainer) {
             isFavorite = isMenuSongFavorite,
             isDisliked = isMenuSongDisliked,
             hasEmbedding = isMenuSongEmbedded,
+            currentSplitCount = embeddingSplitCount,
             currentPlaylistName = playlistCtxName,
             songStats = menuSongStats,
+            tasteSignal = menuSongTasteSignal,
             playlists = playlistsList,
             onDismiss = { menuSong = null; menuPlaylistContext = null },
-            onPlayOnly = { container.playback.playOnly(sheetSong) },
             onPlayNext = {
                 container.playback.playNext(sheetSong)
                 container.toaster.show("Added to play next")
@@ -2908,8 +2938,8 @@ private fun AppRoot(container: AppContainer) {
                 val plName = playlistsList.firstOrNull { it.id == plId }?.name ?: "playlist"
                 container.toaster.show("Added to \"$plName\"")
             },
-            onCreatePlaylistAndAdd = {
-                val pl = container.playlists.create("New playlist")
+            onCreatePlaylistAndAdd = { name ->
+                val pl = container.playlists.create(name)
                 container.playlists.addSong(pl.id, sheetSong.filename)
                 container.toaster.show("Created playlist \"${pl.name}\" and added song")
             },
@@ -2924,17 +2954,12 @@ private fun AppRoot(container: AppContainer) {
             onViewDetails = { /* dialog shown inside SongMenuSheet */ },
             onViewAlbum = {
                 albumToExpand = sheetSong.album.ifBlank { "Unknown album" }
+                albumRevealRequestId += 1
                 coroutineScope.launch { pagerState.animateScrollToPage(Tab.Albums.ordinal) }
             },
-            onToggleEmbedding = {
-                // No engine-level "remove embedding" yet — best-effort: kick off
-                // an embed for the song to ensure it lands in the DB. Removal
-                // requires an EmbeddingDb.deleteByFilename method that doesn't
-                // exist yet; toast-only for now.
-                // Push #59: filepath-based embedded check (was filename).
-                if (sheetSong.filePath != null && sheetSong.filePath !in embeddedFilepaths) {
-                    container.embedding.embedSongs(listOf(sheetSong))
-                }
+            onResetTasteSignal = {
+                container.taste.resetSignalForSong(sheetSong.filename)
+                container.toaster.show("Taste signal reset")
             },
             // Push #40 Tier 1C: explicit "Embed this song" entry. Always
             // fires an embed for the song regardless of current state.

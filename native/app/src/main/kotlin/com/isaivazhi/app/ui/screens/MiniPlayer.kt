@@ -220,8 +220,8 @@ fun MiniPlayer(
                     modifier = Modifier.size(26.dp),
                 )
             }
-            // Refresh Up Next (AI) — only when caller supplied a handler.
-            // Greyed when no current song / no embeddings.
+            // Refresh upcoming queue using current mode:
+            // AI mode -> similarity recommendations, Shuffle mode -> random tail.
             if (onRefresh != null) {
                 IconButton(
                     onClick = onRefresh,
@@ -236,7 +236,7 @@ fun MiniPlayer(
                     } else {
                         Icon(
                             imageVector = Icons.Filled.Refresh,
-                            contentDescription = "Refresh Up Next",
+                            contentDescription = "Refresh upcoming queue",
                             tint = if (refreshEnabled) MaterialTheme.colorScheme.primary
                                    else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(22.dp),

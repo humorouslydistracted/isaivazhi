@@ -33,6 +33,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -49,20 +51,20 @@ import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.HistoryEngine
 import com.isaivazhi.app.engine.PlaylistsEngine
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.engine.TasteEngine
 
 /**
  * Long-press song menu. Full 10-action menu matching the Capacitor build.
  * Actions in order:
- *   1. Play only (keep queue)
- *   2. Play Next
- *   3. Add to playlist…
- *   4. Remove from {currentPlaylist}    — only when invoked from a playlist view
- *   5. Toggle Favorite
- *   6. Toggle Dislike
- *   7. View Details                     — opens metadata + per-song stats modal
- *   8. View Album                       — auto-expand the album in the Albums tab
- *   9. Toggle Embedding (remove/re-add) — flips the song's embedding state
- *  10. Delete from device               — with native confirm dialog
+ *   1. Play Next
+ *   2. Add to playlist…
+ *   3. Remove from {currentPlaylist}    — only when invoked from a playlist view
+ *   4. Toggle Favorite
+ *   5. Toggle Dislike
+ *   6. View Details                     — opens metadata + per-song stats modal
+ *   7. View Album                       — auto-expand the album in the Albums tab
+ *   8. Embed/Re-embed this song
+ *   9. Delete from device               — with native confirm dialog
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -71,20 +73,21 @@ fun SongMenuSheet(
     isFavorite: Boolean,
     isDisliked: Boolean,
     hasEmbedding: Boolean,
+    currentSplitCount: Int,
     currentPlaylistName: String?,
     songStats: HistoryEngine.Stats?,
+    tasteSignal: TasteEngine.TasteSignal?,
     playlists: List<PlaylistsEngine.Playlist>,
     onDismiss: () -> Unit,
-    onPlayOnly: () -> Unit,
     onPlayNext: () -> Unit,
     onToggleFavorite: () -> Unit,
     onToggleDislike: () -> Unit,
     onAddToPlaylist: (playlistId: String) -> Unit,
-    onCreatePlaylistAndAdd: () -> Unit,
+    onCreatePlaylistAndAdd: (playlistName: String) -> Unit,
     onRemoveFromCurrentPlaylist: () -> Unit,
     onViewDetails: () -> Unit,
     onViewAlbum: () -> Unit,
-    onToggleEmbedding: () -> Unit,
+    onResetTasteSignal: () -> Unit,
     onEmbedSong: () -> Unit,
     onDeleteFromDevice: () -> Unit,
     // Push #42 Tier 2I: optional "Play in order" entry — shown when the
@@ -94,8 +97,14 @@ fun SongMenuSheet(
     onPlayInOrder: (() -> Unit)? = null,
 ) {
     var showPlaylistPicker by remember { mutableStateOf(false) }
+    var showCreatePlaylistDialog by remember { mutableStateOf(false) }
+    var showEmbedConfirm by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showDetails by remember { mutableStateOf(false) }
+    val inputColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = MaterialTheme.colorScheme.error,
+        unfocusedBorderColor = MaterialTheme.colorScheme.primary,
+    )
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(
@@ -131,8 +140,6 @@ fun SongMenuSheet(
             }
             Spacer(Modifier.height(8.dp))
 
-            MenuItem(icon = Icons.Filled.PlayArrow, label = "Play only (keep queue)",
-                onClick = { onDismiss(); onPlayOnly() })
             MenuItem(icon = Icons.Filled.SkipNext, label = "Play Next",
                 onClick = { onDismiss(); onPlayNext() })
             // Push #42 Tier 2I: "Play in order" — Songs tab tap defaults to
@@ -174,18 +181,8 @@ fun SongMenuSheet(
             MenuItem(
                 icon = Icons.Filled.AutoAwesome,
                 label = if (hasEmbedding) "Re-embed this song" else "Embed this song",
-                onClick = { onEmbedSong(); onDismiss() },
+                onClick = { showEmbedConfirm = true },
             )
-            // Keeps the previous toggle for users who want to remove an
-            // embedding (no engine-level "remove" yet — toggleEmbedding
-            // currently only embeds when missing).
-            if (hasEmbedding) {
-                MenuItem(
-                    icon = Icons.Filled.AutoAwesome,
-                    label = "Toggle embedding (advanced)",
-                    onClick = { onToggleEmbedding(); onDismiss() },
-                )
-            }
             MenuItem(
                 icon = Icons.Filled.DeleteOutline,
                 label = "Delete from device",
@@ -212,9 +209,8 @@ fun SongMenuSheet(
                     icon = Icons.Filled.Add,
                     label = "New playlist…",
                     onClick = {
-                        onCreatePlaylistAndAdd()
                         showPlaylistPicker = false
-                        onDismiss()
+                        showCreatePlaylistDialog = true
                     },
                 )
                 if (playlists.isEmpty()) {
@@ -244,6 +240,59 @@ fun SongMenuSheet(
         }
     }
 
+    if (showCreatePlaylistDialog) {
+        var playlistName by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showCreatePlaylistDialog = false },
+            title = { Text("New playlist") },
+            text = {
+                OutlinedTextField(
+                    value = playlistName,
+                    onValueChange = { playlistName = it },
+                    label = { Text("Name") },
+                    placeholder = { Text("New playlist") },
+                    singleLine = true,
+                    colors = inputColors,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val name = playlistName.trim().ifBlank { "New playlist" }
+                    onCreatePlaylistAndAdd(name)
+                    showCreatePlaylistDialog = false
+                    onDismiss()
+                }) { Text("Create") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreatePlaylistDialog = false }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (showEmbedConfirm) {
+        val actionLabel = if (hasEmbedding) "Re-embed" else "Embed"
+        AlertDialog(
+            onDismissRequest = { showEmbedConfirm = false },
+            title = { Text("$actionLabel song?") },
+            text = {
+                Text(
+                    "$actionLabel this song using split count $currentSplitCount? " +
+                        "To use a different split count, change it in AI settings first."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showEmbedConfirm = false
+                    onEmbedSong()
+                    onDismiss()
+                }) { Text("Proceed") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEmbedConfirm = false }) { Text("Cancel") }
+            },
+        )
+    }
+
     if (showDeleteConfirm) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirm = false },
@@ -270,6 +319,8 @@ fun SongMenuSheet(
             isDisliked = isDisliked,
             hasEmbedding = hasEmbedding,
             stats = songStats,
+            tasteSignal = tasteSignal,
+            onResetTasteSignal = onResetTasteSignal,
             onClose = { showDetails = false },
         )
     }
@@ -282,6 +333,8 @@ private fun SongDetailsDialog(
     isDisliked: Boolean,
     hasEmbedding: Boolean,
     stats: HistoryEngine.Stats?,
+    tasteSignal: TasteEngine.TasteSignal?,
+    onResetTasteSignal: () -> Unit,
     onClose: () -> Unit,
 ) {
     val avgStr = stats?.let { "${(it.avgFraction * 100).toInt()}%" } ?: "—"
@@ -302,6 +355,7 @@ private fun SongDetailsDialog(
     val mtimeStr = if (fileMeta.exists && fileMeta.lastModified > 0L)
         java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(fileMeta.lastModified))
     else "—"
+    var showResetTasteConfirm by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("Song details") },
@@ -322,10 +376,46 @@ private fun SongDetailsDialog(
                 DetailRow("Last played", lastPlayedStr)
                 DetailRow("Favorite", if (isFavorite) "Yes" else "No")
                 DetailRow("Disliked", if (isDisliked) "Yes" else "No")
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = "Taste signal",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                DetailRow("Plays", (tasteSignal?.plays ?: 0).toString())
+                DetailRow("Skips", (tasteSignal?.skips ?: 0).toString())
+                DetailRow("Avg fraction", tasteSignal?.avgFraction?.let { "%.2f".format(it) } ?: "0.00")
+                DetailRow("X score", tasteSignal?.xScore?.let { "%.2f".format(it) } ?: "0.00")
+                DetailRow("Direct score", tasteSignal?.directScore?.let { "%.2f".format(it) } ?: "0.00")
+                DetailRow("Similarity boost", tasteSignal?.similarityBoost?.let { "%.2f".format(it) } ?: "0.00")
+                DetailRow("Favorite prior", tasteSignal?.favoritePrior?.let { "%.2f".format(it) } ?: "0.00")
+                DetailRow("Dislike prior", tasteSignal?.dislikePrior?.let { "%.2f".format(it) } ?: "0.00")
             }
         },
         confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
+        dismissButton = {
+            TextButton(onClick = { showResetTasteConfirm = true }) {
+                Text("Reset taste signal", color = MaterialTheme.colorScheme.error)
+            }
+        },
     )
+    if (showResetTasteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetTasteConfirm = false },
+            title = { Text("Reset taste signal?") },
+            text = { Text("Reset taste signal for this song? This clears learned taste score history for this track.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showResetTasteConfirm = false
+                    onResetTasteSignal()
+                    onClose()
+                }) { Text("Reset", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetTasteConfirm = false }) { Text("Cancel") }
+            },
+        )
+    }
 }
 
 @Composable

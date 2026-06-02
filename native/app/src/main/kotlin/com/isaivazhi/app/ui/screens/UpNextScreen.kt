@@ -108,7 +108,7 @@ fun UpNextScreen(
             IconButton(onClick = onRefresh) {
                 Icon(
                     imageVector = Icons.Filled.Refresh,
-                    contentDescription = "Refresh queue with current taste settings",
+                    contentDescription = "Refresh upcoming queue with current mode",
                     tint = MaterialTheme.colorScheme.primary,
                 )
             }
@@ -125,29 +125,25 @@ fun UpNextScreen(
         } else {
             val listState = rememberLazyListState()
             val view = LocalView.current
-            // Drag-to-reorder for the Coming Up section only. The item
-            // keys are song-identity-based ("up_<song.id>") rather than
-            // position-based — when a song moves from index 5 to 6 its
-            // key stays "up_<id>", so the reorderable library keeps the
-            // drag gesture bound to the same item across the recomposition
-            // that follows each commit. With position-encoded keys
-            // ("up_5_<id>" → "up_6_<id>") the dragged item appeared to
-            // unmount mid-drag and the user had to re-grab after every
-            // single position swap (push #39 initial bug).
-            //
-            // We resolve `from.key` and `to.key` to current queue indices
-            // by looking the song up in the latest `upcoming` snapshot.
-            // Drags between sections are silently dropped.
+            // Stable duplicate-safe keys for upcoming rows. We key by
+            // song identity + occurrence index within the upcoming
+            // snapshot (e.g. "up_123_0", "up_123_1"). This stays stable
+            // across drag swaps while still supporting repeated songs.
+            val occurrenceBySongId = HashMap<Int, Int>()
+            val upcomingKeys: List<String> = upcoming.map { s ->
+                val occ = occurrenceBySongId[s.id] ?: 0
+                occurrenceBySongId[s.id] = occ + 1
+                "up_${s.id}_$occ"
+            }
+            // Drag-to-reorder for the Coming Up section only.
+            // Resolve from/to keys to current queue indices by looking up
+            // their key position in the latest `upcomingKeys` snapshot.
             val reorderableState = rememberReorderableLazyListState(listState) { from, to ->
                 val fromKey = from.key as? String ?: return@rememberReorderableLazyListState
                 val toKey = to.key as? String ?: return@rememberReorderableLazyListState
                 if (!fromKey.startsWith("up_") || !toKey.startsWith("up_")) return@rememberReorderableLazyListState
-                val fromSongId = fromKey.removePrefix("up_").toIntOrNull()
-                    ?: return@rememberReorderableLazyListState
-                val toSongId = toKey.removePrefix("up_").toIntOrNull()
-                    ?: return@rememberReorderableLazyListState
-                val fromLocal = upcoming.indexOfFirst { it.id == fromSongId }
-                val toLocal = upcoming.indexOfFirst { it.id == toSongId }
+                val fromLocal = upcomingKeys.indexOf(fromKey)
+                val toLocal = upcomingKeys.indexOf(toKey)
                 if (fromLocal < 0 || toLocal < 0) return@rememberReorderableLazyListState
                 val fromQueueIdx = safeIndex + 1 + fromLocal
                 val toQueueIdx = safeIndex + 1 + toLocal
@@ -219,13 +215,12 @@ fun UpNextScreen(
                 item("h_next") { SectionTitle("Coming Up") }
                 itemsIndexed(
                     upcoming,
-                    // Identity-based key (stable across reorder) — see the
-                    // long comment on `reorderableState` above. Position is
-                    // resolved at drag-commit time, not encoded in the key.
-                    key = { _, s -> "up_${s.id}" },
+                    // Identity + duplicate occurrence key stays stable while
+                    // dragging and remains unique for repeated songs.
+                    key = { i, _ -> upcomingKeys[i] },
                 ) { i, song ->
                     val realIndex = safeIndex + 1 + i
-                    val itemKey = "up_${song.id}"
+                    val itemKey = upcomingKeys[i]
                     ReorderableItem(reorderableState, key = itemKey) { isDragging ->
                         // `Modifier.draggableHandle` is a scoped extension
                         // on this ReorderableCollectionItemScope — capture
