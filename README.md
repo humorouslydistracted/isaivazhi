@@ -104,8 +104,26 @@ cd isaivazhi/native
 # Point this at your local Android SDK.
 echo "sdk.dir=/path/to/Android/Sdk" > local.properties
 
+# On-device embedding only: download CLAP ONNX assets (~272 MB weights).
+# Skip this if you only import isaivazhi_embeddings.bin from PC.
+./scripts/fetch_onnx_assets.sh   # or .\scripts\fetch_onnx_assets.ps1 on Windows
+
 ./gradlew :app:assembleDebug
 ```
+
+### On-device ONNX model (optional for build)
+
+Phone-side embedding needs two files in `app/src/main/assets/`:
+
+- `clap_audio_encoder.onnx`
+- `clap_audio_encoder.onnx.data` (~272 MB)
+
+They are **not** in git (GitHub file size limit). Download from the dedicated
+release tag **[onnx-model-v1](https://github.com/humorouslydistracted/isaivazhi/releases/tag/onnx-model-v1)**
+or run `scripts/fetch_onnx_assets.ps1` / `scripts/fetch_onnx_assets.sh`.
+
+Details: [app/src/main/assets/README.md](app/src/main/assets/README.md) ·
+Maintainers: [docs/ONNX_MODEL_RELEASE.md](docs/ONNX_MODEL_RELEASE.md)
 
 Debug APK:
 

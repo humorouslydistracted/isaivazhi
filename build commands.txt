@@ -1,3 +1,6 @@
 $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
 
+# First-time clone only (on-device embedding): download ONNX assets from GitHub Release onnx-model-v1
+# .\scripts\fetch_onnx_assets.ps1
+
 .\gradlew.bat clean assembleDebug

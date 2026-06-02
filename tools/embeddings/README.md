@@ -1,5 +1,11 @@
 # Embedding Tools (Bin-First)
 
+**PC / cloud workflow (this folder):** produces `isaivazhi_embeddings.bin` for import.
+Uses the Hugging Face PyTorch checkpoint (`music_audioset_epoch_15_esc_90.14.pt`).
+
+**On-phone embedding** uses separate ONNX files in `app/src/main/assets/` — see
+[app/src/main/assets/README.md](../../app/src/main/assets/README.md).
+
 All generators now target the same outcome:
 
 - `local_embeddings.json` (resume/checkpoint)
