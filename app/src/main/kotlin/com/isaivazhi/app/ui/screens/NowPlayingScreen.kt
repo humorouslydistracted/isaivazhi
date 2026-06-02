@@ -7,10 +7,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
@@ -115,16 +117,8 @@ fun NowPlayingScreen(
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Spacer(Modifier.weight(1f))
-                IconButton(onClick = onToggleFavorite) {
-                    Icon(
-                        imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                        contentDescription = if (isFavorite) "Unfavorite" else "Favorite",
-                        tint = if (isFavorite) MaterialTheme.colorScheme.primary
-                               else MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier.size(26.dp),
-                    )
-                }
+                // Balance close button — favorite lives in the bottom control row.
+                Spacer(Modifier.width(48.dp))
             }
 
             Column(
@@ -133,7 +127,7 @@ fun NowPlayingScreen(
                     .verticalScroll(scrollState),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(10.dp))
 
                 Box(
                     modifier = Modifier.fillMaxWidth(),
@@ -178,7 +172,17 @@ fun NowPlayingScreen(
                     onSeek = onSeek,
                 )
 
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(6.dp))
+
+                TransportControlsRow(
+                    state = state,
+                    onSkipPrev = onSkipPrev,
+                    onTogglePause = onTogglePause,
+                    onSkipNext = onSkipNext,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                Spacer(Modifier.height(12.dp))
 
                 if (similarLoading || similarSongs.isNotEmpty()) {
                     SimilarSongsRow(
@@ -193,113 +197,176 @@ fun NowPlayingScreen(
                         onQueueAll = onQueueAllSimilar,
                         onToggleFrozen = onToggleSimilarFrozen,
                     )
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(8.dp))
                 }
 
-                Row(
+                SecondaryControlsRow(
+                    state = state,
+                    isFavorite = isFavorite,
+                    isDisliked = isDisliked,
+                    onCycleRepeat = onCycleRepeat,
+                    onToggleShuffle = onToggleShuffle,
+                    onRefresh = onRefresh,
+                    refreshEnabled = refreshEnabled,
+                    refreshInProgress = refreshInProgress,
+                    onToggleDislike = onToggleDislike,
+                    onToggleFavorite = onToggleFavorite,
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = onToggleShuffle) {
-                        Icon(
-                            imageVector = Icons.Filled.Shuffle,
-                            contentDescription = "Shuffle",
-                            tint = if (state.shuffleEnabled) MaterialTheme.colorScheme.primary
-                                   else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(26.dp),
-                        )
-                    }
-                    if (onRefresh != null) {
-                        IconButton(
-                            onClick = onRefresh,
-                            enabled = refreshEnabled && !refreshInProgress,
-                        ) {
-                            if (refreshInProgress) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(22.dp),
-                                    strokeWidth = 2.dp,
-                                    color = MaterialTheme.colorScheme.primary,
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Filled.Refresh,
-                                    contentDescription = "Refresh Up Next",
-                                    tint = if (refreshEnabled) MaterialTheme.colorScheme.primary
-                                           else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(26.dp),
-                                )
-                            }
-                        }
-                    }
-                    IconButton(onClick = onCycleRepeat) {
-                        Icon(
-                            imageVector = if (state.repeatMode == Player.REPEAT_MODE_ONE) Icons.Filled.RepeatOne
-                                          else Icons.Filled.Repeat,
-                            contentDescription = "Repeat",
-                            tint = when (state.repeatMode) {
-                                Player.REPEAT_MODE_OFF -> MaterialTheme.colorScheme.onSurfaceVariant
-                                else -> MaterialTheme.colorScheme.primary
-                            },
-                            modifier = Modifier.size(26.dp),
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = onSkipPrev) {
-                        Icon(
-                            imageVector = Icons.Filled.SkipPrevious,
-                            contentDescription = "Previous",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                            modifier = Modifier.size(48.dp),
-                        )
-                    }
-                    IconButton(onClick = onTogglePause) {
-                        Icon(
-                            imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = if (state.isPlaying) "Pause" else "Play",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(72.dp),
-                        )
-                    }
-                    IconButton(onClick = onSkipNext) {
-                        Icon(
-                            imageVector = Icons.Filled.SkipNext,
-                            contentDescription = "Next (neutral)",
-                            tint = MaterialTheme.colorScheme.onBackground,
-                            modifier = Modifier.size(48.dp),
-                        )
-                    }
-                }
+                )
 
                 Spacer(Modifier.height(12.dp))
+            }
+        }
+    }
+}
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
+private val FullPlayerSecondaryIconSize = 24.dp
+private val FullPlayerTransportSkipSize = 32.dp
+private val FullPlayerTransportPlaySize = 48.dp
+
+@Composable
+private fun TransportControlsRow(
+    state: PlaybackEngine.PlaybackState,
+    onSkipPrev: () -> Unit,
+    onTogglePause: () -> Unit,
+    onSkipNext: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val inactiveTint = MaterialTheme.colorScheme.onBackground
+    Row(
+        modifier = modifier.padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceEvenly,
+    ) {
+        IconButton(onClick = onSkipPrev) {
+            Icon(
+                imageVector = Icons.Filled.SkipPrevious,
+                contentDescription = "Previous",
+                tint = inactiveTint,
+                modifier = Modifier.size(FullPlayerTransportSkipSize),
+            )
+        }
+        IconButton(onClick = onTogglePause) {
+            Icon(
+                imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                contentDescription = if (state.isPlaying) "Pause" else "Play",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(FullPlayerTransportPlaySize),
+            )
+        }
+        IconButton(onClick = onSkipNext) {
+            Icon(
+                imageVector = Icons.Filled.SkipNext,
+                contentDescription = "Next (neutral)",
+                tint = inactiveTint,
+                modifier = Modifier.size(FullPlayerTransportSkipSize),
+            )
+        }
+    }
+}
+
+/** loop / shuffle / refresh / dislike / favorite — mini-player order minus transport */
+@Composable
+private fun SecondaryControlsRow(
+    state: PlaybackEngine.PlaybackState,
+    isFavorite: Boolean,
+    isDisliked: Boolean,
+    onCycleRepeat: () -> Unit,
+    onToggleShuffle: () -> Unit,
+    onRefresh: (() -> Unit)?,
+    refreshEnabled: Boolean,
+    refreshInProgress: Boolean,
+    onToggleDislike: () -> Unit,
+    onToggleFavorite: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val inactiveTint = MaterialTheme.colorScheme.onBackground
+    val repeatIcon = when (state.repeatMode) {
+        Player.REPEAT_MODE_ONE -> Icons.Filled.RepeatOne
+        else -> Icons.Filled.Repeat
+    }
+    val repeatActive = state.repeatMode != Player.REPEAT_MODE_OFF
+
+    Row(
+        modifier = modifier
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ControlSlot {
+            IconButton(onClick = onCycleRepeat) {
+                Icon(
+                    imageVector = repeatIcon,
+                    contentDescription = "Repeat",
+                    tint = if (repeatActive) MaterialTheme.colorScheme.primary else inactiveTint,
+                    modifier = Modifier.size(FullPlayerSecondaryIconSize),
+                )
+            }
+        }
+        ControlSlot {
+            IconButton(onClick = onToggleShuffle) {
+                Icon(
+                    imageVector = Icons.Filled.Shuffle,
+                    contentDescription = "Shuffle",
+                    tint = if (state.shuffleEnabled) MaterialTheme.colorScheme.primary else inactiveTint,
+                    modifier = Modifier.size(FullPlayerSecondaryIconSize),
+                )
+            }
+        }
+        if (onRefresh != null) {
+            ControlSlot {
+                IconButton(
+                    onClick = onRefresh,
+                    enabled = refreshEnabled && !refreshInProgress,
                 ) {
-                    IconButton(onClick = onToggleDislike) {
+                    if (refreshInProgress) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(FullPlayerSecondaryIconSize),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    } else {
                         Icon(
-                            imageVector = if (isDisliked) Icons.Filled.ThumbDownAlt else Icons.Filled.ThumbDown,
-                            contentDescription = if (isDisliked) "Remove dislike" else "Dislike",
-                            tint = if (isDisliked) MaterialTheme.colorScheme.error
+                            imageVector = Icons.Filled.Refresh,
+                            contentDescription = "Refresh Up Next",
+                            tint = if (refreshEnabled) MaterialTheme.colorScheme.primary
                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(28.dp),
+                            modifier = Modifier.size(FullPlayerSecondaryIconSize),
                         )
                     }
                 }
-
-                Spacer(Modifier.height(24.dp))
             }
         }
+        ControlSlot {
+            IconButton(onClick = onToggleDislike) {
+                Icon(
+                    imageVector = if (isDisliked) Icons.Filled.ThumbDownAlt else Icons.Filled.ThumbDown,
+                    contentDescription = if (isDisliked) "Remove dislike" else "Dislike",
+                    tint = if (isDisliked) MaterialTheme.colorScheme.error else inactiveTint,
+                    modifier = Modifier.size(FullPlayerSecondaryIconSize),
+                )
+            }
+        }
+        ControlSlot {
+            IconButton(onClick = onToggleFavorite) {
+                Icon(
+                    imageVector = if (isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                    contentDescription = if (isFavorite) "Unfavorite" else "Favorite",
+                    tint = if (isFavorite) MaterialTheme.colorScheme.primary else inactiveTint,
+                    modifier = Modifier.size(FullPlayerSecondaryIconSize),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.ControlSlot(content: @Composable () -> Unit) {
+    Box(
+        modifier = Modifier.weight(1f),
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
     }
 }
 

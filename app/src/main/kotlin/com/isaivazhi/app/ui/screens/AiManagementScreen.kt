@@ -140,6 +140,8 @@ fun AiManagementScreen(
     // audio-identical-but-different-files (e.g. "song.flac" and
     // "song (1).flac" being byte-identical). Tap-to-play, (−) to delete.
     audioDuplicateGroups: List<EmbeddingDbFacade.AudioDuplicateGroup> = emptyList(),
+    audioDuplicatesScanning: Boolean = false,
+    nearDuplicateScanSkipped: Boolean = false,
     onPlayAudioDup: (filepath: String) -> Unit = {},
     onDeleteAudioDup: (filepath: String) -> Unit = {},
 ) {
@@ -410,7 +412,7 @@ fun AiManagementScreen(
                 if (duplicateGroups.isEmpty() && audioDupIssueGroups.isEmpty() && staleFilenames.isEmpty()) {
                     item {
                         Text(
-                            text = "No stale rows, duplicate embeddings, or audio duplicates. Tap Scan library above to recheck after library changes.",
+                            text = "No stale rows, duplicate embeddings, or audio duplicates. Scan library refreshes MediaStore; duplicate scan runs when you open this page.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -586,16 +588,36 @@ fun AiManagementScreen(
                     val visibleGroups = audioDuplicateGroups
                         .map { g -> g.copy(filepaths = g.filepaths.filter { it !in hiddenAudioDupFilepaths }) }
                         .filter { it.filepaths.size >= 2 }
-                    if (visibleGroups.isEmpty()) {
+                    if (audioDuplicatesScanning) {
                         item {
                             Text(
-                                text = "No audio duplicates detected. Finds byte-identical audio (first 30 s) at different filepaths — e.g. copies in multiple folders. Tap Scan library to re-check.",
+                                text = "Scanning for similar songs (embeddings)…",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                             )
                         }
-                    } else {
+                    }
+                    if (nearDuplicateScanSkipped && !audioDuplicatesScanning) {
+                        item {
+                            Text(
+                                text = "Similarity scan skipped — library has more than ${com.isaivazhi.app.engine.NearDuplicateScanner.MAX_REPRESENTATIVES} embedded songs. Exact hash matches still appear below.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            )
+                        }
+                    }
+                    if (!audioDuplicatesScanning && visibleGroups.isEmpty()) {
+                        item {
+                            Text(
+                                text = "No audio duplicates detected. Finds identical first-30s audio (hash) and likely same song across formats (embedding similarity). Both copies must be embedded. Scan library refreshes the song list; duplicate scan runs when you open this page.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            )
+                        }
+                    } else if (!audioDuplicatesScanning && visibleGroups.isNotEmpty()) {
                         item {
                             Text(
                                 text = "Each group is one piece of audio at multiple filepaths. Tap to play, (−) to delete a copy from device.",
@@ -604,23 +626,25 @@ fun AiManagementScreen(
                                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                             )
                         }
-                        itemsIndexed(
-                            items = visibleGroups,
-                            key = { _, g -> "audiodup_${g.contentHash}" },
-                        ) { _, group ->
-                            AudioDuplicateGroupCard(
-                                group = group,
-                                songsByFilepath = songsByFilepath,
-                                onPlay = onPlayAudioDup,
-                                onDelete = { fp ->
-                                    hiddenAudioDupFilepaths = hiddenAudioDupFilepaths + fp
-                                    onDeleteAudioDup(fp)
-                                },
-                                onOpenDetails = { fp ->
-                                    audioDupDetailFilepath = fp
-                                    audioDupDetailHash = group.contentHash
-                                },
-                            )
+                        if (!audioDuplicatesScanning) {
+                            itemsIndexed(
+                                items = visibleGroups,
+                                key = { _, g -> "audiodup_${g.matchKind}_${g.contentHash}" },
+                            ) { _, group ->
+                                AudioDuplicateGroupCard(
+                                    group = group,
+                                    songsByFilepath = songsByFilepath,
+                                    onPlay = onPlayAudioDup,
+                                    onDelete = { fp ->
+                                        hiddenAudioDupFilepaths = hiddenAudioDupFilepaths + fp
+                                        onDeleteAudioDup(fp)
+                                    },
+                                    onOpenDetails = { fp ->
+                                        audioDupDetailFilepath = fp
+                                        audioDupDetailHash = group.contentHash
+                                    },
+                                )
+                            }
                         }
                     }
                 }
@@ -1162,6 +1186,13 @@ private fun AudioDuplicateGroupCard(
     onOpenDetails: (String) -> Unit,
 ) {
     val hashShort = if (group.contentHash.length > 12) group.contentHash.take(12) + "…" else group.contentHash
+    val matchLabel = when (group.matchKind) {
+        EmbeddingDbFacade.AudioDuplicateMatchKind.EXACT_HASH -> "Same audio (hash)"
+        EmbeddingDbFacade.AudioDuplicateMatchKind.NEAR_EMBEDDING -> {
+            val pct = group.minSimilarity?.let { (it * 100).toInt() } ?: 97
+            "Likely same song (~$pct% similar)"
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1175,12 +1206,18 @@ private fun AudioDuplicateGroupCard(
             .padding(8.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = "hash $hashShort",
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f),
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = matchLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    text = "hash $hashShort",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Text(
                 text = "${group.filepaths.size} files",
                 style = MaterialTheme.typography.labelSmall,

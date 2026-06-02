@@ -11,3 +11,4 @@ tools/embeddings/__pycache__/
 *.pyc
 local.properties
 PAT
+app/src/main/assets/*.onnx.data

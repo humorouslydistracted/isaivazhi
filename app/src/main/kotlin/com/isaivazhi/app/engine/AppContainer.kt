@@ -321,6 +321,23 @@ class AppContainer(private val appContext: Context) {
             "Engine reset: preserved ${favSet.size} favorites + ${disSet.size} dislikes; re-applied priors for ${(favSet + disSet).size} songs"
         )
 
+        // After reseeding manual priors, re-apply a similarity halo around each
+        // favorite so its top-N similar songs regain a positive boost.
+        sideEffectScope.launch {
+            try {
+                val snapshot = taste.signals.value
+                for (fn in favSet) {
+                    val sig = snapshot[fn] ?: continue
+                    val delta = sig.directScore
+                    if (delta != 0f) {
+                        taste.propagateSimilarityBoost(fn, delta, "reset_engine_reseed")
+                    }
+                }
+            } catch (t: Throwable) {
+                android.util.Log.w("AppContainer", "Engine reset similarity reseed failed: ${t.message}")
+            }
+        }
+
         toaster.show("Engine reset (favorites + dislikes preserved)")
         // Saved playback state — wipe queue + position so cold restart starts fresh.
         sideEffectScope.launch {
