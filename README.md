@@ -24,12 +24,6 @@
 
 ---
 
-## 📱 Screenshots
-
-> _Coming soon — add screenshots to `/screenshots` folder_
-
----
-
 ## 🏗️ Architecture
 
 ```
@@ -68,6 +62,83 @@ app/src/main/java/com/makulu/app/
 ├── CsvManager.kt       — CSV export, auto-save to internal + external storage
 └── Theme.kt            — Colors, typography, Material 3 theme
 ```
+
+---
+
+## 📱 Screenshots
+
+Makulu in action — from first launch through daily POS use.
+
+### First Launch
+
+<p align="center">
+  <img src="screenshots/makulu_startup.png" width="280" alt="Permissions screen"/>
+  <br/><em>Grant storage, Bluetooth, and notifications</em>
+  &nbsp;&nbsp;
+  <img src="screenshots/makulu_admin_setup.png" width="280" alt="Admin PIN setup"/>
+  <br/><em>Set up admin PIN and security question for recovery</em>
+</p>
+
+### Admin Setup
+
+<p align="center">
+  <img src="screenshots/makulu_table.png" width="280" alt="Table management"/>
+  <br/><em>Manage tables — add, rename, reorder, delete</em>
+  &nbsp;&nbsp;
+  <img src="screenshots/makulu_menu_items_1.jpg" width="280" alt="Menu categories"/>
+  <br/><em>Menu items by category with prices and availability</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/makulu_menu_items_2.jpg" width="280" alt="Menu items list"/>
+  <br/><em>Full menu list with edit, delete, and toggle controls</em>
+  &nbsp;&nbsp;
+  <img src="screenshots/makulu_inclusions.png" width="280" alt="GST and discount settings"/>
+  <br/><em>Configure GST, discount, and see live receipt preview</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/makulu_receipt_preview_1.png" width="280" alt="Order receipt config"/>
+  <br/><em>Order receipt — field toggles, font size, live preview</em>
+  &nbsp;&nbsp;
+  <img src="screenshots/makulu_receipt_preview_2.png" width="280" alt="Kitchen receipt config"/>
+  <br/><em>Kitchen receipt — separate header, body, and footer settings</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/makulu_printer.png" width="280" alt="Printer settings"/>
+  <br/><em>Bluetooth printer pairing, paper width, and ₹ symbol fix</em>
+</p>
+
+### Ordering
+
+<p align="center">
+  <img src="screenshots/makulu_preview_order_popup.jpg" width="280" alt="Order preview"/>
+  <br/><em>Select table, browse menu, preview order before completing</em>
+</p>
+
+### Reports & Backup
+
+<p align="center">
+  <img src="screenshots/makulu_todays_order.jpg" width="280" alt="Today's orders"/>
+  <br/><em>Today's completed orders at a glance</em>
+  &nbsp;&nbsp;
+  <img src="screenshots/makulu_todays_order_popup.jpg" width="280" alt="Order detail"/>
+  <br/><em>Order detail — reprint receipts, update payment mode</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/makulu_analysis.jpg" width="280" alt="Sales analysis"/>
+  <br/><em>Sales analysis — Today, Week, Month with item breakdown</em>
+  &nbsp;&nbsp;
+  <img src="screenshots/makulu_spending.png" width="280" alt="Shop spending"/>
+  <br/><em>Track daily shop expenses</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/makulu_csv_backup.png" width="280" alt="CSV backup"/>
+  <br/><em>Auto CSV backup — export, sync, and import data</em>
+</p>
 
 ---
 
@@ -221,4 +292,4 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
 ---
 
-**Made with ❤️ for small eateries** · *Last updated: May 31, 2026*
+**Made with ❤️ for small eateries** · *Last updated: June 3, 2026*
