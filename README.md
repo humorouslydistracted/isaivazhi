@@ -2,27 +2,27 @@
 
 **Makulu** is a lightweight, offline-first Point of Sale app for small eateries. Built with Kotlin + Jetpack Compose, it runs entirely on-device with no internet required. Prints receipts via Bluetooth thermal printer (ESC/POS).
 
-<div align="center" style="overflow-x: auto; width: 100%; -webkit-overflow-scrolling: touch;">
-<table cellpadding="8">
-<tr>
-<td align="center" valign="top"><img src="screenshots/makulu_startup.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_admin_setup.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_table.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_menu_items_1.jpg" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_menu_items_2.jpg" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_inclusions.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_receipt_preview_1.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_receipt_preview_2.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_printer.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_preview_order_popup.jpg" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_todays_order.jpg" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_todays_order_popup.jpg" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_analysis.jpg" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_spending.png" width="440" alt=""/></td>
-<td align="center" valign="top"><img src="screenshots/makulu_csv_backup.png" width="440" alt=""/></td>
-</tr>
-</table>
-</div>
+<p align="center">
+<a href="screenshots/makulu_startup.png"><img src="screenshots/makulu_startup.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_admin_setup.png"><img src="screenshots/makulu_admin_setup.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_table.png"><img src="screenshots/makulu_table.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_menu_items_1.jpg"><img src="screenshots/makulu_menu_items_1.jpg" height="480" alt=""/></a>
+<a href="screenshots/makulu_menu_items_2.jpg"><img src="screenshots/makulu_menu_items_2.jpg" height="480" alt=""/></a>
+</p>
+<p align="center">
+<a href="screenshots/makulu_inclusions.png"><img src="screenshots/makulu_inclusions.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_receipt_preview_1.png"><img src="screenshots/makulu_receipt_preview_1.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_receipt_preview_2.png"><img src="screenshots/makulu_receipt_preview_2.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_printer.png"><img src="screenshots/makulu_printer.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_preview_order_popup.jpg"><img src="screenshots/makulu_preview_order_popup.jpg" height="480" alt=""/></a>
+</p>
+<p align="center">
+<a href="screenshots/makulu_todays_order.jpg"><img src="screenshots/makulu_todays_order.jpg" height="480" alt=""/></a>
+<a href="screenshots/makulu_todays_order_popup.jpg"><img src="screenshots/makulu_todays_order_popup.jpg" height="480" alt=""/></a>
+<a href="screenshots/makulu_analysis.jpg"><img src="screenshots/makulu_analysis.jpg" height="480" alt=""/></a>
+<a href="screenshots/makulu_spending.png"><img src="screenshots/makulu_spending.png" height="480" alt=""/></a>
+<a href="screenshots/makulu_csv_backup.png"><img src="screenshots/makulu_csv_backup.png" height="480" alt=""/></a>
+</p>
 
 ---
 
