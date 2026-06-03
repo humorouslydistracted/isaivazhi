@@ -5,6 +5,18 @@ listening behavior. It combines native playback, durable background signal
 capture, and CLAP audio embeddings to recommend music without accounts,
 streaming, tracking, or a server.
 
+<p align="center">
+<a href="screenshots/isaivazhi_home.png"><img src="screenshots/isaivazhi_home.png" height="384" alt=""/></a>
+<a href="screenshots/isaivazhi_up_next.png"><img src="screenshots/isaivazhi_up_next.png" height="384" alt=""/></a>
+<a href="screenshots/isaivazhi_ai_library.png"><img src="screenshots/isaivazhi_ai_library.png" height="384" alt=""/></a>
+<a href="screenshots/isaivazhi_taste_signal_1.png"><img src="screenshots/isaivazhi_taste_signal_1.png" height="384" alt=""/></a>
+</p>
+<p align="center">
+<a href="screenshots/isaivazhi_taste_signal_2.png"><img src="screenshots/isaivazhi_taste_signal_2.png" height="384" alt=""/></a>
+<a href="screenshots/isaivazhi_taste_signal_3.png"><img src="screenshots/isaivazhi_taste_signal_3.png" height="384" alt=""/></a>
+<a href="screenshots/isaivazhi_diagnostics.png"><img src="screenshots/isaivazhi_diagnostics.png" height="384" alt=""/></a>
+</p>
+
 ## Why It Exists
 
 Most music apps optimize for streaming catalogs. IsaiVazhi is built for people

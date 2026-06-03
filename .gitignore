@@ -3,7 +3,6 @@
 build/
 app/build/
 output/
-screenshots/
 songs_downloaded/
 tools/embeddings/.venv-embeddings/
 tools/embeddings/__pycache__/
