@@ -2,6 +2,28 @@
 
 **Makulu** is a lightweight, offline-first Point of Sale app for small eateries. Built with Kotlin + Jetpack Compose, it runs entirely on-device with no internet required. Prints receipts via Bluetooth thermal printer (ESC/POS).
 
+<div align="center" style="overflow-x: auto; width: 100%; -webkit-overflow-scrolling: touch;">
+<table cellpadding="8">
+<tr>
+<td align="center" valign="top"><img src="screenshots/makulu_startup.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_admin_setup.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_table.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_menu_items_1.jpg" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_menu_items_2.jpg" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_inclusions.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_receipt_preview_1.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_receipt_preview_2.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_printer.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_preview_order_popup.jpg" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_todays_order.jpg" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_todays_order_popup.jpg" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_analysis.jpg" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_spending.png" width="440" alt=""/></td>
+<td align="center" valign="top"><img src="screenshots/makulu_csv_backup.png" width="440" alt=""/></td>
+</tr>
+</table>
+</div>
+
 ---
 
 ## ✨ Features
@@ -62,34 +84,6 @@ app/src/main/java/com/makulu/app/
 ├── CsvManager.kt       — CSV export, auto-save to internal + external storage
 └── Theme.kt            — Colors, typography, Material 3 theme
 ```
-
----
-
-## 📱 Screenshots
-
-Makulu in action — from first launch through daily POS use. **Scroll horizontally →**
-
-<div align="center" style="overflow-x: auto; width: 100%; -webkit-overflow-scrolling: touch;">
-<table>
-<tr>
-<td align="center" valign="top"><img src="screenshots/makulu_startup.png" width="220" alt="Permissions"/><br/><sub>Permissions</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_admin_setup.png" width="220" alt="Admin PIN"/><br/><sub>Admin PIN</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_table.png" width="220" alt="Tables"/><br/><sub>Tables</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_menu_items_1.jpg" width="220" alt="Menu categories"/><br/><sub>Menu</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_menu_items_2.jpg" width="220" alt="Menu items"/><br/><sub>Menu items</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_inclusions.png" width="220" alt="GST and discount"/><br/><sub>GST &amp; Discount</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_receipt_preview_1.png" width="220" alt="Order receipt"/><br/><sub>Order receipt</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_receipt_preview_2.png" width="220" alt="Kitchen receipt"/><br/><sub>Kitchen receipt</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_printer.png" width="220" alt="Printer"/><br/><sub>Printer</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_preview_order_popup.jpg" width="220" alt="Order preview"/><br/><sub>Order preview</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_todays_order.jpg" width="220" alt="Today's orders"/><br/><sub>Today's orders</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_todays_order_popup.jpg" width="220" alt="Order detail"/><br/><sub>Order detail</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_analysis.jpg" width="220" alt="Analysis"/><br/><sub>Analysis</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_spending.png" width="220" alt="Spending"/><br/><sub>Spending</sub></td>
-<td align="center" valign="top"><img src="screenshots/makulu_csv_backup.png" width="220" alt="CSV backup"/><br/><sub>CSV backup</sub></td>
-</tr>
-</table>
-</div>
 
 ---
 
