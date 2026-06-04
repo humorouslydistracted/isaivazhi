@@ -24,8 +24,7 @@ keytool -genkey -v -keystore upload-keystore.jks -alias upload \
 Each listing needs: privacy policy URL, Data safety form, content rating,
 screenshots, 512×512 icon, and `applicationId` fixed before first upload.
 
-**Package name:** decide `com.isaivazhi.app` vs `com.isaivazhi.app.kt` in
-`app/build.gradle.kts` before the first production upload.
+**Package name:** `com.isaivazhi.app` (must match the app created in Play Console).
 
 ## Automated upload (optional)
 
