@@ -17,8 +17,26 @@ android {
     namespace = "com.isaivazhi.app"
     compileSdk = 36
 
+    flavorDimensions += "brand"
+    productFlavors {
+        create("isaivazhi") {
+            dimension = "brand"
+            applicationId = "com.isaivazhi.app"
+            resValue("string", "app_name", "IsaiVazhi")
+        }
+        create("makulu") {
+            dimension = "brand"
+            applicationId = "com.makulu.app"
+            resValue("string", "app_name", "Makulu")
+        }
+        create("selavu") {
+            dimension = "brand"
+            applicationId = "com.selavu.app"
+            resValue("string", "app_name", "Selavu")
+        }
+    }
+
     defaultConfig {
-        applicationId = "com.isaivazhi.app"
         minSdk = 24
         targetSdk = 36
         versionCode = 1
