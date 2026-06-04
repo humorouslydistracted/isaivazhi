@@ -33,6 +33,10 @@ fun SettingsScreen(
     artCacheBytes: Long,
     importInProgress: Boolean = false,
     importStatus: String? = null,
+    audioModelReady: Boolean = false,
+    audioModelDownloading: Boolean = false,
+    audioModelProgressLine: String? = null,
+    onDownloadAudioModel: (() -> Unit)? = null,
     onBack: () -> Unit,
     onReimportEmbeddings: () -> Unit,
     onClearArtCache: () -> Unit,
@@ -66,6 +70,28 @@ fun SettingsScreen(
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
+            Text(
+                text = "Audio model",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            )
+            if (onDownloadAudioModel != null) {
+                ActionRow(
+                    title = if (audioModelReady) "Audio model installed" else "Download audio model",
+                    subtitle = audioModelSettingsSubtitle(
+                        ready = audioModelReady,
+                        downloading = audioModelDownloading,
+                        progressLine = audioModelProgressLine,
+                    ),
+                    onClick = onDownloadAudioModel,
+                    enabled = !audioModelDownloading && !audioModelReady,
+                )
+            }
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.padding(top = 8.dp),
+            )
             Text(
                 text = "Maintenance",
                 style = MaterialTheme.typography.labelLarge,

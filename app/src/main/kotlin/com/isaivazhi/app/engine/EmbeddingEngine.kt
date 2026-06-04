@@ -166,6 +166,18 @@ class EmbeddingEngine(
      */
     fun embedSongs(songs: List<Song>) {
         scope.launch {
+            if (!OnnxModelDownload.areModelsReady(appContext)) {
+                _status.value = _status.value.copy(
+                    error = "audio_model_missing",
+                    inProgress = false,
+                )
+                logBuffer.append(
+                    "error",
+                    "embed blocked — download the audio model from Settings first",
+                )
+                toaster?.show("Download the audio model in Settings to embed on device")
+                return@launch
+            }
             // Filter to songs that haven't been embedded yet. The DB row count
             // gives us the upper bound; for individual presence we let the
             // Java EmbeddingService handle deduplication since it already
