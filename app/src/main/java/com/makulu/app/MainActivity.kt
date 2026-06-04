@@ -369,7 +369,7 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .padding(32.dp)
-            .statusBarsPadding(),
+            .safeDrawingPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(modifier = Modifier.height(32.dp))
@@ -468,7 +468,7 @@ fun PrinterSetupScreen(
         modifier = Modifier
             .fillMaxSize()
             .padding(32.dp)
-            .statusBarsPadding(),
+            .safeDrawingPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(modifier = Modifier.height(32.dp))
@@ -909,7 +909,7 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .padding(32.dp)
-            .statusBarsPadding(),
+            .safeDrawingPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(modifier = Modifier.height(48.dp))
