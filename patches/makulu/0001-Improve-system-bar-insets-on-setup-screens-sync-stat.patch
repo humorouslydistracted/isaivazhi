@@ -1,0 +1,100 @@
+From 2c6d151d0f46facfd3ef1e0dad9121a602e51332 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 4 Jun 2026 18:58:20 +0000
+Subject: [PATCH] Improve system bar insets on setup screens; sync status bar
+ in theme
+
+- safeDrawingPadding on full-screen setup flows (notch/cutout safe)
+- WindowCompat status/navigation bar colors like Selavu
+- versionCode 4 for next Play upload
+---
+ app/build.gradle.kts                             |  4 ++--
+ app/src/main/java/com/makulu/app/MainActivity.kt |  6 +++---
+ app/src/main/java/com/makulu/app/Theme.kt        | 15 +++++++++++++++
+ 3 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 82505df..b2b96be 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -23,8 +23,8 @@ android {
+         applicationId = "com.makulu.app"
+         minSdk = 31
+         targetSdk = 35
+-        versionCode = 1
+-        versionName = "1.0.0"
++        versionCode = 4
++        versionName = "1.0.3"
+     }
+ 
+     signingConfigs {
+diff --git a/app/src/main/java/com/makulu/app/MainActivity.kt b/app/src/main/java/com/makulu/app/MainActivity.kt
+index 0cc69b4..ac40a84 100644
+--- a/app/src/main/java/com/makulu/app/MainActivity.kt
++++ b/app/src/main/java/com/makulu/app/MainActivity.kt
+@@ -369,7 +369,7 @@ fun PinSetupScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
+         modifier = Modifier
+             .fillMaxSize()
+             .padding(32.dp)
+-            .statusBarsPadding(),
++            .safeDrawingPadding(),
+         horizontalAlignment = Alignment.CenterHorizontally
+     ) {
+         Spacer(modifier = Modifier.height(32.dp))
+@@ -468,7 +468,7 @@ fun PrinterSetupScreen(
+         modifier = Modifier
+             .fillMaxSize()
+             .padding(32.dp)
+-            .statusBarsPadding(),
++            .safeDrawingPadding(),
+         horizontalAlignment = Alignment.CenterHorizontally
+     ) {
+         Spacer(modifier = Modifier.height(32.dp))
+@@ -909,7 +909,7 @@ fun ResetPinScreen(settingsRepo: SettingsRepository, onDone: () -> Unit) {
+         modifier = Modifier
+             .fillMaxSize()
+             .padding(32.dp)
+-            .statusBarsPadding(),
++            .safeDrawingPadding(),
+         horizontalAlignment = Alignment.CenterHorizontally
+     ) {
+         Spacer(modifier = Modifier.height(48.dp))
+diff --git a/app/src/main/java/com/makulu/app/Theme.kt b/app/src/main/java/com/makulu/app/Theme.kt
+index e47075c..66c0380 100644
+--- a/app/src/main/java/com/makulu/app/Theme.kt
++++ b/app/src/main/java/com/makulu/app/Theme.kt
+@@ -1,9 +1,14 @@
+ package com.makulu.app
+ 
++import android.app.Activity
+ import androidx.compose.foundation.isSystemInDarkTheme
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.SideEffect
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.toArgb
++import androidx.compose.ui.platform.LocalView
++import androidx.core.view.WindowCompat
+ import androidx.compose.ui.text.TextStyle
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.sp
+@@ -93,6 +98,16 @@ fun MakuluTheme(
+     content: @Composable () -> Unit
+ ) {
+     val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
++    val view = LocalView.current
++    if (!view.isInEditMode) {
++        SideEffect {
++            val window = (view.context as Activity).window
++            window.statusBarColor = colorScheme.surface.toArgb()
++            window.navigationBarColor = colorScheme.surface.toArgb()
++            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
++            WindowCompat.getInsetsController(window, view).isAppearanceLightNavigationBars = !darkTheme
++        }
++    }
+ 
+     MaterialTheme(
+         colorScheme = colorScheme,
+-- 
+2.43.0
+
