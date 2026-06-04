@@ -94,3 +94,6 @@ PAT
 # OS specific files
 .DS_Store
 Thumbs.db
+keystore.properties
+upload-keystore.jks
+*.jks
