@@ -89,6 +89,8 @@ class AppPreferences(private val appContext: Context) {
         // embedding_config.py / EmbeddingWindowConfig.java.
         val EMBEDDING_SPLIT_COUNT = intPreferencesKey("embedding_split_count_v1")
         val LAST_EMBED_SPLIT_COUNT = intPreferencesKey("last_embed_split_count_v1")
+        /** User skipped first-launch ONNX download; on-device embed disabled until installed. */
+        val ONNX_DOWNLOAD_SKIPPED = booleanPreferencesKey("onnx_download_skipped_v1")
     }
 
     val recMode: kotlinx.coroutines.flow.Flow<Boolean> =
@@ -212,6 +214,19 @@ class AppPreferences(private val appContext: Context) {
     suspend fun saveLastEmbedSplitCount(count: Int) {
         val n = EmbeddingSplitCount.normalize(count)
         appContext.dataStore.edit { it[Keys.LAST_EMBED_SPLIT_COUNT] = n }
+    }
+
+    suspend fun isOnnxDownloadSkipped(): Boolean =
+        appContext.dataStore.data.first()[Keys.ONNX_DOWNLOAD_SKIPPED] == true
+
+    suspend fun setOnnxDownloadSkipped(skipped: Boolean) {
+        appContext.dataStore.edit { prefs ->
+            if (skipped) {
+                prefs[Keys.ONNX_DOWNLOAD_SKIPPED] = true
+            } else {
+                prefs.remove(Keys.ONNX_DOWNLOAD_SKIPPED)
+            }
+        }
     }
 
     suspend fun saveQueue(filenames: List<String>, index: Int) {

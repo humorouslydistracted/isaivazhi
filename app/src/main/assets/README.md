@@ -8,12 +8,15 @@ used when you only import precomputed `isaivazhi_embeddings.bin` from a PC.
 | `clap_audio_encoder.onnx` | ONNX graph (small) |
 | `clap_audio_encoder.onnx.data` | Model weights (~272 MB) |
 
-Git does not store the weights (GitHub’s 100 MB file limit). Download them from a
-**dedicated model release**, separate from normal app APK releases.
+Git does not store the weights (GitHub’s 100 MB file limit). **Play Store builds**
+do not bundle these files — the app downloads them on first launch (or from
+Settings) from the same GitHub release.
 
-## After cloning the repo
+**Release URL:** [GitHub Releases — tag `onnx-model-v1`](https://github.com/humorouslydistracted/isaivazhi/releases/tag/onnx-model-v1)
 
-From the project root (`native/`):
+## Developer builds (optional local bundle)
+
+From the project root:
 
 **Windows (PowerShell):**
 
@@ -27,8 +30,6 @@ From the project root (`native/`):
 chmod +x scripts/fetch_onnx_assets.sh
 ./scripts/fetch_onnx_assets.sh
 ```
-
-**Manual download:** [GitHub Releases — tag `onnx-model-v1`](https://github.com/humorouslydistracted/isaivazhi/releases/tag/onnx-model-v1)
 
 Place both files in this folder (`app/src/main/assets/`), then build:
 

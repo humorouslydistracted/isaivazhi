@@ -101,7 +101,9 @@ import com.isaivazhi.app.ui.screens.HistoryScreen
 import com.isaivazhi.app.ui.screens.MiniPlayer
 import com.isaivazhi.app.ui.screens.NowPlayingScreen
 import com.isaivazhi.app.ui.screens.EmbeddingsImportDialog
+import com.isaivazhi.app.ui.screens.AudioModelDownloadScreen
 import com.isaivazhi.app.ui.screens.OnboardingScreen
+import com.isaivazhi.app.engine.OnnxModelDownload
 import com.isaivazhi.app.ui.screens.PlaylistDetailScreen
 import com.isaivazhi.app.ui.screens.PlaylistsScreen
 import com.isaivazhi.app.ui.screens.SearchOverlay
@@ -391,6 +393,38 @@ private fun AppRoot(container: AppContainer) {
     // session-local dismiss flag.
     val notificationsPermission = rememberNotificationsPermissionGate(ctx)
     var notifGateDismissed by remember { mutableStateOf(false) }
+    var onnxModelsReady by remember { mutableStateOf(OnnxModelDownload.areModelsReady(ctx)) }
+    var onnxDownloadSkipped by remember { mutableStateOf(false) }
+    var onnxDownloadInProgress by remember { mutableStateOf(false) }
+    var onnxDownloadProgressLine by remember { mutableStateOf<String?>(null) }
+    var onnxDownloadError by remember { mutableStateOf<String?>(null) }
+    var showOnnxSkipConfirm by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        onnxDownloadSkipped = container.preferences.isOnnxDownloadSkipped()
+        onnxModelsReady = OnnxModelDownload.areModelsReady(ctx)
+    }
+    fun startOnnxModelDownload() {
+        if (onnxDownloadInProgress) return
+        onnxDownloadInProgress = true
+        onnxDownloadError = null
+        coroutineScope.launch {
+            val result = OnnxModelDownload.download(ctx) { progress ->
+                onnxDownloadProgressLine = OnnxModelDownload.formatProgressLine(progress)
+            }
+            onnxDownloadInProgress = false
+            if (result.isSuccess) {
+                onnxModelsReady = true
+                onnxDownloadSkipped = false
+                container.preferences.setOnnxDownloadSkipped(false)
+                onnxDownloadProgressLine = "Download complete"
+                onnxDownloadError = null
+                container.toaster.show("Audio model installed — on-device embedding is available")
+            } else {
+                onnxDownloadError = result.exceptionOrNull()?.message ?: "Download failed"
+                onnxDownloadProgressLine = null
+            }
+        }
+    }
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
     // Bugfix 2026-06-01d: mirror songs to the process-lifetime container
     // so engines that run outside the Activity (RecommendationCache) can
@@ -2059,6 +2093,9 @@ private fun AppRoot(container: AppContainer) {
                 songs.isNotEmpty() &&
                 embeddingsRowCount == 0 &&
                 !onboardingDismissed
+            val showAudioModelGate = permission.granted &&
+                !onnxModelsReady &&
+                !onnxDownloadSkipped
             when {
                 !permission.granted -> PermissionGateUi(
                     onRequest = permission.request,
@@ -2068,6 +2105,25 @@ private fun AppRoot(container: AppContainer) {
                         ).setData(android.net.Uri.parse("package:${ctx.packageName}"))
                         runCatching { ctx.startActivity(intent) }
                     },
+                )
+                showAudioModelGate -> AudioModelDownloadScreen(
+                    downloadInProgress = onnxDownloadInProgress,
+                    progressLine = onnxDownloadProgressLine,
+                    errorMessage = onnxDownloadError,
+                    onDownload = { startOnnxModelDownload() },
+                    onSkip = { showOnnxSkipConfirm = true },
+                    showSkipConfirm = showOnnxSkipConfirm,
+                    onConfirmSkip = {
+                        showOnnxSkipConfirm = false
+                        onnxDownloadSkipped = true
+                        coroutineScope.launch {
+                            container.preferences.setOnnxDownloadSkipped(true)
+                        }
+                        container.toaster.show(
+                            "Audio model not installed — on-device embedding is disabled until you download it in Settings",
+                        )
+                    },
+                    onDismissSkipConfirm = { showOnnxSkipConfirm = false },
                 )
                 // Push #55: explicit notification permission step. Falls
                 // between audio permission and onboarding so the user has
@@ -2102,7 +2158,14 @@ private fun AppRoot(container: AppContainer) {
                             }
                         },
                         onEmbedInBackground = {
-                            container.embedding.embedSongs(songs); onboardingDismissed = true
+                            if (!onnxModelsReady) {
+                                container.toaster.show(
+                                    "Download the audio model first (Settings or the startup prompt)",
+                                )
+                            } else {
+                                container.embedding.embedSongs(songs)
+                                onboardingDismissed = true
+                            }
                         },
                         onContinueWithoutEmbeddings = {
                             onboardingDismissed = true
@@ -2370,6 +2433,14 @@ private fun AppRoot(container: AppContainer) {
             artCacheBytes = artCacheBytes,
             importInProgress = importInProgress,
             importStatus = importMessage,
+            audioModelReady = onnxModelsReady,
+            audioModelDownloading = onnxDownloadInProgress,
+            audioModelProgressLine = onnxDownloadProgressLine,
+            onDownloadAudioModel = {
+                if (!onnxModelsReady && !onnxDownloadInProgress) {
+                    startOnnxModelDownload()
+                }
+            },
             onBack = { overlay = Overlay.None },
             onReimportEmbeddings = {
                 if (!importInProgress) {

@@ -9,6 +9,9 @@ tools/embeddings/__pycache__/
 **/__pycache__/
 *.pyc
 local.properties
+keystore.properties
+upload-keystore.jks
+*.jks
 PAT
 # On-device CLAP ONNX (large) — fetch from GitHub Release onnx-model-v1; see app/src/main/assets/README.md
 app/src/main/assets/clap_audio_encoder.onnx

@@ -1,7 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        load(keystorePropertiesFile.inputStream())
+    }
 }
 
 android {
@@ -9,11 +18,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        // Distinct applicationId so the Kotlin port installs alongside the
-        // existing Capacitor build (com.isaivazhi.app) on the same device.
-        // Cutover later by switching this back to "com.isaivazhi.app" and
-        // uninstalling the kt variant.
-        applicationId = "com.isaivazhi.app.kt"
+        applicationId = "com.isaivazhi.app"
         minSdk = 24
         targetSdk = 36
         versionCode = 1
@@ -33,6 +38,17 @@ android {
         }
     }
 
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
@@ -40,6 +56,9 @@ android {
         }
         release {
             isMinifyEnabled = false
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

@@ -52,13 +52,16 @@ import java.util.concurrent.TimeoutException;
  *   6. Average window embeddings + L2 normalize
  *   7. Save to pending_embeddings.json
  *
- * The ONNX model (clap_audio_encoder.onnx) is loaded from app assets.
+ * The ONNX model (clap_audio_encoder.onnx) is loaded from internal storage
+ * ({@link #ONNX_MODEL_DIR_NAME}), optionally copied from APK assets on dev
+ * builds, or downloaded at runtime via {@link com.isaivazhi.app.engine.OnnxModelDownload}.
  * Results are staged in pending_embeddings.json and later promoted to the
  * stable binary store by the JS layer.
  */
 public class EmbeddingService {
 
     private static final String TAG = "EmbeddingService";
+    public static final String ONNX_MODEL_DIR_NAME = "onnx_model";
     private static final String ONNX_MODEL_FILENAME = "clap_audio_encoder.onnx";
     private static final String PENDING_EMBEDDINGS_FILE = "pending_embeddings.json";
     private String dataDir; // set in constructor — app-private external storage
@@ -172,6 +175,15 @@ public class EmbeddingService {
 
     public String getLastError() { return lastError; }
 
+    /** True when both graph and external weights exist under [filesDir/onnx_model]. */
+    public static boolean areModelFilesReady(Context context) {
+        File modelDir = new File(context.getFilesDir(), ONNX_MODEL_DIR_NAME);
+        File modelFile = new File(modelDir, ONNX_MODEL_FILENAME);
+        File dataFile = new File(modelDir, ONNX_MODEL_FILENAME + ".data");
+        return modelFile.exists() && modelFile.length() > 0
+                && dataFile.exists() && dataFile.length() > 0;
+    }
+
     // Push #40 Tier 2E: 30 s timeout per ONNX init step. ONNX Runtime
     // session creation has historically hung indefinitely on devices with
     // buggy NNAPI drivers — the user sees "warming up" forever with no
@@ -196,28 +208,31 @@ public class EmbeddingService {
             }
 
             // ONNX models with external data need filesystem paths (not asset streams).
-            // Extract both .onnx and .onnx.data from assets to internal storage.
-            File modelDir = new File(context.getFilesDir(), "onnx_model");
+            File modelDir = new File(context.getFilesDir(), ONNX_MODEL_DIR_NAME);
             if (!modelDir.exists()) modelDir.mkdirs();
 
             File modelFile = new File(modelDir, ONNX_MODEL_FILENAME);
             File dataFile = new File(modelDir, ONNX_MODEL_FILENAME + ".data");
 
-            // Push #43: surface model extraction progress. The 273 MB
-            // `.data` file can take 10-60 s to copy from APK assets to
-            // internal storage on first launch — the user sees "Warming
-            // up" with no info during that. Now they see "Extracting
-            // audio model (273 MB)…".
-            boolean needsExtract = !(modelFile.exists() && modelFile.length() > 0
-                    && dataFile.exists() && dataFile.length() > 0);
-            if (needsExtract) {
-                emitInitStep("extracting_model", "Extracting audio model (~273 MB)…");
+            if (!areModelFilesReady(context)) {
+                // Dev builds may still bundle assets; try a one-time copy from APK.
+                boolean needsExtract = true;
+                if (needsExtract) {
+                    emitInitStep("extracting_model", "Preparing audio model…");
+                }
+                long tExtract = SystemClock.elapsedRealtime();
+                extractAssetIfNeeded(ONNX_MODEL_FILENAME, modelFile);
+                extractAssetIfNeeded(ONNX_MODEL_FILENAME + ".data", dataFile);
+                Log.i(TAG, "init: model files prepared in " + (SystemClock.elapsedRealtime() - tExtract)
+                        + " ms (graph=" + modelFile.length() + " B, weights=" + dataFile.length() + " B)");
             }
-            long tExtract = SystemClock.elapsedRealtime();
-            extractAssetIfNeeded(ONNX_MODEL_FILENAME, modelFile);
-            extractAssetIfNeeded(ONNX_MODEL_FILENAME + ".data", dataFile);
-            Log.i(TAG, "init: assets ready in " + (SystemClock.elapsedRealtime() - tExtract) + " ms "
-                    + "(graph=" + modelFile.length() + " B, weights=" + dataFile.length() + " B)");
+
+            if (!areModelFilesReady(context)) {
+                lastError = "Audio model not installed. Download it from Settings (or on first launch).";
+                Log.w(TAG, "init: " + lastError);
+                emitInitStep("model_missing", lastError);
+                return false;
+            }
             emitInitStep("model_ready", "Audio model ready, starting accelerator…");
 
             modelFilePath = modelFile.getAbsolutePath();
@@ -406,6 +421,10 @@ public class EmbeddingService {
             Log.i(TAG, "Asset already extracted: " + assetName + " (" + destFile.length() + " bytes)");
             return;
         }
+        if (!assetExists(assetName)) {
+            Log.i(TAG, "Asset not bundled, skipping: " + assetName);
+            return;
+        }
         Log.i(TAG, "Extracting asset: " + assetName + " to " + destFile.getAbsolutePath());
         try (InputStream is = context.getAssets().open(assetName);
              FileOutputStream fos = new FileOutputStream(destFile)) {
@@ -417,6 +436,14 @@ public class EmbeddingService {
                 total += len;
             }
             Log.i(TAG, "Extracted " + assetName + ": " + total + " bytes");
+        }
+    }
+
+    private boolean assetExists(String assetName) {
+        try (InputStream ignored = context.getAssets().open(assetName)) {
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
 
