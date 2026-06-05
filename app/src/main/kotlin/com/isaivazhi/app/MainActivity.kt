@@ -5,7 +5,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
@@ -25,8 +24,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -46,9 +43,12 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -196,7 +196,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
 
         // Install crash handler EARLY so any subsequent uncaught exception
         // lands in the persisted Debug Logs file before the process dies.
@@ -379,6 +378,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AppRoot(container: AppContainer) {
     val ctx = LocalContext.current
@@ -1943,61 +1943,49 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
+    // Selavu-style layout: default Scaffold window insets + Material TopAppBar
+    // (no enableEdgeToEdge / zero insets — those hid the bar under the status area).
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        // Push #39: disable Scaffold's automatic system-bar inset
-        // reservation. We handle insets manually inside the topBar
-        // (`statusBarsPadding`) and bottomBar (`navigationBarsPadding`).
-        // The default (`WindowInsets.systemBars`) double-counted, leaving
-        // a ~25 dp band below the topBar text AND a ~30 dp band above
-        // the MiniPlayer — the symmetric "padding above and below" the
-        // user saw.
-        contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0),
         topBar = {
             if (permission.granted && songs.isNotEmpty() && overlay is Overlay.None) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        // Push #39: was `systemBarsPadding()` which adds
-                        // insets on ALL four sides — including the bottom
-                        // navigation-bar inset (~30 dp) which had nothing
-                        // to do with a top bar and just created a blank
-                        // band between the "Discover" text and the page
-                        // content below.
-                        .statusBarsPadding()
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = Tab.entries[pagerState.currentPage].title,
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier.padding(start = 12.dp),
-                    )
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = { overlay = Overlay.Search }) {
-                        Icon(Icons.Filled.Search, contentDescription = "Search", tint = MaterialTheme.colorScheme.onBackground)
-                    }
-                    Box {
-                        IconButton(onClick = { libraryMenuOpen = true }) {
-                            Icon(Icons.Filled.Menu, contentDescription = "Library menu", tint = MaterialTheme.colorScheme.onBackground)
+                TopAppBar(
+                    title = {
+                        Text(
+                            text = Tab.entries[pagerState.currentPage].title,
+                            style = MaterialTheme.typography.titleLarge,
+                        )
+                    },
+                    actions = {
+                        IconButton(onClick = { overlay = Overlay.Search }) {
+                            Icon(Icons.Filled.Search, contentDescription = "Search")
                         }
-                        DropdownMenu(expanded = libraryMenuOpen, onDismissRequest = { libraryMenuOpen = false }) {
-                            DropdownMenuItem(text = { Text("Taste") },
-                                leadingIcon = { Icon(Icons.Filled.Tune, contentDescription = null) },
-                                onClick = { libraryMenuOpen = false; overlay = Overlay.Taste })
-                            DropdownMenuItem(text = { Text("AI & Library") },
-                                leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
-                                onClick = { libraryMenuOpen = false; overlay = Overlay.Ai })
-                            DropdownMenuItem(text = { Text("Diagnostics") },
-                                leadingIcon = { Icon(Icons.Filled.BugReport, contentDescription = null) },
-                                onClick = { libraryMenuOpen = false; overlay = Overlay.Logs() })
-                            DropdownMenuItem(text = { Text("Settings") },
-                                leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-                                onClick = { libraryMenuOpen = false; overlay = Overlay.Settings })
+                        Box {
+                            IconButton(onClick = { libraryMenuOpen = true }) {
+                                Icon(Icons.Filled.Menu, contentDescription = "Library menu")
+                            }
+                            DropdownMenu(expanded = libraryMenuOpen, onDismissRequest = { libraryMenuOpen = false }) {
+                                DropdownMenuItem(text = { Text("Taste") },
+                                    leadingIcon = { Icon(Icons.Filled.Tune, contentDescription = null) },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Taste })
+                                DropdownMenuItem(text = { Text("AI & Library") },
+                                    leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Ai })
+                                DropdownMenuItem(text = { Text("Diagnostics") },
+                                    leadingIcon = { Icon(Icons.Filled.BugReport, contentDescription = null) },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Logs() })
+                                DropdownMenuItem(text = { Text("Settings") },
+                                    leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Settings })
+                            }
                         }
-                    }
-                }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        titleContentColor = MaterialTheme.colorScheme.onBackground,
+                        actionIconContentColor = MaterialTheme.colorScheme.onBackground,
+                    ),
+                )
             }
         },
         bottomBar = {
@@ -3209,7 +3197,7 @@ private fun AppRoot(container: AppContainer) {
     // The fillMaxSize Box itself is cheap (single empty layout slot
     // unless `currentToast != null`); the heavy work is short-circuited
     // by AnimatedVisibility's invisible state.
-    Box(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+    Box(modifier = Modifier.fillMaxSize()) {
         androidx.compose.animation.AnimatedVisibility(
             visible = currentToast != null,
             enter = androidx.compose.animation.fadeIn() +

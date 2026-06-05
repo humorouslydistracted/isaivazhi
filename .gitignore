@@ -2,6 +2,7 @@
 .kotlin/
 build/
 app/build/
+release-aabs/
 output/
 songs_downloaded/
 tools/embeddings/.venv-embeddings/
