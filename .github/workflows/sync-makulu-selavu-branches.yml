@@ -1,0 +1,41 @@
+# Pushes mirrored branches to makulu/selavu when REPO_SYNC_PAT is configured.
+# The Cloud Agent installation token is often limited to the workspace repo only;
+# a classic PAT with repo scope on all three apps fixes cross-repo push.
+name: Sync branches to Makulu and Selavu
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - makulu-export/**
+
+jobs:
+  sync-makulu:
+    runs-on: ubuntu-latest
+    if: ${{ secrets.REPO_SYNC_PAT != '' }}
+    steps:
+      - name: Checkout makulu export branch
+        uses: actions/checkout@v4
+        with:
+          ref: makulu-export/fix-system-bar-layout-e148
+          fetch-depth: 0
+
+      - name: Push to makulu repository
+        env:
+          PAT: ${{ secrets.REPO_SYNC_PAT }}
+        run: |
+          git config user.name "cursor[bot]"
+          git config user.email "cursor[bot]@users.noreply.github.com"
+          git remote add makulu "https://x-access-token:${PAT}@github.com/humorouslydistracted/makulu.git"
+          git push makulu HEAD:cursor/fix-system-bar-layout-e148 --force
+
+      - name: Open PR on makulu
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SYNC_PAT }}
+        run: |
+          gh pr create --repo humorouslydistracted/makulu \
+            --head cursor/fix-system-bar-layout-e148 \
+            --base main \
+            --title "Fix system bar insets on setup screens (versionCode 4)" \
+            --body "Automated sync from isaivazhi \`makulu-export/fix-system-bar-layout-e148\`." \
+            || echo "PR may already exist"
