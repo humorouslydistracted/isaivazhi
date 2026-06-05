@@ -91,6 +91,12 @@ class AppPreferences(private val appContext: Context) {
         val LAST_EMBED_SPLIT_COUNT = intPreferencesKey("last_embed_split_count_v1")
         /** User skipped first-launch ONNX download; on-device embed disabled until installed. */
         val ONNX_DOWNLOAD_SKIPPED = booleanPreferencesKey("onnx_download_skipped_v1")
+        /** One-time post-download prompt to guide the user to restrict network access. */
+        val NETWORK_PROMPT_SHOWN = booleanPreferencesKey("network_access_prompt_shown_v1")
+        /** User dismissed the embedding onboarding screen; don't show again automatically. */
+        val ONBOARDING_DISMISSED = booleanPreferencesKey("onboarding_dismissed_v1")
+        /** User has toggled the in-app network block; prevents model re-downloads via app code. */
+        val NETWORK_BLOCKED = booleanPreferencesKey("network_blocked_v1")
     }
 
     val recMode: kotlinx.coroutines.flow.Flow<Boolean> =
@@ -226,6 +232,33 @@ class AppPreferences(private val appContext: Context) {
             } else {
                 prefs.remove(Keys.ONNX_DOWNLOAD_SKIPPED)
             }
+        }
+    }
+
+    suspend fun isNetworkPromptShown(): Boolean =
+        appContext.dataStore.data.first()[Keys.NETWORK_PROMPT_SHOWN] == true
+
+    suspend fun setNetworkPromptShown() {
+        appContext.dataStore.edit { it[Keys.NETWORK_PROMPT_SHOWN] = true }
+    }
+
+    suspend fun isOnboardingDismissed(): Boolean =
+        appContext.dataStore.data.first()[Keys.ONBOARDING_DISMISSED] == true
+
+    suspend fun setOnboardingDismissed(dismissed: Boolean) {
+        appContext.dataStore.edit { prefs ->
+            if (dismissed) prefs[Keys.ONBOARDING_DISMISSED] = true
+            else prefs.remove(Keys.ONBOARDING_DISMISSED)
+        }
+    }
+
+    suspend fun isNetworkBlocked(): Boolean =
+        appContext.dataStore.data.first()[Keys.NETWORK_BLOCKED] == true
+
+    suspend fun setNetworkBlocked(blocked: Boolean) {
+        appContext.dataStore.edit { prefs ->
+            if (blocked) prefs[Keys.NETWORK_BLOCKED] = true
+            else prefs.remove(Keys.NETWORK_BLOCKED)
         }
     }
 

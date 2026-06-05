@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -18,6 +18,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -42,12 +43,17 @@ fun SettingsScreen(
     onClearArtCache: () -> Unit,
     onOpenAiLibrary: (() -> Unit)? = null,
     onOpenLogs: (() -> Unit)? = null,
+    networkBlocked: Boolean = false,
+    onToggleNetworkBlocked: ((Boolean) -> Unit)? = null,
+    onOpenNetworkSystemSettings: (() -> Unit)? = null,
+    onOpenFolders: (() -> Unit)? = null,
+    folderSummary: String = "",
 ) {
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .systemBarsPadding(),
+            .safeDrawingPadding(),
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
@@ -86,6 +92,69 @@ fun SettingsScreen(
                     ),
                     onClick = onDownloadAudioModel,
                     enabled = !audioModelDownloading && !audioModelReady,
+                )
+            }
+            if (onToggleNetworkBlocked != null) {
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    text = "Network",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Block network downloads",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onBackground,
+                        )
+                        Text(
+                            text = if (networkBlocked)
+                                "Downloads disabled — re-enable to install model updates."
+                            else
+                                "Allow the app to download audio model updates over the network.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Switch(
+                        checked = networkBlocked,
+                        onCheckedChange = onToggleNetworkBlocked,
+                    )
+                }
+                if (onOpenNetworkSystemSettings != null) {
+                    ActionRow(
+                        title = "System-level network restriction",
+                        subtitle = "For complete isolation, revoke network permission in Android settings.",
+                        onClick = onOpenNetworkSystemSettings,
+                    )
+                }
+            }
+            if (onOpenFolders != null) {
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    text = "Folders",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+                ActionRow(
+                    title = "Manage folders",
+                    subtitle = folderSummary.ifBlank { "Control which directories appear in your library." },
+                    onClick = onOpenFolders,
                 )
             }
             HorizontalDivider(

@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -47,8 +49,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -59,6 +59,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -102,6 +103,8 @@ import com.isaivazhi.app.ui.screens.MiniPlayer
 import com.isaivazhi.app.ui.screens.NowPlayingScreen
 import com.isaivazhi.app.ui.screens.EmbeddingsImportDialog
 import com.isaivazhi.app.ui.screens.AudioModelDownloadScreen
+import com.isaivazhi.app.ui.screens.FoldersScreen
+import com.isaivazhi.app.ui.screens.NetworkAccessPromptScreen
 import com.isaivazhi.app.ui.screens.OnboardingScreen
 import com.isaivazhi.app.engine.OnnxModelDownload
 import com.isaivazhi.app.ui.screens.PlaylistDetailScreen
@@ -144,6 +147,7 @@ private sealed class Overlay {
     data object History : Overlay()
     data object Taste : Overlay()
     data object Ai : Overlay()
+    data object Folders : Overlay()
     data class Logs(val initialTab: LogsTab = LogsTab.Activity) : Overlay()
     data class PlaylistDetail(val playlistId: String) : Overlay()
     data class ViewAll(val category: BrowseCategory) : Overlay()
@@ -196,7 +200,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         // Install crash handler EARLY so any subsequent uncaught exception
         // lands in the persisted Debug Logs file before the process dies.
         DebugLogCapture.installCrashHandler(applicationContext)
@@ -276,10 +279,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             IsaiVazhiTheme {
-                Surface(modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background) {
-                    AppRoot(container = container)
-                }
+                AppRoot(container = container)
             }
         }
     }
@@ -399,12 +399,21 @@ private fun AppRoot(container: AppContainer) {
     var onnxDownloadProgressLine by remember { mutableStateOf<String?>(null) }
     var onnxDownloadError by remember { mutableStateOf<String?>(null) }
     var showOnnxSkipConfirm by remember { mutableStateOf(false) }
+    var showNetworkPrompt by remember { mutableStateOf(false) }
+    var networkBlocked by remember { mutableStateOf(false) }
+    var onboardingDismissed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         onnxDownloadSkipped = container.preferences.isOnnxDownloadSkipped()
         onnxModelsReady = OnnxModelDownload.areModelsReady(ctx)
+        onboardingDismissed = container.preferences.isOnboardingDismissed()
+        networkBlocked = container.preferences.isNetworkBlocked()
     }
     fun startOnnxModelDownload() {
         if (onnxDownloadInProgress) return
+        if (networkBlocked) {
+            container.toaster.show("Network downloads are blocked — toggle off in Settings › Network to re-enable.")
+            return
+        }
         onnxDownloadInProgress = true
         onnxDownloadError = null
         coroutineScope.launch {
@@ -419,13 +428,22 @@ private fun AppRoot(container: AppContainer) {
                 onnxDownloadProgressLine = "Download complete"
                 onnxDownloadError = null
                 container.toaster.show("Audio model installed — on-device embedding is available")
+                if (!container.preferences.isNetworkPromptShown()) {
+                    showNetworkPrompt = true
+                }
             } else {
                 onnxDownloadError = result.exceptionOrNull()?.message ?: "Download failed"
                 onnxDownloadProgressLine = null
             }
         }
     }
-    var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
+    // rawSongs holds the full unfiltered library from LibraryCache/enrichment.
+    // songs is derived from rawSongs after applying folder exclusions so every
+    // view automatically sees only included-folder tracks.
+    var rawSongs by remember { mutableStateOf<List<Song>>(emptyList()) }
+    val excludedFolderPaths by container.folderExclusion.excludedPaths.collectAsState(initial = emptySet())
+    val manualFolderPaths by container.folderExclusion.manualPaths.collectAsState(initial = emptySet())
+    val songs by remember { derivedStateOf { container.folderExclusion.filter(rawSongs, excludedFolderPaths) } }
     // Bugfix 2026-06-01d: mirror songs to the process-lifetime container
     // so engines that run outside the Activity (RecommendationCache) can
     // see the library. Covers every reload site — invalidate-on-import,
@@ -477,7 +495,6 @@ private fun AppRoot(container: AppContainer) {
     // DISPLAY_NAME and the EmbeddingService's File(path).getName()).
     var embeddedFilepaths by remember { mutableStateOf<Set<String>>(emptySet()) }
     var artCacheBytes by remember { mutableStateOf(0L) }
-    var onboardingDismissed by remember { mutableStateOf(false) }
     var importMessage by remember { mutableStateOf<String?>(null) }
     var importInProgress by remember { mutableStateOf(false) }
     var exportBackupInProgress by remember { mutableStateOf(false) }
@@ -644,7 +661,7 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Deleted ${filepaths.size} files")
                 container.embedding.logBuffer.append("delete", "batch removed ${filepaths.size} files")
                 coroutineScope.launch {
-                    songs = LibraryCache.invalidate(ctx)
+                    rawSongs = LibraryCache.invalidate(ctx)
                     // Best-effort: also drop T_PATH entries for each
                     // deleted filepath in case any were audio-dupes.
                     for (fp in filepaths) {
@@ -682,7 +699,7 @@ private fun AppRoot(container: AppContainer) {
                 // immediately (LibraryScanner now filters non-existent
                 // filepaths on top of MediaStore so even pre-MediaStore-
                 // re-scan we won't show the row).
-                songs = LibraryCache.invalidate(ctx)
+                rawSongs = LibraryCache.invalidate(ctx)
                 if (wasAudioDup) {
                     container.embedding.removeAudioDupPath(filepath) { _ -> }
                 }
@@ -769,7 +786,7 @@ private fun AppRoot(container: AppContainer) {
                 val relink = container.embeddingDb.relinkLibraryPaths(songs)
                 val relinked = relink?.optInt("relinked", 0) ?: 0
                 val hashMap = container.embeddingDb.contentHashByFilepath()
-                songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                 container.library.value = songs
                 container.embeddingDb.clearVecHeapCache()
                 container.embeddingDb.prewarmFromLibrary(songs)
@@ -788,6 +805,7 @@ private fun AppRoot(container: AppContainer) {
                 }
                 importMessage = doneMessage
                 onboardingDismissed = true
+                container.preferences.setOnboardingDismissed(true)
                 container.activityLog.log(
                     "engine", "embed_import_done", doneMessage,
                     data = mapOf("rows" to rows, "relinked" to relinked),
@@ -846,6 +864,60 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
+    // Pending result from the SAF folder picker — used to show the "Found N songs" confirm dialog
+    data class PendingFolderAdd(val path: String, val displayName: String, val songCount: Int)
+    var pendingFolderAdd by remember { mutableStateOf<PendingFolderAdd?>(null) }
+
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        coroutineScope.launch {
+            // Persist read permission so the app can access this folder after restart
+            runCatching {
+                ctx.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+            // Resolve SAF tree URI → absolute path.
+            // Format: content://com.android.externalstorage.documents/tree/primary:Music
+            // lastPathSegment yields "primary:Music" or "home:Music"
+            val docId = uri.lastPathSegment ?: ""
+            val resolvedPath = when {
+                docId.startsWith("primary:") ->
+                    "/storage/emulated/0/${docId.removePrefix("primary:")}"
+                docId.startsWith("home:") ->
+                    "/storage/emulated/0/${docId.removePrefix("home:")}"
+                else -> {
+                    // Fallback: try to extract from raw URI path string
+                    val raw = uri.path ?: ""
+                    val idx = raw.indexOf("/primary:")
+                    if (idx >= 0) "/storage/emulated/0/${raw.substring(idx + 9)}"
+                    else raw
+                }
+            }
+            if (resolvedPath.isBlank()) {
+                container.toaster.show("Could not resolve folder path — try a folder inside Internal Storage")
+                return@launch
+            }
+            val dir = java.io.File(resolvedPath)
+            if (!dir.isDirectory) {
+                container.toaster.show("Selected path is not a directory")
+                return@launch
+            }
+            val audioExts = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma")
+            val count = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                dir.walkTopDown().count { it.isFile && it.extension.lowercase() in audioExts }
+            }
+            pendingFolderAdd = PendingFolderAdd(
+                path = resolvedPath,
+                displayName = dir.name.ifBlank { resolvedPath },
+                songCount = count,
+            )
+        }
+    }
+
     LaunchedEffect(permission.granted) {
         if (permission.granted) {
             try {
@@ -862,9 +934,9 @@ private fun AppRoot(container: AppContainer) {
                     message = "LibraryCache.loadOrScan start",
                     data = mapOf("permissionGranted" to permission.granted),
                 )
-                songs = LibraryCache.loadOrScan(ctx)
-                if (songs.isEmpty()) {
-                    songs = LibraryCache.loadOrScan(ctx, force = true)
+                rawSongs = LibraryCache.loadOrScan(ctx)
+                if (rawSongs.isEmpty()) {
+                    rawSongs = LibraryCache.loadOrScan(ctx, force = true)
                 }
                 // Bugfix 2026-06-01d: publish to container so the
                 // process-lifetime RecommendationCache can see the
@@ -941,7 +1013,7 @@ private fun AppRoot(container: AppContainer) {
                 try {
                     container.embeddingDb.relinkLibraryPaths(songs)
                     val hashMap = container.embeddingDb.contentHashByFilepath()
-                    songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                    rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                     container.library.value = songs
                     container.embeddingDb.prewarmFromLibrary(songs)
                 } catch (t: Throwable) {
@@ -972,7 +1044,7 @@ private fun AppRoot(container: AppContainer) {
                 try {
                     container.embeddingDb.relinkLibraryPaths(songs)
                     val hashMap = container.embeddingDb.contentHashByFilepath()
-                    songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                    rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                     container.library.value = songs
                     container.embeddingDb.prewarmFromLibrary(songs)
                 } catch (t: Throwable) {
@@ -1943,49 +2015,74 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
-    // Selavu-style layout: default Scaffold window insets + Material TopAppBar
-    // (no enableEdgeToEdge / zero insets — those hid the bar under the status area).
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         topBar = {
             if (permission.granted && songs.isNotEmpty() && overlay is Overlay.None) {
-                TopAppBar(
-                    title = {
+                Surface(
+                    color = MaterialTheme.colorScheme.background,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp)
+                            .height(56.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         Text(
                             text = Tab.entries[pagerState.currentPage].title,
                             style = MaterialTheme.typography.titleLarge,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = 12.dp),
                         )
-                    },
-                    actions = {
                         IconButton(onClick = { overlay = Overlay.Search }) {
-                            Icon(Icons.Filled.Search, contentDescription = "Search")
+                            Icon(
+                                Icons.Filled.Search,
+                                contentDescription = "Search",
+                                tint = MaterialTheme.colorScheme.onBackground,
+                            )
                         }
                         Box {
                             IconButton(onClick = { libraryMenuOpen = true }) {
-                                Icon(Icons.Filled.Menu, contentDescription = "Library menu")
+                                Icon(
+                                    Icons.Filled.Menu,
+                                    contentDescription = "Library menu",
+                                    tint = MaterialTheme.colorScheme.onBackground,
+                                )
                             }
-                            DropdownMenu(expanded = libraryMenuOpen, onDismissRequest = { libraryMenuOpen = false }) {
-                                DropdownMenuItem(text = { Text("Taste") },
+                            DropdownMenu(
+                                expanded = libraryMenuOpen,
+                                onDismissRequest = { libraryMenuOpen = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Taste") },
                                     leadingIcon = { Icon(Icons.Filled.Tune, contentDescription = null) },
-                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Taste })
-                                DropdownMenuItem(text = { Text("AI & Library") },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Taste },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("AI & Library") },
                                     leadingIcon = { Icon(Icons.Filled.AutoAwesome, contentDescription = null) },
-                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Ai })
-                                DropdownMenuItem(text = { Text("Diagnostics") },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Ai },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Diagnostics") },
                                     leadingIcon = { Icon(Icons.Filled.BugReport, contentDescription = null) },
-                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Logs() })
-                                DropdownMenuItem(text = { Text("Settings") },
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Logs() },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Settings") },
                                     leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Settings })
+                                    onClick = { libraryMenuOpen = false; overlay = Overlay.Settings },
+                                )
                             }
                         }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.background,
-                        titleContentColor = MaterialTheme.colorScheme.onBackground,
-                        actionIconContentColor = MaterialTheme.colorScheme.onBackground,
-                    ),
-                )
+                    }
+                }
             }
         },
         bottomBar = {
@@ -2113,6 +2210,24 @@ private fun AppRoot(container: AppContainer) {
                     },
                     onDismissSkipConfirm = { showOnnxSkipConfirm = false },
                 )
+                showNetworkPrompt -> NetworkAccessPromptScreen(
+                    onOpenSettings = {
+                        val intent = android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        ).setData(android.net.Uri.parse("package:${ctx.packageName}"))
+                        runCatching { ctx.startActivity(intent) }
+                        networkBlocked = true
+                        showNetworkPrompt = false
+                        coroutineScope.launch {
+                            container.preferences.setNetworkBlocked(true)
+                            container.preferences.setNetworkPromptShown()
+                        }
+                    },
+                    onSkip = {
+                        showNetworkPrompt = false
+                        coroutineScope.launch { container.preferences.setNetworkPromptShown() }
+                    },
+                )
                 // Push #55: explicit notification permission step. Falls
                 // between audio permission and onboarding so the user has
                 // already committed to "yes, I'm setting this app up"
@@ -2153,11 +2268,15 @@ private fun AppRoot(container: AppContainer) {
                             } else {
                                 container.embedding.embedSongs(songs)
                                 onboardingDismissed = true
+                                coroutineScope.launch { container.preferences.setOnboardingDismissed(true) }
                             }
                         },
                         onContinueWithoutEmbeddings = {
                             onboardingDismissed = true
-                            coroutineScope.launch { container.preferences.setRecMode(false) }
+                            coroutineScope.launch {
+                                container.preferences.setRecMode(false)
+                                container.preferences.setOnboardingDismissed(true)
+                            }
                         },
                     )
                 }
@@ -2442,6 +2561,92 @@ private fun AppRoot(container: AppContainer) {
             },
             onOpenAiLibrary = { overlay = Overlay.Ai },
             onOpenLogs = { overlay = Overlay.Logs() },
+            networkBlocked = networkBlocked,
+            onToggleNetworkBlocked = { blocked ->
+                networkBlocked = blocked
+                coroutineScope.launch { container.preferences.setNetworkBlocked(blocked) }
+            },
+            onOpenNetworkSystemSettings = {
+                val intent = android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                ).setData(android.net.Uri.parse("package:${ctx.packageName}"))
+                runCatching { ctx.startActivity(intent) }
+            },
+            onOpenFolders = { overlay = Overlay.Folders },
+            folderSummary = run {
+                val total = container.folderExclusion.folderCount(rawSongs)
+                val excl = excludedFolderPaths.size
+                if (total == 0) "No folders found yet."
+                else if (excl == 0) "$total folder${if (total == 1) "" else "s"} · all included"
+                else "$total folder${if (total == 1) "" else "s"} · $excl excluded"
+            },
+        )
+    }
+
+    // "Found N songs in [folder]" confirmation dialog after folder picker
+    pendingFolderAdd?.let { pending ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { pendingFolderAdd = null },
+            title = { androidx.compose.material3.Text("Add \"${pending.displayName}\"?") },
+            text = {
+                androidx.compose.material3.Text(
+                    "Found ${pending.songCount} song${if (pending.songCount == 1) "" else "s"} " +
+                        "in this folder. Add it to your library?",
+                )
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        val path = pending.path
+                        pendingFolderAdd = null
+                        coroutineScope.launch {
+                            container.folderExclusion.addManualFolder(path)
+                            LibraryCache.invalidate(ctx)
+                            rawSongs = LibraryCache.loadOrScan(ctx, force = true)
+                            container.library.value = songs
+                            container.recommendationCache.precomputeNow(reason = "folder_add")
+                            container.toaster.show("Folder added to library")
+                        }
+                    },
+                ) { androidx.compose.material3.Text("Add") }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { pendingFolderAdd = null }) {
+                    androidx.compose.material3.Text("Cancel")
+                }
+            },
+        )
+    }
+
+    AnimatedVisibility(visible = overlay is Overlay.Folders,
+        enter = slideInVertically(initialOffsetY = { it }),
+        exit = slideOutVertically(targetOffsetY = { it })) {
+        FoldersScreen(
+            folders = container.folderExclusion.allFolders(rawSongs, manualFolderPaths, excludedFolderPaths),
+            onBack = { overlay = Overlay.None },
+            onExcludeFolder = { path ->
+                coroutineScope.launch {
+                    container.folderExclusion.setExcluded(path, true)
+                    // songs derived state auto-updates; resync recommendation queue
+                    container.recommendationCache.precomputeNow(reason = "folder_exclude")
+                }
+            },
+            onIncludeFolder = { path ->
+                coroutineScope.launch {
+                    container.folderExclusion.setExcluded(path, false)
+                    // Reset taste and history signals for songs in the re-included folder
+                    // so they start fresh in recommendations and avoid stale bias
+                    val targets = rawSongs.filter {
+                        it.filePath?.let { fp -> java.io.File(fp).parent } == path
+                    }
+                    targets.forEach { s ->
+                        container.taste.resetSignalForSong(s.filename)
+                        container.history.resetStatsForSong(s.filename)
+                    }
+                    container.recommendationCache.precomputeNow(reason = "folder_include")
+                }
+            },
+            onAddFolder = { folderPickerLauncher.launch(null) },
         )
     }
 
@@ -2612,7 +2817,7 @@ private fun AppRoot(container: AppContainer) {
             try {
                 container.embeddingDb.relinkLibraryPaths(songs)
                 val hashMap = container.embeddingDb.contentHashByFilepath()
-                songs = container.embeddingDb.enrichSongsWithHashes(songs, hashMap)
+                rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                 container.library.value = songs
                 container.embeddingDb.prewarmFromLibrary(songs)
             } catch (t: Throwable) {
@@ -2758,7 +2963,7 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Scanning library…")
                 container.embedding.logBuffer.append("rescan", "started (library=$beforeSongs, embedded=$beforeEmbedded)")
                 coroutineScope.launch {
-                    songs = LibraryCache.invalidate(ctx)
+                    rawSongs = LibraryCache.invalidate(ctx)
                     // Push #47: rescan also refreshes the embeddedFilenames
                     // set so the pending list reflects newly-recorded
                     // songs in the DB (e.g. after a batch finished while
@@ -3206,7 +3411,8 @@ private fun AppRoot(container: AppContainer) {
                 androidx.compose.animation.slideOutVertically { -it / 2 },
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(top = 56.dp, end = 12.dp, start = 12.dp),
+                .safeDrawingPadding()
+                .padding(top = 8.dp, end = 12.dp, start = 12.dp),
         ) {
             val msg = currentToast ?: ""
             Box(
@@ -3674,7 +3880,13 @@ private fun fallbackShuffleQueue(library: List<Song>, current: Song, k: Int): Li
 
 @Composable
 private fun PermissionGateUi(onRequest: () -> Unit, onOpenSettings: () -> Unit) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
             modifier = Modifier.fillMaxWidth()) {
@@ -3711,7 +3923,13 @@ private fun NotificationsPermissionGateUi(
     onOpenSettings: () -> Unit,
     onSkip: () -> Unit,
 ) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
@@ -3752,7 +3970,13 @@ private fun NotificationsPermissionGateUi(
 
 @Composable
 private fun ErrorPanel(msg: String) {
-    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
         Text(text = "Library scan failed: $msg",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.error)

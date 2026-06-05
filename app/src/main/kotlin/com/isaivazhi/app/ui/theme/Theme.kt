@@ -41,6 +41,10 @@ fun IsaiVazhiTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
+            // Keep content below the status bar on older devices (e.g. Pixel 3 XL /
+            // API 31) where Compose window insets can report 0 while the window
+            // still draws behind the system bars.
+            WindowCompat.setDecorFitsSystemWindows(window, true)
             window.statusBarColor = colorScheme.background.toArgb()
             window.navigationBarColor = colorScheme.background.toArgb()
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false

@@ -247,6 +247,8 @@ class AppContainer(private val appContext: Context) {
     val library: kotlinx.coroutines.flow.MutableStateFlow<List<Song>> =
         kotlinx.coroutines.flow.MutableStateFlow(emptyList())
 
+    val folderExclusion: FolderExclusionEngine by lazy { FolderExclusionEngine(appContext) }
+
     /**
      * Bugfix 2026-06-01d: process-lifetime scope for engines that must
      * keep working after MainActivity is destroyed (lockscreen precompute,
