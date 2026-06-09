@@ -97,13 +97,6 @@ fun AiManagementScreen(
     onReembedAll: () -> Unit,
     onRescanLibrary: () -> Unit,
     onStop: () -> Unit,
-    // Push #46: explicit user-triggered backup of the embeddings DB
-    // into a portable local_embeddings.json file. Useful right before
-    // a reinstall — the user copies the JSON off the device and
-    // re-imports it on the new install.
-    onExportBackup: () -> Unit = {},
-    exportBackupInProgress: Boolean = false,
-    exportBackupStatus: String? = null,
     // Push #49: filenames present in the embeddings DB but missing from
     // the current MediaStore library (file deleted / renamed / imported
     // from another install). Surfaced under the "Stale" stat — tapping
@@ -309,9 +302,6 @@ fun AiManagementScreen(
                     onEmbedPending = { showEmbedPendingConfirm = true },
                     onStop = onStop,
                     onRescan = { showRescanConfirm = true },
-                    onExportBackup = onExportBackup,
-                    exportBackupInProgress = exportBackupInProgress,
-                    exportBackupStatus = exportBackupStatus,
                 )
             }
 
@@ -1321,9 +1311,6 @@ private fun TopActionBar(
     onEmbedPending: () -> Unit,
     onStop: () -> Unit,
     onRescan: () -> Unit,
-    onExportBackup: () -> Unit,
-    exportBackupInProgress: Boolean = false,
-    exportBackupStatus: String? = null,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -1397,85 +1384,13 @@ private fun TopActionBar(
             }
         }
         Spacer(Modifier.height(8.dp))
-        var showExportInfo by remember { mutableStateOf(false) }
-        Row(
+        TextButton(
+            onClick = onRescan,
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            TextButton(
-                onClick = onRescan,
-                modifier = Modifier.weight(1f),
-                enabled = !exportBackupInProgress,
-            ) {
-                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("Scan library", style = MaterialTheme.typography.labelMedium)
-            }
-            Row(
-                modifier = Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-            ) {
-                TextButton(
-                    onClick = onExportBackup,
-                    enabled = !exportBackupInProgress,
-                ) {
-                    Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        if (exportBackupInProgress) "Exporting…"
-                        else "Export embeddings",
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                }
-                IconButton(
-                    onClick = { showExportInfo = true },
-                    modifier = Modifier.size(32.dp),
-                ) {
-                    Icon(
-                        Icons.Filled.Info,
-                        contentDescription = "About export",
-                        modifier = Modifier.size(18.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-        if (exportBackupInProgress || !exportBackupStatus.isNullOrBlank()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp, start = 4.dp, end = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (exportBackupInProgress) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp,
-                    )
-                    Spacer(Modifier.width(10.dp))
-                }
-                Text(
-                    text = exportBackupStatus ?: "Export in progress…",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-        }
-        if (showExportInfo) {
-            AlertDialog(
-                onDismissRequest = { showExportInfo = false },
-                title = { Text("Export embeddings") },
-                text = {
-                    Text(
-                        "Saves every AI vector to isaivazhi_embeddings.bin on your device. " +
-                            "After reinstall, use Settings → Import to restore without re-embedding."
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = { showExportInfo = false }) { Text("OK") }
-                },
-            )
+            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("Scan library", style = MaterialTheme.typography.labelMedium)
         }
     }
 }

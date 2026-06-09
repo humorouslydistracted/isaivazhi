@@ -232,6 +232,16 @@ class AppContainer(private val appContext: Context) {
 
     val recommender: Recommender by lazy { Recommender(embeddingDb) }
 
+    /**
+     * Persisted record of songs the algorithm recently placed in Up Next.
+     * Used to suppress re-surfacing within a 6-hour cooldown window so the
+     * 1500-song library gets better rotation. Manual user taps are never
+     * recorded here — only algorithm-generated queues.
+     */
+    val recentlySurfacedTracker: RecentlySurfacedTracker by lazy {
+        RecentlySurfacedTracker(appContext)
+    }
+
     val embedding: EmbeddingEngine by lazy {
         EmbeddingEngine(appContext, embeddingDb, toaster, preferences)
     }
@@ -290,6 +300,7 @@ class AppContainer(private val appContext: Context) {
         signalTimeline.clear()
         session.reset()
         activityLog.clear()
+        recentlySurfacedTracker.clear()
         // Push #66: clear the transitions history buffer + pending evidence
         // so cold-start reconciliation doesn't replay pre-reset listens.
         com.isaivazhi.app.Media3PlaybackService.clearRecentTransitionsStatic(appContext)

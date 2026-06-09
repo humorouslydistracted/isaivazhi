@@ -60,6 +60,7 @@ fun MiniPlayer(
     state: PlaybackEngine.PlaybackState,
     positionMs: Long,
     durationMs: Long,
+    controllerReady: Boolean = true,
     currentSongFilePath: String?,
     isFavorite: Boolean,
     isDisliked: Boolean,
@@ -203,11 +204,15 @@ fun MiniPlayer(
                 )
             }
             // Play/Pause (primary, larger — center slot)
-            IconButton(onClick = onTogglePause) {
+            IconButton(
+                onClick = onTogglePause,
+                enabled = controllerReady,
+            ) {
                 Icon(
                     imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = if (state.isPlaying) "Pause" else "Play",
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = if (controllerReady) MaterialTheme.colorScheme.primary
+                           else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(34.dp),
                 )
             }
@@ -276,12 +281,20 @@ private fun DraggableProgress(
 ) {
     val dur = durationMs.coerceAtLeast(0L)
     var dragValue by remember { mutableStateOf<Float?>(null) }
-    val livePos = positionMs.coerceIn(0L, dur.coerceAtLeast(1L))
+    // When duration is unknown, avoid clamping a real position to 1 ms (thumb
+    // at far right while label still reads 0:00).
+    val effectiveDur = if (dur > 0L) dur else positionMs.coerceAtLeast(0L)
+    val sliderMax = effectiveDur.coerceAtLeast(1L)
+    val livePos = if (dur > 0L) {
+        positionMs.coerceIn(0L, dur)
+    } else {
+        positionMs.coerceAtLeast(0L)
+    }
     val sliderValue = dragValue ?: livePos.toFloat()
     // Show the in-progress drag time in the start label, otherwise the
     // live position so the user sees the seekbar position update as
     // they drag.
-    val displayedPositionMs: Long = (dragValue?.toLong() ?: livePos).coerceIn(0L, dur.coerceAtLeast(1L))
+    val displayedPositionMs: Long = (dragValue?.toLong() ?: livePos).coerceIn(0L, sliderMax)
 
     Row(
         modifier = Modifier
@@ -302,7 +315,7 @@ private fun DraggableProgress(
                 dragValue?.let { onSeek(it.toLong()) }
                 dragValue = null
             },
-            valueRange = 0f..(dur.coerceAtLeast(1L).toFloat()),
+            valueRange = 0f..sliderMax.toFloat(),
             interactionSource = interactionSource,
             modifier = Modifier
                 .weight(1f)

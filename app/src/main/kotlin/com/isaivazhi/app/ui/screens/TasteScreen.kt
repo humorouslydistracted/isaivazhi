@@ -664,7 +664,7 @@ private fun TuningRow(
                 drag = null
             },
             valueRange = 0f..1f,
-            steps = 19,
+            steps = 9,
             interactionSource = interactionSource,
             modifier = Modifier
                 .weight(1f)

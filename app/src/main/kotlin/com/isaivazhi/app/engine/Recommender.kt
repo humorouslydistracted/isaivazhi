@@ -1,6 +1,7 @@
 package com.isaivazhi.app.engine
 
 import com.isaivazhi.app.NativeAccelerator
+import kotlin.math.pow
 import kotlin.math.sqrt
 import java.util.Random as JavaRandom
 
@@ -12,13 +13,19 @@ import java.util.Random as JavaRandom
  * fallback) for the top-K relevance step, then an MMR rerank applies
  * diversity penalty `(1 - lambda) * maxRedundancy` over a 3K candidate set.
  *
- * `lambda = 1 - adventurous`:
+ * `lambda = (1 - adventurous)^1.5` (power-curve mapping):
  *   - adventurous=0.0 → lambda=1.0 → pure relevance, top-K = first K by sim
- *   - adventurous=0.8 (default) → lambda=0.2 → 80% diversity penalty
+ *   - adventurous=0.8 (default) → lambda≈0.089 (was 0.20 with linear mapping)
  *   - adventurous=1.0 → lambda=0.0 → pure diversity (sim ignored)
  *
- * The same formula the Capacitor build settled on in batch #3 (after the
- * earlier inversion was caught).
+ * The 1.5 exponent keeps the boundary semantics intact while making the
+ * 0.70–0.85 practical range less sensitive: a 5% slider move changes lambda
+ * by ~0.03–0.04 instead of a flat 0.05, reducing the drastic reshuffling
+ * users observed with the original linear mapping.
+ *
+ * The original formula the Capacitor build settled on in batch #3 (after
+ * the earlier inversion was caught) was linear; the power curve was added
+ * to fix slider over-sensitivity without changing the conceptual range.
  */
 class Recommender(
     private val embeddingDb: EmbeddingDbFacade,
@@ -230,7 +237,7 @@ class Recommender(
         // building it via [buildBlendedVec].
         blendedQueryVec: FloatArray? = null,
     ): List<Song> {
-        val lambda = (1f - adventurous).coerceIn(0f, 1f)
+        val lambda = (1f - adventurous).coerceIn(0f, 1f).pow(1.5f)
         val policyExcludes = RecommendationPolicy.unionExcludes(
             hardBlockedFilenames, softExcludedFilenames, dislikedFilenames,
         )

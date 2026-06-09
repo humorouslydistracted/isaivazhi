@@ -28,8 +28,15 @@ data class FolderEntry(
  *
  * Filtering is pure (stateless) — callers pass the current excluded set so the
  * logic can run on any coroutine dispatcher without holding stale state.
+ *
+ * Paths are normalized before persistence and matched with suffix fallback so
+ * exclusions survive library rescans after app updates (MediaStore path drift).
  */
 class FolderExclusionEngine(private val appContext: Context) {
+
+    companion object {
+        private const val SUFFIX_MATCH_MIN_SEGMENTS = 2
+    }
 
     private val KEY_EXCLUDED = stringPreferencesKey("excluded_folder_paths_v1")
     private val KEY_MANUAL = stringPreferencesKey("manual_folder_paths_v1")
@@ -39,11 +46,11 @@ class FolderExclusionEngine(private val appContext: Context) {
     // ---------------------------------------------------------------------------
 
     val excludedPaths: Flow<Set<String>> = appContext.dataStoreLocal.data.map { prefs ->
-        prefs[KEY_EXCLUDED]?.split('\n')?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+        parsePathSet(prefs[KEY_EXCLUDED])
     }
 
     val manualPaths: Flow<Set<String>> = appContext.dataStoreLocal.data.map { prefs ->
-        prefs[KEY_MANUAL]?.split('\n')?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+        parsePathSet(prefs[KEY_MANUAL])
     }
 
     // ---------------------------------------------------------------------------
@@ -51,34 +58,71 @@ class FolderExclusionEngine(private val appContext: Context) {
     // ---------------------------------------------------------------------------
 
     suspend fun setExcluded(folderPath: String, excluded: Boolean) {
+        val target = normalizeFolderPath(folderPath)
+        if (target.isBlank()) return
         appContext.dataStoreLocal.edit { prefs ->
-            val current = prefs[KEY_EXCLUDED]?.split('\n')?.filter { it.isNotBlank() }
-                ?.toMutableSet() ?: mutableSetOf()
-            if (excluded) current.add(folderPath) else current.remove(folderPath)
+            val current = parsePathSet(prefs[KEY_EXCLUDED]).toMutableSet()
+            if (excluded) {
+                current.removeAll { matchesSameFolder(it, target) }
+                current.add(target)
+            } else {
+                current.removeAll { matchesSameFolder(it, target) }
+            }
             prefs[KEY_EXCLUDED] = current.joinToString("\n")
         }
     }
 
     suspend fun addManualFolder(path: String) {
+        val normalized = normalizeFolderPath(path)
+        if (normalized.isBlank()) return
         appContext.dataStoreLocal.edit { prefs ->
-            val current = prefs[KEY_MANUAL]?.split('\n')?.filter { it.isNotBlank() }
-                ?.toMutableSet() ?: mutableSetOf()
-            current.add(path)
+            val current = parsePathSet(prefs[KEY_MANUAL]).toMutableSet()
+            current.add(normalized)
             prefs[KEY_MANUAL] = current.joinToString("\n")
         }
     }
 
     suspend fun removeManualFolder(path: String) {
+        val normalized = normalizeFolderPath(path)
         appContext.dataStoreLocal.edit { prefs ->
-            val current = prefs[KEY_MANUAL]?.split('\n')?.filter { it.isNotBlank() }
-                ?.toMutableSet() ?: mutableSetOf()
-            current.remove(path)
+            val current = parsePathSet(prefs[KEY_MANUAL]).toMutableSet()
+            current.removeAll { matchesSameFolder(it, normalized) }
             prefs[KEY_MANUAL] = current.joinToString("\n")
-            // Also un-exclude it so re-adding later starts clean
-            val excl = prefs[KEY_EXCLUDED]?.split('\n')?.filter { it.isNotBlank() }
-                ?.toMutableSet() ?: mutableSetOf()
-            excl.remove(path)
+            val excl = parsePathSet(prefs[KEY_EXCLUDED]).toMutableSet()
+            excl.removeAll { matchesSameFolder(it, normalized) }
             prefs[KEY_EXCLUDED] = excl.joinToString("\n")
+        }
+    }
+
+    /**
+     * Remap stored excluded paths to the current library's parent directories.
+     * Called after each library load/rescan so exclusions survive path drift
+     * across Play Store updates (e.g. /storage/emulated/0/... vs /sdcard/...).
+     */
+    suspend fun reconcileExcludedPaths(currentParentPaths: Set<String>) {
+        val stored = excludedPathsSnapshot()
+        if (stored.isEmpty()) return
+        val reconciled = mutableSetOf<String>()
+        var changed = false
+        for (old in stored) {
+            val match = findMatchingCurrentPath(old, currentParentPaths)
+            when {
+                match != null -> {
+                    val normalized = normalizeFolderPath(match)
+                    reconciled.add(normalized)
+                    if (normalizeFolderPath(old) != normalized) changed = true
+                }
+                else -> {
+                    val normalized = normalizeFolderPath(old)
+                    reconciled.add(normalized)
+                    if (old != normalized) changed = true
+                }
+            }
+        }
+        val deduped = reconciled.toSet()
+        val storedNormalized = stored.map { normalizeFolderPath(it) }.toSet()
+        if (changed || deduped != storedNormalized) {
+            persistExcluded(deduped)
         }
     }
 
@@ -93,7 +137,7 @@ class FolderExclusionEngine(private val appContext: Context) {
         if (excluded.isEmpty()) return songs
         return songs.filter { song ->
             val parent = song.filePath?.let { File(it).parent } ?: return@filter true
-            parent !in excluded
+            !isPathExcluded(parent, excluded)
         }
     }
 
@@ -101,13 +145,13 @@ class FolderExclusionEngine(private val appContext: Context) {
      * Builds the merged folder list for the Folders screen.
      * Auto-discovered folders come from the song library; manual paths are
      * overlaid so a user-added folder appears even if the rescan hasn't run yet.
+     * Orphan excluded paths (stored but not in current scan) are also shown.
      */
     fun allFolders(
         autoSongs: List<Song>,
         manualPaths: Set<String>,
         excluded: Set<String>,
     ): List<FolderEntry> {
-        // Count songs per parent directory
         val counts = mutableMapOf<String, Int>()
         for (song in autoSongs) {
             val parent = song.filePath?.let { File(it).parent } ?: continue
@@ -116,30 +160,40 @@ class FolderExclusionEngine(private val appContext: Context) {
 
         val result = mutableMapOf<String, FolderEntry>()
 
-        // Auto-discovered
         for ((path, count) in counts) {
             result[path] = FolderEntry(
                 path = path,
                 displayName = File(path).name.ifBlank { path },
                 songCount = count,
-                isExcluded = path in excluded,
-                isManual = false,
+                isExcluded = isPathExcluded(path, excluded),
+                isManual = manualPaths.any { matchesSameFolder(it, path) },
             )
         }
 
-        // Manual paths overlay (mark isManual; update count if songs found there)
         for (path in manualPaths) {
-            val existing = result[path]
+            val existing = result.entries.firstOrNull { matchesSameFolder(it.key, path) }
             if (existing != null) {
-                result[path] = existing.copy(isManual = true)
+                result[existing.key] = existing.value.copy(isManual = true)
             } else {
-                // Folder was added manually but no songs scanned yet (e.g., first add before rescan)
                 result[path] = FolderEntry(
                     path = path,
                     displayName = File(path).name.ifBlank { path },
                     songCount = 0,
-                    isExcluded = path in excluded,
+                    isExcluded = isPathExcluded(path, excluded),
                     isManual = true,
+                )
+            }
+        }
+
+        for (path in excluded) {
+            val represented = result.keys.any { matchesSameFolder(it, path) }
+            if (!represented) {
+                result[path] = FolderEntry(
+                    path = path,
+                    displayName = File(path).name.ifBlank { path },
+                    songCount = 0,
+                    isExcluded = true,
+                    isManual = manualPaths.any { matchesSameFolder(it, path) },
                 )
             }
         }
@@ -147,22 +201,70 @@ class FolderExclusionEngine(private val appContext: Context) {
         return result.values.sortedBy { it.displayName.lowercase() }
     }
 
-    /**
-     * Total number of distinct source folders in [songs]. Used for the Settings
-     * summary line before the Folders screen is opened.
-     */
     fun folderCount(songs: List<Song>): Int =
         songs.mapNotNull { it.filePath?.let { p -> File(p).parent } }.toSet().size
+
+    // ---------------------------------------------------------------------------
+    // Path normalization + matching
+    // ---------------------------------------------------------------------------
+
+    fun normalizeFolderPath(path: String): String {
+        val cleaned = path.trim().replace('\\', '/').trimEnd('/')
+        if (cleaned.isBlank()) return cleaned
+        return runCatching { File(cleaned).canonicalFile.absolutePath }
+            .getOrElse { cleaned }
+    }
+
+    private fun pathSuffix(path: String, minSegments: Int = SUFFIX_MATCH_MIN_SEGMENTS): String? {
+        val norm = normalizeFolderPath(path)
+        val parts = norm.split('/').filter { it.isNotBlank() }
+        if (parts.size < minSegments) return null
+        return parts.takeLast(minSegments).joinToString("/")
+    }
+
+    private fun matchesSameFolder(a: String, b: String): Boolean {
+        val normA = normalizeFolderPath(a)
+        val normB = normalizeFolderPath(b)
+        if (normA == normB) return true
+        val suffixA = pathSuffix(normA) ?: return false
+        val suffixB = pathSuffix(normB) ?: return false
+        return suffixA == suffixB
+    }
+
+    private fun isPathExcluded(path: String, excluded: Set<String>): Boolean {
+        if (excluded.isEmpty()) return false
+        return excluded.any { matchesSameFolder(it, path) }
+    }
+
+    private fun findMatchingCurrentPath(stored: String, currentParents: Set<String>): String? {
+        val normStored = normalizeFolderPath(stored)
+        currentParents.firstOrNull { normalizeFolderPath(it) == normStored }?.let { return it }
+        val suffix = pathSuffix(normStored) ?: return null
+        val matches = currentParents.filter { pathSuffix(it) == suffix }
+        return matches.singleOrNull() ?: matches.firstOrNull()
+    }
+
+    private fun parsePathSet(raw: String?): Set<String> =
+        raw?.split('\n')
+            ?.filter { it.isNotBlank() }
+            ?.map { normalizeFolderPath(it) }
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            ?: emptySet()
+
+    private suspend fun persistExcluded(paths: Set<String>) {
+        appContext.dataStoreLocal.edit { prefs ->
+            prefs[KEY_EXCLUDED] = paths.joinToString("\n")
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // Snapshot read (for use outside Compose)
     // ---------------------------------------------------------------------------
 
     suspend fun excludedPathsSnapshot(): Set<String> =
-        appContext.dataStoreLocal.data.first()[KEY_EXCLUDED]
-            ?.split('\n')?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+        parsePathSet(appContext.dataStoreLocal.data.first()[KEY_EXCLUDED])
 
     suspend fun manualPathsSnapshot(): Set<String> =
-        appContext.dataStoreLocal.data.first()[KEY_MANUAL]
-            ?.split('\n')?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+        parsePathSet(appContext.dataStoreLocal.data.first()[KEY_MANUAL])
 }

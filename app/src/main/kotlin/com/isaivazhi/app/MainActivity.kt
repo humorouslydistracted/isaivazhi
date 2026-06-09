@@ -124,6 +124,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
 private enum class Tab(val title: String) {
@@ -452,6 +453,15 @@ private fun AppRoot(container: AppContainer) {
     LaunchedEffect(songs) {
         if (songs.isNotEmpty()) container.library.value = songs
     }
+    // Realign stored folder exclusions to current scan paths after library
+    // load/rescan (Play Store updates often change MediaStore DATA paths).
+    LaunchedEffect(rawSongs) {
+        if (rawSongs.isEmpty()) return@LaunchedEffect
+        val parents = rawSongs.mapNotNull { song ->
+            song.filePath?.let { java.io.File(it).parent }
+        }.toSet()
+        container.folderExclusion.reconcileExcludedPaths(parents)
+    }
     var scanError by remember { mutableStateOf<String?>(null) }
     // Phase 4 (2026-06-01): pager starts on Songs (index 0 after Discover
     // removal). A LaunchedEffect below restores the persisted last tab on
@@ -578,6 +588,7 @@ private fun AppRoot(container: AppContainer) {
     // the mini player slider + Now Playing scrub bar consume these.
     val livePositionMs by container.playback.livePosition.collectAsState()
     val liveDurationMs by container.playback.liveDuration.collectAsState()
+    val controllerReady by container.playback.controllerReady.collectAsState()
 
     // Push #44: replaced Material 3 SnackbarHost (bottom-center, ~4 s
     // suspending) with a custom top-end overlay. The previous setup
@@ -864,6 +875,51 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
+    val exportEmbeddingsBackup: () -> Unit = {
+        if (exportBackupInProgress) {
+            container.toaster.show("Export already in progress…")
+        } else {
+            exportBackupInProgress = true
+            val rowHint = embeddingsRowCount ?: 0
+            exportBackupStatus = "Preparing backup — reading $rowHint embeddings…"
+            container.embedding.logBuffer.append("backup", "manual export started")
+            coroutineScope.launch {
+                try {
+                    val splits = container.preferences.getEmbeddingSplitCount()
+                    val res = runCatching {
+                        container.embeddingDb.exportEmbeddingsBin(splits)
+                    }.getOrNull()
+                    val rows = res?.optInt("rowCount", 0) ?: 0
+                    val bytes = res?.optLong("bytes", 0L) ?: 0L
+                    val mbStr = "%.1f".format(bytes / 1024.0 / 1024.0)
+                    if (res == null || rows <= 0) {
+                        exportBackupStatus = "Export failed — no embeddings in database"
+                        container.toaster.show("Backup failed — no embeddings to export")
+                        container.embedding.logBuffer.append("backup", "manual export FAILED")
+                        exportBackupInProgress = false
+                        kotlinx.coroutines.delay(3000)
+                        exportBackupStatus = null
+                        return@launch
+                    }
+                    container.embedding.logBuffer.append(
+                        "backup",
+                        "manual export complete — $rows rows, $bytes bytes ($mbStr MB)",
+                    )
+                    exportBackupStatus = "Ready — choose where to save ($rows songs, $mbStr MB)"
+                    exportSaveLauncher.launch(EmbeddingsImport.BIN_FILENAME)
+                } catch (t: Throwable) {
+                    val err = t.message ?: t.javaClass.simpleName
+                    exportBackupStatus = "Export failed: $err"
+                    container.toaster.show("Export failed: $err")
+                    container.embedding.logBuffer.append("backup", "manual export FAILED: $err")
+                    exportBackupInProgress = false
+                    kotlinx.coroutines.delay(3000)
+                    exportBackupStatus = null
+                }
+            }
+        }
+    }
+
     // Pending result from the SAF folder picker — used to show the "Found N songs" confirm dialog
     data class PendingFolderAdd(val path: String, val displayName: String, val songCount: Int)
     var pendingFolderAdd by remember { mutableStateOf<PendingFolderAdd?>(null) }
@@ -934,7 +990,16 @@ private fun AppRoot(container: AppContainer) {
                     message = "LibraryCache.loadOrScan start",
                     data = mapOf("permissionGranted" to permission.granted),
                 )
-                rawSongs = LibraryCache.loadOrScan(ctx)
+                // Fix 1A: reuse the library already loaded by IsaiVazhiApp.onCreate()
+                // warmup if available, avoiding a redundant MediaStore scan that
+                // can cost 1-5s on a cold process start.
+                val preloaded = container.library.value
+                rawSongs = if (preloaded.isNotEmpty()) {
+                    preloaded
+                } else {
+                    val scanned = LibraryCache.loadOrScan(ctx)
+                    if (scanned.isEmpty()) LibraryCache.loadOrScan(ctx, force = true) else scanned
+                }
                 if (rawSongs.isEmpty()) {
                     rawSongs = LibraryCache.loadOrScan(ctx, force = true)
                 }
@@ -1110,15 +1175,61 @@ private fun AppRoot(container: AppContainer) {
 
     LaunchedEffect(songs) {
         if (songs.isEmpty()) return@LaunchedEffect
+        // Playback recovery runs FIRST so early play/pause taps cannot race
+        // prepareForResume (which was previously blocked behind engine loads).
+        val resumeSnap = container.preferences.snapshot()
+        val resumePositionMs = resumeSnap.positionMs
+        try {
+            val svc = com.isaivazhi.app.Media3PlaybackService.INSTANCE
+            val svcMediaId = svc?.getCurrentMediaIdSnapshot() ?: ""
+            val svcInstId = svc?.getCurrentPlaybackInstanceId() ?: 0L
+            if (svc != null && svcMediaId.isNotBlank() && svcInstId > 0L) {
+                val svcPos = svc.getCurrentPositionMsSnapshot()
+                android.util.Log.i(
+                    "MainActivity",
+                    "cold-start: service alive at mediaId=$svcMediaId instId=$svcInstId pos=${svcPos}ms — " +
+                        "skipping prepareForResume (DataStore had mediaId=${resumeSnap.mediaId} pos=${resumePositionMs}ms)"
+                )
+                container.playback.syncStateFromController(songs)
+            } else {
+                val mediaId = resumeSnap.mediaId
+                if (mediaId == null) {
+                    container.playback.markPlaybackRecoveryComplete()
+                } else {
+                    val queue = if (resumeSnap.queueFilenames.isNotEmpty()) {
+                        resumeSnap.queueFilenames.mapNotNull { fn -> songs.firstOrNull { it.filename == fn } }
+                    } else {
+                        songs.firstOrNull { it.filename == mediaId }?.let { listOf(it) } ?: emptyList()
+                    }
+                    if (queue.isEmpty()) {
+                        container.playback.markPlaybackRecoveryComplete()
+                    } else {
+                        val resolvedIndex = queue.indexOfFirst { it.filename == mediaId }.coerceAtLeast(0)
+                        android.util.Log.i(
+                            "MainActivity",
+                            "cold-start: service NOT alive — rebuilding from DataStore mediaId=$mediaId pos=${resumePositionMs}ms idx=$resolvedIndex"
+                        )
+                        container.playback.prepareForResume(queue, resolvedIndex, resumePositionMs)
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "cold-start prepare failed: ${t.message}")
+            container.playback.markPlaybackRecoveryComplete()
+        }
         // Engine state loads from DataStore asynchronously. Recovery writes
         // must wait for those loads; otherwise the load coroutine can replace
         // freshly-recovered Taste/History/Timeline state with stale disk state.
-        container.taste.awaitReady()
-        container.signalTimeline.awaitReady()
-        container.history.awaitReady()
-        container.activityLog.awaitReady()
-        container.favorites.awaitReady()
-        container.disliked.awaitReady()
+        // Fix 1B: all 6 engines read from independent DataStore keys — run them
+        // in parallel so total wait = max(loads) instead of Σ(loads).
+        coroutineScope {
+            launch { container.taste.awaitReady() }
+            launch { container.signalTimeline.awaitReady() }
+            launch { container.history.awaitReady() }
+            launch { container.activityLog.awaitReady() }
+            launch { container.favorites.awaitReady() }
+            launch { container.disliked.awaitReady() }
+        }
         container.reconcileNotificationFavoriteStorage()
         container.reconcileCapacitorDislikedStorage()
         container.reconcileManualTasteFlags()
@@ -1256,52 +1367,6 @@ private fun AppRoot(container: AppContainer) {
             if (svcSnapshot != null) sp.edit().clear().apply()
         } catch (t: Throwable) {
             android.util.Log.w("MainActivity", "pending evidence reconciliation failed: ${t.message}")
-        }
-        try {
-            // Push #71: BEFORE calling prepareForResume (which destructively
-            // replaces Media3's queue), check whether the service is alive
-            // and already has an active playback session. If yes, the
-            // service's state is the source of truth — background headphone
-            // skips, auto-advances, queue manipulations all happened on the
-            // service while the Activity was destroyed. Calling
-            // prepareForResume with the Activity's stale DataStore values
-            // would CLOBBER the service's current track (the bug the user
-            // reported: "Kanne Kanne restarted from middle after I used
-            // headphone skip in background").
-            val svc = com.isaivazhi.app.Media3PlaybackService.INSTANCE
-            val svcMediaId = svc?.getCurrentMediaIdSnapshot() ?: ""
-            val svcInstId = svc?.getCurrentPlaybackInstanceId() ?: 0L
-            if (svc != null && svcMediaId.isNotBlank() && svcInstId > 0L) {
-                val svcPos = svc.getCurrentPositionMsSnapshot()
-                val snap = container.preferences.snapshot()
-                android.util.Log.i(
-                    "MainActivity",
-                    "cold-start: service alive at mediaId=$svcMediaId instId=$svcInstId pos=${svcPos}ms — " +
-                        "skipping prepareForResume (DataStore had mediaId=${snap.mediaId} pos=${snap.positionMs}ms)"
-                )
-                // Sync Activity state from the service's actual current
-                // state. The MediaController listener will keep it
-                // up-to-date going forward.
-                container.playback.syncStateFromController(songs)
-                return@LaunchedEffect
-            }
-            // Truly cold start: service is dead, no current session. Use
-            // the DataStore snapshot to rebuild the queue and seek to the
-            // saved position.
-            val snap = container.preferences.snapshot()
-            val mediaId = snap.mediaId ?: return@LaunchedEffect
-            val queue = if (snap.queueFilenames.isNotEmpty()) {
-                snap.queueFilenames.mapNotNull { fn -> songs.firstOrNull { it.filename == fn } }
-            } else listOf(songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect)
-            if (queue.isEmpty()) return@LaunchedEffect
-            val resolvedIndex = queue.indexOfFirst { it.filename == mediaId }.coerceAtLeast(0)
-            android.util.Log.i(
-                "MainActivity",
-                "cold-start: service NOT alive — rebuilding from DataStore mediaId=$mediaId pos=${snap.positionMs}ms idx=$resolvedIndex"
-            )
-            container.playback.prepareForResume(queue, resolvedIndex, snap.positionMs)
-        } catch (t: Throwable) {
-            android.util.Log.w("MainActivity", "cold-start prepare failed: ${t.message}")
         }
     }
 
@@ -1512,23 +1577,30 @@ private fun AppRoot(container: AppContainer) {
             val playNextSet = playbackState.playNextFilenames
             val byFn = songs.associateBy { it.filename }
             val playNextSongs = playNextSet.mapNotNull { byFn[it] }
+            val recentlySurfacedForCache = container.recentlySurfacedTracker.recentlySurfaced()
             val policyFilteredTail = com.isaivazhi.app.engine.RecommendationPolicy.filterSongsForUpNext(
                 cachedTail,
                 upNextPolicyExcludes,
             )
-            val finalUpcoming = playNextSongs + policyFilteredTail.filter {
-                it.filename !in playNextSet && it.filename != mediaId
+            val finalCacheTail = policyFilteredTail.filter {
+                it.filename !in playNextSet &&
+                    it.filename != mediaId &&
+                    it.filename !in recentlySurfacedForCache
             }
+            val finalUpcoming = playNextSongs + finalCacheTail
             container.activityLog.log(
                 category = "queue",
                 type = "REFRESH_CACHE_HIT",
-                message = "Served upcoming from RecommendationCache (size=${cachedTail.size}, afterPolicy=${policyFilteredTail.size})",
+                message = "Served upcoming from RecommendationCache (size=${cachedTail.size}, afterPolicy=${policyFilteredTail.size}, afterRecency=${finalCacheTail.size})",
                 data = mapOf(
                     "tailSize" to cachedTail.size,
                     "policyFilteredSize" to policyFilteredTail.size,
+                    "afterRecencySize" to finalCacheTail.size,
                     "mediaId" to mediaId,
                 ),
             )
+            // Record these algorithm-surfaced songs so they enter the cooldown window.
+            container.recentlySurfacedTracker.record(finalCacheTail.map { it.filename })
             container.toaster.show("Up Next refreshed")
             if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
                 newUpcoming = finalUpcoming,
@@ -1584,12 +1656,17 @@ private fun AppRoot(container: AppContainer) {
             }.getOrNull()
             blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
+            // Recency suppression: exclude songs the algorithm surfaced within
+            // the last 6 hours so recently queued tracks don't immediately
+            // resurface. Manual user taps are never recorded in this tracker.
+            val recentlySurfaced = container.recentlySurfacedTracker.recentlySurfaced()
+            val excludeFnsWithRecency = excludeFns + recentlySurfaced
             val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
                 runCatching {
                     container.recommender.recommendUpcoming(
                         current, songs, k = 50,
                         adventurous = tuning.adventurous,
-                        extraExcludeFilenames = excludeFns,
+                        extraExcludeFilenames = excludeFnsWithRecency,
                         hardBlockedFilenames = upNextHardBlocked,
                         dislikedFilenames = dislikedSet,
                         softExcludedFilenames = upNextSoftExcluded,
@@ -1597,9 +1674,11 @@ private fun AppRoot(container: AppContainer) {
                     )
                 }.getOrDefault(emptyList())
             } else {
-                songs.filter { it.filePath != null && it.filename !in excludeFns }
+                songs.filter { it.filePath != null && it.filename !in excludeFnsWithRecency }
                     .shuffled().take(50)
             }
+            // Record algorithm-surfaced songs so they enter the cooldown window.
+            container.recentlySurfacedTracker.record(newTail.map { it.filename })
             val recommendElapsedMs = android.os.SystemClock.elapsedRealtime() - recommendStartedAt
             container.activityLog.log(
                 category = "queue",
@@ -1714,6 +1793,10 @@ private fun AppRoot(container: AppContainer) {
             }.getOrNull()
             blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
+            // Recency suppression for the AI tail. The manually-tapped song
+            // is intentionally NOT excluded here (it was the user's choice)
+            // and won't appear in the tail anyway (it's position 0 / dropped).
+            val recentlySurfacedForTap = container.recentlySurfacedTracker.recentlySurfaced()
             val tail: List<Song> = if (recMode && hasEmbeddings) {
                 runCatching {
                     container.recommender.buildPlayQueue(
@@ -1721,6 +1804,7 @@ private fun AppRoot(container: AppContainer) {
                         library = songs,
                         k = 50,
                         adventurous = tuning.adventurous,
+                        extraExcludeFilenames = recentlySurfacedForTap,
                         hardBlockedFilenames = upNextHardBlocked,
                         dislikedFilenames = dislikedSet,
                         softExcludedFilenames = upNextSoftExcluded,
@@ -1735,6 +1819,10 @@ private fun AppRoot(container: AppContainer) {
                 songs.asSequence()
                     .filter { it.filePath != null && it.filename != song.filename }
                     .shuffled().take(50).toList()
+            }
+            // Record algorithm-surfaced tail songs (not the manually tapped song).
+            if (recMode && hasEmbeddings) {
+                container.recentlySurfacedTracker.record(tail.map { it.filename })
             }
             val buildMs = android.os.SystemClock.elapsedRealtime() - tapStart
             android.util.Log.i(
@@ -1897,7 +1985,8 @@ private fun AppRoot(container: AppContainer) {
             "QueueExhaust",
             "appending AI tail: ctx=$ctx queueSize=$queueSize mediaId=$mediaId"
         )
-        val excludeFns = playbackState.queueFilenames.toSet()
+        val recentlySurfacedForExhaust = container.recentlySurfacedTracker.recentlySurfaced()
+        val excludeFns = playbackState.queueFilenames.toSet() + recentlySurfacedForExhaust
         // Push #67: build a blended query vector that mixes the current
         // song with the session-listened rolling window and the long-
         // term profile centroid. This is the recommender's view of
@@ -1928,6 +2017,8 @@ private fun AppRoot(container: AppContainer) {
             )
         }.getOrDefault(emptyList())
         if (tail.isNotEmpty()) {
+            // Record algorithm-surfaced songs before appending.
+            container.recentlySurfacedTracker.record(tail.map { it.filename })
             container.playback.appendToQueue(tail)
             container.toaster.show("Up Next refreshed with recommendations (${blendedTriple?.third ?: "current"})")
         }
@@ -2097,6 +2188,7 @@ private fun AppRoot(container: AppContainer) {
                         state = playbackState,
                         positionMs = livePositionMs,
                         durationMs = liveDurationMs,
+                        controllerReady = controllerReady,
                         currentSongFilePath = currentSongFilePath,
                         isFavorite = isCurrentFavorite,
                         isDisliked = isCurrentDisliked,
@@ -2355,7 +2447,8 @@ private fun AppRoot(container: AppContainer) {
                                     val playNextSet = playbackState.playNextFilenames
                                     val byFn = songs.associateBy { it.filename }
                                     val playNextSongs = playNextSet.mapNotNull { byFn[it] }
-                                    val excludeFns = playNextSet + mediaId
+                                    val recentlySurfacedForToggle = container.recentlySurfacedTracker.recentlySurfaced()
+                                    val excludeFns = playNextSet + mediaId + recentlySurfacedForToggle
                                     // Push #72: AI/Shuffle toggle uses the
                                     // blended query vec (mode=refresh) so
                                     // recommendations reflect current+session
@@ -2388,6 +2481,7 @@ private fun AppRoot(container: AppContainer) {
                                         songs.filter { it.filePath != null && it.filename !in excludeFns }
                                             .shuffled().take(50)
                                     }
+                                    container.recentlySurfacedTracker.record(newTail.map { it.filename })
                                     val finalUpcoming = playNextSongs + newTail
                                     android.util.Log.i(
                                         "QueueOp",
@@ -2549,6 +2643,9 @@ private fun AppRoot(container: AppContainer) {
                 }
             },
             onBack = { overlay = Overlay.None },
+            onExportEmbeddings = exportEmbeddingsBackup,
+            exportInProgress = exportBackupInProgress,
+            exportStatus = exportBackupStatus,
             onReimportEmbeddings = {
                 if (!importInProgress) {
                     importLauncher.launch(arrayOf("application/json", "*/*"))
@@ -2994,53 +3091,6 @@ private fun AppRoot(container: AppContainer) {
                 container.toaster.show("Embedding stopped")
                 container.embedding.logBuffer.append("stop", "user stopped embedding")
             },
-            // Manual one-shot IVZ backup (isaivazhi_embeddings.bin).
-            onExportBackup = {
-                if (exportBackupInProgress) {
-                    container.toaster.show("Export already in progress…")
-                } else {
-                exportBackupInProgress = true
-                val rowHint = embeddingsRowCount ?: 0
-                exportBackupStatus = "Preparing backup — reading $rowHint embeddings…"
-                container.embedding.logBuffer.append("backup", "manual export started")
-                coroutineScope.launch {
-                    try {
-                        val splits = container.preferences.getEmbeddingSplitCount()
-                        val res = runCatching {
-                            container.embeddingDb.exportEmbeddingsBin(splits)
-                        }.getOrNull()
-                        val rows = res?.optInt("rowCount", 0) ?: 0
-                        val bytes = res?.optLong("bytes", 0L) ?: 0L
-                        val mbStr = "%.1f".format(bytes / 1024.0 / 1024.0)
-                        if (res == null || rows <= 0) {
-                            exportBackupStatus = "Export failed — no embeddings in database"
-                            container.toaster.show("Backup failed — no embeddings to export")
-                            container.embedding.logBuffer.append("backup", "manual export FAILED")
-                            exportBackupInProgress = false
-                            kotlinx.coroutines.delay(3000)
-                            exportBackupStatus = null
-                            return@launch
-                        }
-                        container.embedding.logBuffer.append(
-                            "backup",
-                            "manual export complete — $rows rows, $bytes bytes ($mbStr MB)",
-                        )
-                        exportBackupStatus = "Ready — choose where to save ($rows songs, $mbStr MB)"
-                        exportSaveLauncher.launch(EmbeddingsImport.BIN_FILENAME)
-                    } catch (t: Throwable) {
-                        val err = t.message ?: t.javaClass.simpleName
-                        exportBackupStatus = "Export failed: $err"
-                        container.toaster.show("Export failed: $err")
-                        container.embedding.logBuffer.append("backup", "manual export FAILED: $err")
-                        exportBackupInProgress = false
-                        kotlinx.coroutines.delay(3000)
-                        exportBackupStatus = null
-                    }
-                }
-                }
-            },
-            exportBackupInProgress = exportBackupInProgress,
-            exportBackupStatus = exportBackupStatus,
             // Push #51: Duplicates section wiring. Grouping is now
             // filepath-based (push #51 SQL change), play lookup goes
             // strictly through filepath — no filename fallback (the

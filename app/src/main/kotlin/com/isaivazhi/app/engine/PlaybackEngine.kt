@@ -162,6 +162,14 @@ class PlaybackEngine(
     private val _liveDuration = MutableStateFlow(0L)
     val liveDuration: StateFlow<Long> = _liveDuration.asStateFlow()
 
+    /** False until cold-start playback recovery completes (sync or prepareForResume). */
+    private val _controllerReady = MutableStateFlow(false)
+    val controllerReady: StateFlow<Boolean> = _controllerReady.asStateFlow()
+
+    fun markPlaybackRecoveryComplete() {
+        _controllerReady.value = true
+    }
+
     // 2026-06-01: emits when the lockscreen / notification Refresh-Up-Next
     // button is tapped. The UI process collects this and invokes the same
     // refreshUpcomingWithAI() lambda used by the in-app icons. Service-side
@@ -442,7 +450,22 @@ class PlaybackEngine(
                 queueIndex = newQueueIndex,
                 playNextFilenames = updatedPlayNext,
             )
-            // Reset live position/duration for the new track. duration may be
+            // Controller reconnect fires onMediaItemTransition for the current
+            // item — same mediaId, not a real track change. Refresh position
+            // from the service instead of resetting to 0 (seek bar flicker).
+            if (prevMediaId != null && prevMediaId == nextMediaId) {
+                val svc = serviceRef()
+                val pos = svc?.getCurrentPositionMsSnapshot()
+                    ?: ctrl?.currentPosition?.coerceAtLeast(0L)
+                    ?: _livePosition.value
+                val dur = svc?.getCurrentDurationMsSnapshot()
+                    ?: ctrl?.duration?.takeIf { it > 0 }
+                    ?: _liveDuration.value
+                _livePosition.value = pos
+                _liveDuration.value = dur
+                return
+            }
+            // Reset live position/duration for a new track. duration may be
             // unknown until Media3 reports it via onMediaMetadataChanged or
             // the next poll tick.
             _livePosition.value = 0L
@@ -575,8 +598,33 @@ class PlaybackEngine(
             }
             ctrl.addListener(playerListener)
             controller = ctrl
+            hydrateLiveStateFromService(ctrl)
             startPositionPoll()
             ctrl
+        }
+    }
+
+    /** Seed position/duration/play state from the durable service snapshot. */
+    private fun hydrateLiveStateFromService(ctrl: MediaController) {
+        val svc = serviceRef()
+        val pos = svc?.getCurrentPositionMsSnapshot()
+            ?: runCatching { ctrl.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
+        val dur = svc?.getCurrentDurationMsSnapshot()
+            ?: runCatching { ctrl.duration.takeIf { it > 0 } ?: 0L }.getOrDefault(0L)
+        val playWhenReady = runCatching { ctrl.playWhenReady }.getOrDefault(false)
+        val svcMediaId = svc?.getCurrentMediaIdSnapshot()?.takeIf { it.isNotBlank() }
+        val ctrlMediaId = mediaIdToFilename(ctrl.currentMediaItem?.mediaId)
+        val mediaId = svcMediaId ?: ctrlMediaId
+        if (pos > 0L || dur > 0L) {
+            _livePosition.value = pos
+            _liveDuration.value = dur
+        }
+        if (mediaId != null || playWhenReady) {
+            _state.value = _state.value.copy(
+                currentMediaId = mediaId ?: _state.value.currentMediaId,
+                isPlaying = playWhenReady,
+                preparedNotPlaying = !playWhenReady,
+            )
         }
     }
 
@@ -816,6 +864,7 @@ class PlaybackEngine(
         // recordEnd later gets rejected by the stale-event guard and the
         // song never appears in Recently Played.
         curMediaId?.let { history?.recordStart(it) }
+        _controllerReady.value = true
     }
 
     fun prepareForResume(songs: List<Song>, startIndex: Int, seekToMs: Long) {
@@ -833,43 +882,68 @@ class PlaybackEngine(
         )
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val targetSong = playable[safeStart]
+            val targetMediaId = targetSong.filename
+            val currentMediaId = mediaIdToFilename(ctrl.currentMediaItem?.mediaId)
+            val safeSeek = seekToMs.coerceAtLeast(0L)
+            if (ctrl.mediaItemCount > 0 && currentMediaId == targetMediaId) {
+                val currentPos = runCatching { ctrl.currentPosition.coerceAtLeast(0L) }.getOrDefault(0L)
+                if (kotlin.math.abs(currentPos - safeSeek) > 2_000L) {
+                    ctrl.seekTo(safeSeek)
+                    _livePosition.value = safeSeek
+                }
+                _state.value = _state.value.copy(
+                    currentSongId = targetSong.id,
+                    currentMediaId = targetMediaId,
+                    title = targetSong.title,
+                    artist = targetSong.artist,
+                    album = targetSong.album,
+                    isPlaying = runCatching { ctrl.playWhenReady }.getOrDefault(false),
+                    queueFilenames = playable.map { it.filename },
+                    queueIndex = safeStart,
+                    preparedNotPlaying = !runCatching { ctrl.playWhenReady }.getOrDefault(false),
+                )
+                android.util.Log.i(
+                    "PlaybackEngine",
+                    "prepareForResume: skipped SET_QUEUE — controller already has $targetMediaId at ${currentPos}ms"
+                )
+                _controllerReady.value = true
+                return@launch
+            }
             sendPlaybackCommand(
                 ctrl,
                 CMD_SET_QUEUE,
                 queueCommandArgs(
                     songs = playable,
                     startIndex = safeStart,
-                    seekToMs = seekToMs,
+                    seekToMs = safeSeek,
                     playWhenReady = false,
                 ),
             )
-            val first = playable[safeStart]
             _state.value = _state.value.copy(
-                currentSongId = first.id,
-                currentMediaId = first.filename,
-                title = first.title,
-                artist = first.artist,
-                album = first.album,
+                currentSongId = targetSong.id,
+                currentMediaId = targetMediaId,
+                title = targetSong.title,
+                artist = targetSong.artist,
+                album = targetSong.album,
                 isPlaying = false,
                 queueFilenames = playable.map { it.filename },
                 queueIndex = safeStart,
                 preparedNotPlaying = true,
             )
-            _livePosition.value = seekToMs.coerceAtLeast(0L)
+            _livePosition.value = safeSeek
             _liveDuration.value = 0L
+            _controllerReady.value = true
         }
     }
 
     fun togglePause() {
-        // Optimistic UI flip — the icon swaps the instant the user taps,
-        // before Media3 confirms via onPlayWhenReadyChanged. If the controller
-        // somehow refuses the command, onPlayWhenReadyChanged will correct
-        // the state back. Driven by playWhenReady (user intent), not isPlaying
-        // (actual audio flowing) — buffering frames don't confuse it.
-        val nowPlaying = _state.value.isPlaying
-        _state.value = _state.value.copy(isPlaying = !nowPlaying, preparedNotPlaying = false)
+        if (!_controllerReady.value) return
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val nowPlaying = runCatching { ctrl.playWhenReady }.getOrDefault(_state.value.isPlaying)
+            val nextPlaying = !nowPlaying
+            _state.value = _state.value.copy(isPlaying = nextPlaying, preparedNotPlaying = false)
             if (nowPlaying) ctrl.pause() else ctrl.play()
         }
     }
@@ -1125,6 +1199,15 @@ class PlaybackEngine(
                 val mediaId = snap.mediaId ?: return@launch
                 val cur = _state.value
                 if (cur.currentMediaId != null) return@launch  // real state already arrived
+                val svc = serviceRef()
+                val servicePlaying = svc?.let {
+                    runCatching {
+                        val instId = it.getCurrentPlaybackInstanceId()
+                        instId > 0L && runCatching {
+                            controller?.playWhenReady
+                        }.getOrNull() == true
+                    }.getOrDefault(false)
+                } ?: false
                 _state.value = cur.copy(
                     currentMediaId = mediaId,
                     title = snap.title,
@@ -1132,7 +1215,8 @@ class PlaybackEngine(
                     album = snap.album,
                     queueFilenames = if (cur.queueFilenames.isEmpty()) snap.queueFilenames else cur.queueFilenames,
                     queueIndex = if (cur.queueFilenames.isEmpty()) snap.queueIndex else cur.queueIndex,
-                    preparedNotPlaying = true,
+                    isPlaying = servicePlaying,
+                    preparedNotPlaying = !servicePlaying,
                 )
                 _livePosition.value = snap.positionMs
             } catch (t: Throwable) {
@@ -1601,6 +1685,7 @@ class PlaybackEngine(
         controller?.removeListener(playerListener)
         controller?.release()
         controller = null
+        _controllerReady.value = false
     }
 
     /**
