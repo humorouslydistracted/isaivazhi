@@ -21,7 +21,7 @@ android {
         applicationId = "com.isaivazhi.app"
         minSdk = 24
         targetSdk = 36
-        versionCode = 10
+        versionCode = 11
         versionName = "1.0.9-kt"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
