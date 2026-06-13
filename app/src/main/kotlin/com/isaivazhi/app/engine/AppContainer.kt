@@ -223,24 +223,22 @@ class AppContainer(private val appContext: Context) {
     // parity: `engine.activity` separate from SignalTimeline.
     val activityLog: ActivityLogEngine by lazy { ActivityLogEngine(appContext) }
 
-    val playback: PlaybackEngine by lazy {
-        PlaybackEngine(
-            appContext, preferences, history, taste, signalTimeline, session, toaster,
-            activityLog, favorites,
-        )
-    }
-
-    val recommender: Recommender by lazy { Recommender(embeddingDb) }
-
     /**
-     * Persisted record of songs the algorithm recently placed in Up Next.
-     * Used to suppress re-surfacing within a 6-hour cooldown window so the
-     * 1500-song library gets better rotation. Manual user taps are never
-     * recorded here — only algorithm-generated queues.
+     * Recommendation cooldown — songs that entered the player from AI flows
+     * and are suppressed from Up Next for 6h of listening time.
      */
     val recentlySurfacedTracker: RecentlySurfacedTracker by lazy {
         RecentlySurfacedTracker(appContext)
     }
+
+    val playback: PlaybackEngine by lazy {
+        PlaybackEngine(
+            appContext, preferences, history, taste, signalTimeline, session, toaster,
+            activityLog, favorites, recentlySurfacedTracker,
+        )
+    }
+
+    val recommender: Recommender by lazy { Recommender(embeddingDb) }
 
     val embedding: EmbeddingEngine by lazy {
         EmbeddingEngine(appContext, embeddingDb, toaster, preferences)

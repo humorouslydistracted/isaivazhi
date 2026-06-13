@@ -14,19 +14,28 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.Song
@@ -41,7 +50,37 @@ fun ViewAllScreen(
     onPlay: (queue: List<Song>, startIndex: Int) -> Unit,
     onLongPress: (Song) -> Unit,
     subtitleForSong: ((Song) -> String)? = null,
+    onTrailingAction: ((Song) -> Unit)? = null,
+    trailingIcon: ImageVector = Icons.Filled.Close,
+    trailingContentDescription: String = "Release early",
+    emptyMessage: String = "Nothing here yet.",
+    onClearAll: (() -> Unit)? = null,
+    clearAllConfirmMessage: String? = null,
 ) {
+    var showClearAllConfirm by remember { mutableStateOf(false) }
+
+    if (showClearAllConfirm && onClearAll != null) {
+        AlertDialog(
+            onDismissRequest = { showClearAllConfirm = false },
+            title = { Text("Clear all?") },
+            text = {
+                Text(
+                    clearAllConfirmMessage
+                        ?: "Release all songs from recommendation cooldown? They will be eligible for AI recommendations again.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onClearAll()
+                    showClearAllConfirm = false
+                }) { Text("Clear all") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearAllConfirm = false }) { Text("Cancel") }
+            },
+        )
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -62,13 +101,20 @@ fun ViewAllScreen(
                     text = title,
                     style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
-                Spacer(Modifier.weight(1f))
+                if (onClearAll != null && songs.isNotEmpty()) {
+                    TextButton(onClick = { showClearAllConfirm = true }) {
+                        Text("Clear all")
+                    }
+                }
                 Text(
                     text = "${songs.size} songs",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(end = 12.dp),
+                    modifier = Modifier.padding(end = if (onClearAll != null && songs.isNotEmpty()) 4.dp else 12.dp),
                 )
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
@@ -76,7 +122,7 @@ fun ViewAllScreen(
             if (songs.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                     Text(
-                        text = "Nothing here yet.",
+                        text = emptyMessage,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -125,6 +171,18 @@ fun ViewAllScreen(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
+                        }
+                        if (onTrailingAction != null) {
+                            IconButton(
+                                onClick = { onTrailingAction(song) },
+                                modifier = Modifier.size(40.dp),
+                            ) {
+                                Icon(
+                                    imageVector = trailingIcon,
+                                    contentDescription = trailingContentDescription,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                     }
                 }

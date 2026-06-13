@@ -57,6 +57,7 @@ class PlaybackEngine(
     // Push #74: favorites engine — wired so the MediaController.Listener for
     // EVT_MEDIA_ACTION can sync notification taps into the Kotlin state.
     private val favorites: FavoritesEngine? = null,
+    private val recentlySurfacedTracker: RecentlySurfacedTracker? = null,
 ) {
 
     /**
@@ -274,6 +275,7 @@ class PlaybackEngine(
             val md = mediaItem?.mediaMetadata
             val ctrl = controller
             val prevState = _state.value
+            val transitionSource = pendingTransitionSource
             val prevMediaId = mediaIdToFilename(prevState.currentMediaId)
             val nextMediaId = mediaIdToFilename(mediaItem?.mediaId)
             // Push #39: read the prev song's played-ms + duration from
@@ -321,7 +323,7 @@ class PlaybackEngine(
                 history?.recordEnd(prevMediaId, frac)
                 // Feed the taste signal pipeline. Snapshot before/after and
                 // append to the timeline so the user can audit each event.
-                val source = pendingTransitionSource
+                val source = transitionSource
                 val t = taste
                 if (t != null) {
                     val (before, after) = t.recordPlaybackEvent(prevMediaId, frac, source, transitionInstId)
@@ -464,6 +466,24 @@ class PlaybackEngine(
                 _livePosition.value = pos
                 _liveDuration.value = dur
                 return
+            }
+            if (!newMediaId.isNullOrBlank() && prevMediaId != newMediaId) {
+                val tracker = recentlySurfacedTracker
+                if (tracker != null &&
+                    shouldRecordRecommendationCooldown(newMediaId, prevState, transitionSource)
+                ) {
+                    tracker.record(listOf(newMediaId))
+                    activityLog?.log(
+                        category = "queue",
+                        type = "COOLDOWN_ENTER",
+                        message = "$newMediaId entered recommendation cooldown",
+                        data = mapOf(
+                            "mediaId" to newMediaId,
+                            "source" to transitionSource,
+                            "ctx" to prevState.queueContext.name,
+                        ),
+                    )
+                }
             }
             // Reset live position/duration for a new track. duration may be
             // unknown until Media3 reports it via onMediaMetadataChanged or
@@ -1667,6 +1687,9 @@ class PlaybackEngine(
                 if (_livePosition.value != pos) _livePosition.value = pos
                 if (_liveDuration.value != dur) _liveDuration.value = dur
                 val cur = _state.value
+                if (cur.isPlaying) {
+                    recentlySurfacedTracker?.advanceListeningClock(500L)
+                }
                 // Persist position every ~5 s while playing so cold-start
                 // resumes near where the user left off, without spamming
                 // DataStore on every poll.

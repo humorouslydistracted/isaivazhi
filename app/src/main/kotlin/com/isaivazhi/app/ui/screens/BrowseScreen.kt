@@ -45,11 +45,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.HistoryEngine
 import com.isaivazhi.app.engine.PlaylistsEngine
+import com.isaivazhi.app.engine.RecentlySurfacedTracker
 import com.isaivazhi.app.engine.Song
 
 enum class BrowseCategory(val title: String) {
     MostPlayed("Most Played"),
     RecentlyPlayed("Recently Played"),
+    ResumesIn("Resumes In"),
     NeverPlayed("Never Played"),
     LastAdded("Last Added"),
     Favorites("Favorites"),
@@ -336,13 +338,22 @@ fun lastAddedSongs(songs: List<Song>): List<Song> =
     songs.filter { it.filePath != null }
         .sortedWith(compareByDescending<Song> { it.dateModified }.thenBy { it.filename })
 
-/** Compute the 7 browse tiles in display order. */
+/** Format remaining cooldown time for display (e.g. "4h 23m" or "12m"). */
+fun formatRemainingMs(remainingMs: Long): String {
+    val totalMinutes = (remainingMs / 60_000L).coerceAtLeast(0L)
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+}
+
+/** Compute the browse tiles in display order. */
 fun buildBrowseTiles(
     songs: List<Song>,
     historyStats: Map<String, HistoryEngine.Stats>,
     historyEvents: List<HistoryEngine.Event>,
     favorites: Set<String>,
     disliked: Set<String>,
+    cooldownEntries: List<RecentlySurfacedTracker.ActiveEntry> = emptyList(),
 ): List<BrowseTile> {
     val byFilename = songs.associateBy { it.filename }
 
@@ -355,6 +366,8 @@ fun buildBrowseTiles(
         .distinctBy { it.filename }
         .mapNotNull { byFilename[it.filename] }
 
+    val resumesInSongs = cooldownEntries.mapNotNull { byFilename[it.filename] }
+
     val neverPlayed = songs.filter { it.filename !in historyStats.keys && it.filePath != null }
     val lastAddedAll = lastAddedSongs(songs)
     val favSongs = songs.filter { it.filename in favorites }
@@ -363,6 +376,8 @@ fun buildBrowseTiles(
     return listOf(
         BrowseTile(BrowseCategory.MostPlayed, mostPlayedAll.size, mostPlayedAll.take(4).map { it.filePath }),
         BrowseTile(BrowseCategory.RecentlyPlayed, recentlyPlayedAll.size, recentlyPlayedAll.take(4).map { it.filePath }),
+        BrowseTile(BrowseCategory.ResumesIn, cooldownEntries.size,
+            resumesInSongs.take(4).map { it.filePath }),
         BrowseTile(BrowseCategory.NeverPlayed, neverPlayed.size,
             neverPlayed.shuffled().take(4).map { it.filePath }),
         BrowseTile(BrowseCategory.LastAdded, lastAddedAll.size, lastAddedAll.take(4).map { it.filePath }),
@@ -381,6 +396,7 @@ fun browseCategorySongs(
     historyEvents: List<HistoryEngine.Event>,
     favorites: Set<String>,
     disliked: Set<String>,
+    cooldownEntries: List<RecentlySurfacedTracker.ActiveEntry> = emptyList(),
 ): List<Song> {
     val byFilename = songs.associateBy { it.filename }
     return when (category) {
@@ -391,6 +407,7 @@ fun browseCategorySongs(
         BrowseCategory.RecentlyPlayed -> historyEvents
             .distinctBy { it.filename }
             .mapNotNull { byFilename[it.filename] }
+        BrowseCategory.ResumesIn -> cooldownEntries.mapNotNull { byFilename[it.filename] }
         BrowseCategory.NeverPlayed -> songs.filter { it.filename !in historyStats.keys && it.filePath != null }
         BrowseCategory.LastAdded -> lastAddedSongs(songs)
         BrowseCategory.Favorites -> songs.filter { it.filename in favorites }

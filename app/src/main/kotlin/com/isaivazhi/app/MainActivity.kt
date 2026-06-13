@@ -118,6 +118,7 @@ import com.isaivazhi.app.ui.screens.UpNextScreen
 import com.isaivazhi.app.ui.screens.ViewAllScreen
 import com.isaivazhi.app.ui.screens.browseCategorySongs
 import com.isaivazhi.app.ui.screens.buildBrowseTiles
+import com.isaivazhi.app.ui.screens.formatRemainingMs
 import com.isaivazhi.app.ui.theme.IsaiVazhiTheme
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -125,6 +126,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 private enum class Tab(val title: String) {
@@ -620,6 +623,18 @@ private fun AppRoot(container: AppContainer) {
     val playlistsList by container.playlists.playlists.collectAsState()
     val historyEvents by container.history.events.collectAsState()
     val historyStats by container.history.stats.collectAsState()
+    var cooldownEntries by remember {
+        mutableStateOf(container.recentlySurfacedTracker.activeEntries())
+    }
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            cooldownEntries = container.recentlySurfacedTracker.activeEntries()
+            delay(60_000)
+        }
+    }
+    LaunchedEffect(playbackState.isPlaying, playbackState.currentMediaId) {
+        cooldownEntries = container.recentlySurfacedTracker.activeEntries()
+    }
     val tuning by container.taste.tuning.collectAsState()
     val tasteSignals by container.taste.signals.collectAsState()
     // Push #63: decorated signals (chips + display hard-block set at full guard).
@@ -1599,8 +1614,7 @@ private fun AppRoot(container: AppContainer) {
                     "mediaId" to mediaId,
                 ),
             )
-            // Record these algorithm-surfaced songs so they enter the cooldown window.
-            container.recentlySurfacedTracker.record(finalCacheTail.map { it.filename })
+            // Recency suppression applied via recentlySurfaced() excludes at recommend time.
             container.toaster.show("Up Next refreshed")
             if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
                 newUpcoming = finalUpcoming,
@@ -1677,8 +1691,6 @@ private fun AppRoot(container: AppContainer) {
                 songs.filter { it.filePath != null && it.filename !in excludeFnsWithRecency }
                     .shuffled().take(50)
             }
-            // Record algorithm-surfaced songs so they enter the cooldown window.
-            container.recentlySurfacedTracker.record(newTail.map { it.filename })
             val recommendElapsedMs = android.os.SystemClock.elapsedRealtime() - recommendStartedAt
             container.activityLog.log(
                 category = "queue",
@@ -1819,10 +1831,6 @@ private fun AppRoot(container: AppContainer) {
                 songs.asSequence()
                     .filter { it.filePath != null && it.filename != song.filename }
                     .shuffled().take(50).toList()
-            }
-            // Record algorithm-surfaced tail songs (not the manually tapped song).
-            if (recMode && hasEmbeddings) {
-                container.recentlySurfacedTracker.record(tail.map { it.filename })
             }
             val buildMs = android.os.SystemClock.elapsedRealtime() - tapStart
             android.util.Log.i(
@@ -2017,8 +2025,6 @@ private fun AppRoot(container: AppContainer) {
             )
         }.getOrDefault(emptyList())
         if (tail.isNotEmpty()) {
-            // Record algorithm-surfaced songs before appending.
-            container.recentlySurfacedTracker.record(tail.map { it.filename })
             container.playback.appendToQueue(tail)
             container.toaster.show("Up Next refreshed with recommendations (${blendedTriple?.third ?: "current"})")
         }
@@ -2481,7 +2487,6 @@ private fun AppRoot(container: AppContainer) {
                                         songs.filter { it.filePath != null && it.filename !in excludeFns }
                                             .shuffled().take(50)
                                     }
-                                    container.recentlySurfacedTracker.record(newTail.map { it.filename })
                                     val finalUpcoming = playNextSongs + newTail
                                     android.util.Log.i(
                                         "QueueOp",
@@ -2506,6 +2511,7 @@ private fun AppRoot(container: AppContainer) {
                             // running 3× per song transition before push #35).
                             val browseTiles = remember(
                                 songs, historyStats, historyEvents, favoritesSet, dislikedSet,
+                                cooldownEntries,
                             ) {
                                 buildBrowseTiles(
                                     songs = songs,
@@ -2513,6 +2519,7 @@ private fun AppRoot(container: AppContainer) {
                                     historyEvents = historyEvents,
                                     favorites = favoritesSet,
                                     disliked = dislikedSet,
+                                    cooldownEntries = cooldownEntries,
                                 )
                             }
                             BrowseScreen(
@@ -3180,6 +3187,9 @@ private fun AppRoot(container: AppContainer) {
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         if (viewAllCat != null) {
+            val cooldownRemainingByFilename = remember(cooldownEntries) {
+                cooldownEntries.associate { it.filename to it.remainingMs }
+            }
             val listSongs = browseCategorySongs(
                 category = viewAllCat,
                 songs = songs,
@@ -3187,6 +3197,7 @@ private fun AppRoot(container: AppContainer) {
                 historyEvents = historyEvents,
                 favorites = favoritesSet,
                 disliked = dislikedSet,
+                cooldownEntries = cooldownEntries,
             )
             ViewAllScreen(
                 title = viewAllCat.title,
@@ -3203,11 +3214,44 @@ private fun AppRoot(container: AppContainer) {
                     )
                 },
                 onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
-                subtitleForSong = if (viewAllCat == BrowseCategory.MostPlayed) {
-                    { song ->
-                        val plays = historyStats[song.filename]?.plays ?: 0
-                        "Played $plays ${if (plays == 1) "time" else "times"}"
+                subtitleForSong = when (viewAllCat) {
+                    BrowseCategory.MostPlayed -> {
+                        { song ->
+                            val plays = historyStats[song.filename]?.plays ?: 0
+                            "Played $plays ${if (plays == 1) "time" else "times"}"
+                        }
                     }
+                    BrowseCategory.ResumesIn -> {
+                        { song ->
+                            val remaining = cooldownRemainingByFilename[song.filename] ?: 0L
+                            "Resumes in ${formatRemainingMs(remaining)}"
+                        }
+                    }
+                    else -> null
+                },
+                onTrailingAction = if (viewAllCat == BrowseCategory.ResumesIn) {
+                    { song ->
+                        if (container.recentlySurfacedTracker.remove(song.filename)) {
+                            cooldownEntries = container.recentlySurfacedTracker.activeEntries()
+                            container.toaster.show("Released — eligible for recommendations again")
+                        }
+                    }
+                } else null,
+                emptyMessage = if (viewAllCat == BrowseCategory.ResumesIn) {
+                    "No songs on recommendation cooldown yet."
+                } else {
+                    "Nothing here yet."
+                },
+                onClearAll = if (viewAllCat == BrowseCategory.ResumesIn) {
+                    {
+                        container.recentlySurfacedTracker.clearAll()
+                        cooldownEntries = container.recentlySurfacedTracker.activeEntries()
+                        container.toaster.show("All songs released — eligible for recommendations again")
+                    }
+                } else null,
+                clearAllConfirmMessage = if (viewAllCat == BrowseCategory.ResumesIn && listSongs.isNotEmpty()) {
+                    "Release all ${listSongs.size} songs from recommendation cooldown? " +
+                        "They will be eligible for AI recommendations again."
                 } else null,
             )
         }
