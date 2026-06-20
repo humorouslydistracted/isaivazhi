@@ -41,4 +41,32 @@ class RecommenderNegativeFilterTest {
         val filtered = RecommendationPolicy.filterSongsForUpNext(songs, excludes)
         assertEquals(listOf("ok"), filtered.map { it.filename })
     }
+
+    @Test
+    fun filterSongsForRecommendationCooldown_removesCooldownSongs() {
+        val songs = listOf(
+            Song(1, "fresh", "Fresh", "", "", null, contentHash = "h1"),
+            Song(2, "cooldown", "Cooldown", "", "", null, contentHash = "h2"),
+        )
+        val filtered = RecommendationPolicy.filterSongsForRecommendationCooldown(
+            songs = songs,
+            cooldownFilenames = setOf("cooldown"),
+        )
+        assertEquals(listOf("fresh"), filtered.map { it.filename })
+    }
+
+    @Test
+    fun filterSongsForRecommendationCooldown_keepsAllowedSongs() {
+        val songs = listOf(
+            Song(1, "current", "Current", "", "", null, contentHash = "h1"),
+            Song(2, "play_next", "Play Next", "", "", null, contentHash = "h2"),
+            Song(3, "cooldown", "Cooldown", "", "", null, contentHash = "h3"),
+        )
+        val filtered = RecommendationPolicy.filterSongsForRecommendationCooldown(
+            songs = songs,
+            cooldownFilenames = setOf("current", "play_next", "cooldown"),
+            allowedFilenames = setOf("current", "play_next"),
+        )
+        assertEquals(listOf("current", "play_next"), filtered.map { it.filename })
+    }
 }

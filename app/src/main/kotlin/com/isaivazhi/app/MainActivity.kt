@@ -454,7 +454,9 @@ private fun AppRoot(container: AppContainer) {
     // settings rescan, library-changed broadcast — without sprinkling
     // assignments through each callsite.
     LaunchedEffect(songs) {
-        if (songs.isNotEmpty()) container.library.value = songs
+        if (songs.isNotEmpty()) {
+            container.library.value = container.embeddingDb.enrichSongsWithKnownHashes(songs)
+        }
     }
     // Realign stored folder exclusions to current scan paths after library
     // load/rescan (Play Store updates often change MediaStore DATA paths).
@@ -1009,11 +1011,16 @@ private fun AppRoot(container: AppContainer) {
                 // warmup if available, avoiding a redundant MediaStore scan that
                 // can cost 1-5s on a cold process start.
                 val preloaded = container.library.value
-                rawSongs = if (preloaded.isNotEmpty()) {
-                    preloaded
-                } else {
-                    val scanned = LibraryCache.loadOrScan(ctx)
-                    if (scanned.isEmpty()) LibraryCache.loadOrScan(ctx, force = true) else scanned
+                val cachedSnapshot = if (preloaded.isEmpty() || LibraryCache.lastLoadSource == "stale_cache") {
+                    LibraryCache.loadCached(ctx, allowStale = true)
+                } else null
+                rawSongs = when {
+                    preloaded.isNotEmpty() -> preloaded
+                    cachedSnapshot != null -> cachedSnapshot.songs
+                    else -> {
+                        val scanned = LibraryCache.loadOrScan(ctx)
+                        if (scanned.isEmpty()) LibraryCache.loadOrScan(ctx, force = true) else scanned
+                    }
                 }
                 if (rawSongs.isEmpty()) {
                     rawSongs = LibraryCache.loadOrScan(ctx, force = true)
@@ -1021,15 +1028,49 @@ private fun AppRoot(container: AppContainer) {
                 // Bugfix 2026-06-01d: publish to container so the
                 // process-lifetime RecommendationCache can see the
                 // library even after the Activity is destroyed.
-                container.library.value = songs
+                container.library.value = container.embeddingDb.enrichSongsWithKnownHashes(songs)
+                if (cachedSnapshot != null && !cachedSnapshot.isFresh) {
+                    val staleAgeMs = cachedSnapshot.ageMs
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val refreshStart = System.currentTimeMillis()
+                        val refreshed = runCatching {
+                            LibraryCache.loadOrScan(ctx, force = true)
+                        }.getOrElse {
+                            android.util.Log.w("MainActivity", "stale-cache refresh failed: ${it.message}")
+                            emptyList()
+                        }
+                        if (refreshed.isNotEmpty()) {
+                            val refreshElapsed = System.currentTimeMillis() - refreshStart
+                            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                rawSongs = refreshed
+                                val filtered = container.folderExclusion.filter(refreshed, excludedFolderPaths)
+                                container.library.value =
+                                    container.embeddingDb.enrichSongsWithKnownHashes(filtered)
+                                container.activityLog.log(
+                                    category = "engine",
+                                    type = "LIBRARY_STALE_REFRESH_DONE",
+                                    message = "Background library refresh done in ${refreshElapsed}ms",
+                                    data = mapOf(
+                                        "songsCount" to filtered.size,
+                                        "elapsedMs" to refreshElapsed,
+                                        "staleAgeMs" to staleAgeMs,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
                 val libElapsed = System.currentTimeMillis() - libStartMs
                 container.activityLog.log(
                     category = "engine",
                     type = "LIBRARY_LOAD_DONE",
-                    message = "LibraryCache.loadOrScan done in ${libElapsed}ms (songs=${songs.size})",
+                    message = "Library load done in ${libElapsed}ms (songs=${songs.size} source=${LibraryCache.lastLoadSource})",
                     data = mapOf(
                         "songsCount" to songs.size,
                         "elapsedMs" to libElapsed,
+                        "source" to LibraryCache.lastLoadSource,
+                        "cacheFresh" to (cachedSnapshot?.isFresh ?: true),
+                        "cacheAgeMs" to (cachedSnapshot?.ageMs ?: 0L),
                     ),
                 )
                 scanError = null
@@ -1067,6 +1108,25 @@ private fun AppRoot(container: AppContainer) {
             }
 
             // Diagnostic — Discover load timing. Additive only.
+            if (cached.rowCount > 0) {
+                container.activityLog.log(
+                    category = "engine",
+                    type = "PERF_DB_STATS_DEFERRED",
+                    message = "cache-hit startup: live DB stats delayed; filepath sets load on AI page",
+                    data = mapOf("cachedRowCount" to cached.rowCount),
+                )
+                coroutineScope.launch {
+                    kotlinx.coroutines.delay(8_000)
+                    refreshEmbeddingRowCount(container) { rc, dim, ext ->
+                        embeddingsRowCount = rc
+                        embeddingsDim = dim
+                        vecExtLoaded = ext
+                    }
+                }
+                artCacheBytes = withContextIo { AlbumArtRepository.diskCacheBytes(ctx) }
+                return@LaunchedEffect
+            }
+
             val dbStartMs = System.currentTimeMillis()
             container.activityLog.log(
                 category = "engine",
@@ -1094,8 +1154,9 @@ private fun AppRoot(container: AppContainer) {
                     container.embeddingDb.relinkLibraryPaths(songs)
                     val hashMap = container.embeddingDb.contentHashByFilepath()
                     rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
-                    container.library.value = songs
-                    container.embeddingDb.prewarmFromLibrary(songs)
+                    val enrichedSongs = container.embeddingDb.enrichSongsWithKnownHashes(songs)
+                    container.library.value = enrichedSongs
+                    container.embeddingDb.prewarmFromLibrary(enrichedSongs)
                 } catch (t: Throwable) {
                     android.util.Log.w("MainActivity", "startup relink failed: ${t.message}")
                 }
@@ -1125,8 +1186,9 @@ private fun AppRoot(container: AppContainer) {
                     container.embeddingDb.relinkLibraryPaths(songs)
                     val hashMap = container.embeddingDb.contentHashByFilepath()
                     rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
-                    container.library.value = songs
-                    container.embeddingDb.prewarmFromLibrary(songs)
+                    val enrichedSongs = container.embeddingDb.enrichSongsWithKnownHashes(songs)
+                    container.library.value = enrichedSongs
+                    container.embeddingDb.prewarmFromLibrary(enrichedSongs)
                 } catch (t: Throwable) {
                     android.util.Log.w("MainActivity", "startup relink failed: ${t.message}")
                 }
@@ -1616,7 +1678,7 @@ private fun AppRoot(container: AppContainer) {
             )
             // Recency suppression applied via recentlySurfaced() excludes at recommend time.
             container.toaster.show("Up Next refreshed")
-            if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
+            container.playback.replaceUpcoming(
                 newUpcoming = finalUpcoming,
                 newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
             )
@@ -1709,7 +1771,7 @@ private fun AppRoot(container: AppContainer) {
                 "Refresh: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
             )
             val replaceStartedAt = android.os.SystemClock.elapsedRealtime()
-            if (finalUpcoming.isNotEmpty()) container.playback.replaceUpcoming(
+            container.playback.replaceUpcoming(
                 newUpcoming = finalUpcoming,
                 newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
             )
@@ -1805,13 +1867,18 @@ private fun AppRoot(container: AppContainer) {
             }.getOrNull()
             blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
-            // Recency suppression for the AI tail. The manually-tapped song
-            // is intentionally NOT excluded here (it was the user's choice)
-            // and won't appear in the tail anyway (it's position 0 / dropped).
+            // Recency suppression for generated tails. The manually-tapped
+            // song remains playable as the current item but is removed from
+            // any generated tail.
             val recentlySurfacedForTap = container.recentlySurfacedTracker.recentlySurfaced()
+            val generatedTailExcludes = recentlySurfacedForTap + song.filename
+            fun shuffledTapTail(): List<Song> = songs.asSequence()
+                .filter { it.filePath != null && it.filename !in generatedTailExcludes }
+                .shuffled().take(50).toList()
+            var builtAiTail = false
             val tail: List<Song> = if (recMode && hasEmbeddings) {
                 runCatching {
-                    container.recommender.buildPlayQueue(
+                    val queue = container.recommender.buildPlayQueue(
                         currentSong = song,
                         library = songs,
                         k = 50,
@@ -1821,23 +1888,28 @@ private fun AppRoot(container: AppContainer) {
                         dislikedFilenames = dislikedSet,
                         softExcludedFilenames = upNextSoftExcluded,
                         blendedQueryVec = blendedVec,
-                    ).drop(1)   // drop the current song; replaceUpcoming dedupes anyway
+                    )
+                    builtAiTail = true
+                    queue.drop(1)   // drop the current song; replaceUpcoming dedupes anyway
                 }.getOrElse {
-                    songs.asSequence()
-                        .filter { it.filePath != null && it.filename != song.filename }
-                        .shuffled().take(50).toList()
+                    shuffledTapTail()
                 }
             } else {
-                songs.asSequence()
-                    .filter { it.filePath != null && it.filename != song.filename }
-                    .shuffled().take(50).toList()
+                shuffledTapTail()
             }
             val buildMs = android.os.SystemClock.elapsedRealtime() - tapStart
             android.util.Log.i(
                 "PlayFromTap",
                 "tail built in ${buildMs}ms (aiMode=$recMode emb=$hasEmbeddings tailSize=${tail.size}) for ${song.filename}"
             )
-            container.playback.replaceUpcoming(tail)
+            container.playback.replaceUpcoming(
+                tail,
+                newContext = if (builtAiTail) {
+                    com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED
+                } else {
+                    com.isaivazhi.app.engine.PlaybackEngine.QueueContext.LIBRARY
+                },
+            )
         }
         Unit
     }
@@ -2061,6 +2133,7 @@ private fun AppRoot(container: AppContainer) {
         if (upcomingFilenames.size <= 5) return@LaunchedEffect  // too short to bother
         val byFn = songs.associateBy { it.filename }
         val upcomingSongs = upcomingFilenames.mapNotNull { byFn[it] }
+        val recentlySurfacedForSoftRefresh = container.recentlySurfacedTracker.recentlySurfaced()
         val blendedTriple = runCatching {
             container.recommender.buildBlendedVec(
                 currentSongHash = current.contentHash,
@@ -2080,14 +2153,17 @@ private fun AppRoot(container: AppContainer) {
                 library = songs,
                 blendedQueryVec = blendedVec,
                 adventurous = tuning.adventurous,
-                extraExcludeFilenames = upcomingFilenames.toSet(),
+                extraExcludeFilenames = upcomingFilenames.toSet() + recentlySurfacedForSoftRefresh,
                 hardBlockedFilenames = upNextHardBlocked,
                 dislikedFilenames = dislikedSet,
                 softExcludedFilenames = upNextSoftExcluded,
             )
         }.getOrDefault(emptyList())
         if (newTail.isNotEmpty() && newTail != upcomingSongs) {
-            container.playback.replaceUpcoming(newTail)
+            container.playback.replaceUpcoming(
+                newTail,
+                newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
+            )
             android.util.Log.i(
                 "MainActivity",
                 "soft-refresh applied to upcoming tail: size=${newTail.size}"
@@ -2922,8 +2998,9 @@ private fun AppRoot(container: AppContainer) {
                 container.embeddingDb.relinkLibraryPaths(songs)
                 val hashMap = container.embeddingDb.contentHashByFilepath()
                 rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
-                container.library.value = songs
-                container.embeddingDb.prewarmFromLibrary(songs)
+                val enrichedSongs = container.embeddingDb.enrichSongsWithKnownHashes(songs)
+                container.library.value = enrichedSongs
+                container.embeddingDb.prewarmFromLibrary(enrichedSongs)
             } catch (t: Throwable) {
                 android.util.Log.w("MainActivity", "AI-page relink failed: ${t.message}")
             }

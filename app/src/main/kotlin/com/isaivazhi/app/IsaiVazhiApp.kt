@@ -1,6 +1,9 @@
 package com.isaivazhi.app
 
+import android.app.ActivityManager
 import android.app.Application
+import android.os.Build
+import android.os.Process
 import com.isaivazhi.app.engine.AppContainer
 import com.isaivazhi.app.engine.LibraryCache
 import com.isaivazhi.app.ui.hasAudioReadPermission
@@ -37,6 +40,13 @@ class IsaiVazhiApp : Application() {
     override fun onCreate() {
         super.onCreate()
         container = AppContainer(this)
+        if (!isDefaultProcess()) {
+            android.util.Log.i(
+                "IsaiVazhiApp",
+                "Skipping main-process warmups in ${currentProcessName()}",
+            )
+            return
+        }
 
         val startedAt = System.currentTimeMillis()
         container.activityLog.log(
@@ -105,7 +115,8 @@ class IsaiVazhiApp : Application() {
                     )
                     return@launch
                 }
-                val songs = LibraryCache.loadOrScan(this@IsaiVazhiApp)
+                val cached = LibraryCache.loadCached(this@IsaiVazhiApp, allowStale = true)
+                val songs = cached?.songs ?: LibraryCache.loadOrScan(this@IsaiVazhiApp)
                 container.library.value = songs
                 // Bugfix 2026-06-01h: populate filename→hash and hash→meta
                 // lookup tables so all DB vector calls can be served from
@@ -114,8 +125,13 @@ class IsaiVazhiApp : Application() {
                 container.activityLog.log(
                     category = "engine",
                     type = "PROCESS_LIBRARY_LOADED",
-                    message = "Library loaded into container size=${songs.size}",
-                    data = mapOf("size" to songs.size),
+                    message = "Library loaded into container size=${songs.size} source=${LibraryCache.lastLoadSource}",
+                    data = mapOf(
+                        "size" to songs.size,
+                        "source" to LibraryCache.lastLoadSource,
+                        "cacheFresh" to (cached?.isFresh ?: true),
+                        "cacheAgeMs" to (cached?.ageMs ?: 0L),
+                    ),
                 )
                 // Bugfix 2026-06-01k: run full vector heap warm BEFORE
                 // starting RecommendationCache, via direct-cursor path.
@@ -135,11 +151,30 @@ class IsaiVazhiApp : Application() {
                     message = "Full vector heap warm done size=$loaded in ${warmMs}ms",
                     data = mapOf("size" to loaded, "elapsedMs" to warmMs),
                 )
+                val enriched = container.embeddingDb.enrichSongsWithKnownHashes(container.library.value)
+                if (enriched !== container.library.value) {
+                    container.library.value = enriched
+                    container.embeddingDb.prewarmFromLibrary(enriched)
+                }
                 container.recommendationCache.start()
                 container.recommendationCache.precomputeNow(reason = "process_start")
             } catch (t: Throwable) {
                 android.util.Log.w("IsaiVazhiApp", "library/precompute init failed: ${t.message}")
             }
         }
+    }
+
+    private fun isDefaultProcess(): Boolean = currentProcessName() == packageName
+
+    private fun currentProcessName(): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            return getProcessName()
+        }
+        val pid = Process.myPid()
+        val am = getSystemService(ActivityManager::class.java) ?: return packageName
+        return am.runningAppProcesses
+            ?.firstOrNull { it.pid == pid }
+            ?.processName
+            ?: packageName
     }
 }

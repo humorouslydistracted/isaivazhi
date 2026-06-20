@@ -1570,9 +1570,25 @@ class PlaybackEngine(
             if (curIdx < 0 || totalBefore == 0) return@launch
             val curState = _state.value
             val curFilename = curState.currentMediaId
+            val resolvedContext = newContext ?: curState.queueContext
+            val cooldownFilenames = if (resolvedContext == QueueContext.AI_RECOMMENDED) {
+                recentlySurfacedTracker?.recentlySurfaced().orEmpty()
+            } else {
+                emptySet()
+            }
+            val cooldownAllowed = buildSet {
+                curFilename?.let { add(it) }
+                addAll(curState.playNextFilenames)
+            }
+            val cooldownFiltered = RecommendationPolicy.filterSongsForRecommendationCooldown(
+                songs = newUpcoming,
+                cooldownFilenames = cooldownFilenames,
+                allowedFilenames = cooldownAllowed,
+            )
+            val cooldownDropped = newUpcoming.size - cooldownFiltered.size
             val seen = HashSet<String>()
             curFilename?.let { seen += it }
-            val nextSongs = newUpcoming.filter {
+            val nextSongs = cooldownFiltered.filter {
                 !it.filePath.isNullOrEmpty() && seen.add(it.filename)
             }
             sendPlaybackCommand(ctrl, CMD_REPLACE_UPCOMING, queueCommandArgs(nextSongs))
@@ -1580,7 +1596,21 @@ class PlaybackEngine(
                 if (curFilename != null) add(curFilename)
                 addAll(nextSongs.map { it.filename })
             }
-            val resolvedContext = newContext ?: curState.queueContext
+            if (cooldownDropped > 0) {
+                android.util.Log.i(
+                    "QueueOp",
+                    "replaceUpcoming cooldown filtered=$cooldownDropped ctx=$resolvedContext",
+                )
+                activityLog?.log(
+                    category = "queue",
+                    type = "COOLDOWN_FILTER_REPLACE",
+                    message = "Removed $cooldownDropped cooldown songs from upcoming queue",
+                    data = mapOf(
+                        "dropped" to cooldownDropped,
+                        "ctx" to resolvedContext.name,
+                    ),
+                )
+            }
             android.util.Log.i(
                 "QueueOp",
                 "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +

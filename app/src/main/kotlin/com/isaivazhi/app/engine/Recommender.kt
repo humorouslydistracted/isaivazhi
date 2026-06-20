@@ -584,8 +584,12 @@ class Recommender(
         val tail = if (recs.isNotEmpty()) {
             recs
         } else {
+            val policyExcludes = RecommendationPolicy.unionExcludes(
+                hardBlockedFilenames, softExcludedFilenames, dislikedFilenames,
+            )
+            val excludes = extraExcludeFilenames + policyExcludes + currentSong.filename
             library.asSequence()
-                .filter { it.filePath != null && it.filename != currentSong.filename }
+                .filter { it.filePath != null && it.filename !in excludes }
                 .shuffled()
                 .take(k)
                 .toList()

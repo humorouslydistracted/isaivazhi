@@ -194,6 +194,22 @@ class EmbeddingDbFacade(appContext: Context) {
         }
     }
 
+    /** Attach hashes already known from the process-lifetime heap warm. */
+    fun enrichSongsWithKnownHashes(songs: List<Song>): List<Song> {
+        if (songs.isEmpty() || filenameToHashCache.isEmpty()) return songs
+        var changed = false
+        val out = songs.map { song ->
+            val hash = filenameToHashCache[song.filename] ?: return@map song
+            if (song.contentHash == hash && song.hasEmbedding) {
+                song
+            } else {
+                changed = true
+                song.copy(contentHash = hash, hasEmbedding = true)
+            }
+        }
+        return if (changed) out else songs
+    }
+
     suspend fun stats(): JSONObject? = awaitJsonObject { cb ->
         manager.stats(cb)
     }

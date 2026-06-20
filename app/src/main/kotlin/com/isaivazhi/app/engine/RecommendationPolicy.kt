@@ -66,4 +66,18 @@ object RecommendationPolicy {
         if (policyExcludes.isEmpty()) return songs
         return songs.filter { it.filename !in policyExcludes }
     }
+
+    /**
+     * Drop songs that are still inside the recommendation cooldown window.
+     * [allowedFilenames] lets explicit user choices such as Play Next survive
+     * final queue replacement even when they are also on cooldown.
+     */
+    fun filterSongsForRecommendationCooldown(
+        songs: List<Song>,
+        cooldownFilenames: Set<String>,
+        allowedFilenames: Set<String> = emptySet(),
+    ): List<Song> {
+        if (cooldownFilenames.isEmpty()) return songs
+        return songs.filter { it.filename !in cooldownFilenames || it.filename in allowedFilenames }
+    }
 }

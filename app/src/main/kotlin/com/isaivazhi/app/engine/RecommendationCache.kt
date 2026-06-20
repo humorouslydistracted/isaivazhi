@@ -197,7 +197,9 @@ class RecommendationCache(
         val recMode = container.preferences.recMode.first()
         val playbackState = container.playback.state.value
         val playNextSet = playbackState.playNextFilenames
-        val excludeFns = playNextSet + seedFilename
+        val queueSet = playbackState.queueFilenames.toSet()
+        val cooldownSet = container.recentlySurfacedTracker.recentlySurfaced()
+        val excludeFns = playNextSet + queueSet + seedFilename + cooldownSet
         val embeddingRows = runCatching {
             container.embeddingDb.rowCount()
         }.getOrDefault(0)

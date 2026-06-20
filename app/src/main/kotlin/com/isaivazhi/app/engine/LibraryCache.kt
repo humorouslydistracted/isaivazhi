@@ -28,15 +28,35 @@ object LibraryCache {
     @Volatile var lastLoadElapsedMs: Long = 0L
         private set
 
+    data class CachedSnapshot(
+        val songs: List<Song>,
+        val ageMs: Long,
+        val isFresh: Boolean,
+    )
+
+    suspend fun loadCached(ctx: Context, allowStale: Boolean = true): CachedSnapshot? = withContext(Dispatchers.IO) {
+        val startMs = android.os.SystemClock.elapsedRealtime()
+        val snapshot = readCacheSnapshot(ctx, allowStale, enrichMissingDurations = false)
+        if (snapshot != null) {
+            lastLoadSource = if (snapshot.isFresh) "cache" else "stale_cache"
+            lastLoadElapsedMs = android.os.SystemClock.elapsedRealtime() - startMs
+            android.util.Log.i(
+                "LibraryCache",
+                "Loaded ${snapshot.songs.size} songs from $lastLoadSource age=${snapshot.ageMs / 60_000}min"
+            )
+        }
+        snapshot
+    }
+
     suspend fun loadOrScan(ctx: Context, force: Boolean = false): List<Song> = withContext(Dispatchers.IO) {
         val startMs = android.os.SystemClock.elapsedRealtime()
         if (!force) {
-            val cached = readIfFresh(ctx)
+            val cached = readCacheSnapshot(ctx, allowStale = false, enrichMissingDurations = true)
             if (cached != null) {
                 lastLoadSource = "cache"
                 lastLoadElapsedMs = android.os.SystemClock.elapsedRealtime() - startMs
-                android.util.Log.i("LibraryCache", "Loaded ${cached.size} songs from cache")
-                return@withContext cached
+                android.util.Log.i("LibraryCache", "Loaded ${cached.songs.size} songs from cache")
+                return@withContext cached.songs
             }
         }
         val scanned = LibraryScanner.scan(ctx)
@@ -61,11 +81,16 @@ object LibraryCache {
         return File(dir, CACHE_FILE)
     }
 
-    private fun readIfFresh(ctx: Context): List<Song>? {
+    private fun readCacheSnapshot(
+        ctx: Context,
+        allowStale: Boolean,
+        enrichMissingDurations: Boolean,
+    ): CachedSnapshot? {
         val f = cacheFile(ctx)
         if (!f.exists() || f.length() <= 0) return null
         val ageMs = System.currentTimeMillis() - f.lastModified()
-        if (ageMs > MAX_AGE_MS) {
+        val isFresh = ageMs <= MAX_AGE_MS
+        if (!allowStale && !isFresh) {
             android.util.Log.i("LibraryCache", "cache is ${ageMs / 60_000} min old, refreshing")
             return null
         }
@@ -99,11 +124,16 @@ object LibraryCache {
             // Never trust an empty cache — it may have been written before
             // the user granted storage permission.
             if (out.isEmpty()) return null
-            val enriched = LibraryScanner.enrichDurations(ctx, out)
-            if (enriched.zip(out).any { (a, b) -> a.durationMs != b.durationMs }) {
-                runCatching { write(ctx, enriched) }
+            val songs = if (enrichMissingDurations) {
+                val enriched = LibraryScanner.enrichDurations(ctx, out)
+                if (enriched.zip(out).any { (a, b) -> a.durationMs != b.durationMs }) {
+                    runCatching { write(ctx, enriched) }
+                }
+                enriched
+            } else {
+                out
             }
-            enriched
+            CachedSnapshot(songs = songs, ageMs = ageMs, isFresh = isFresh)
         }.getOrNull()
     }
 

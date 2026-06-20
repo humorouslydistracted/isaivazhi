@@ -14,7 +14,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -46,7 +46,7 @@ fun ActivityLogPane(
     modifier: Modifier = Modifier,
 ) {
     val entries by activityLog.entries.collectAsState()
-    val expanded = remember { mutableStateOf<Set<Long>>(emptySet()) }
+    val expanded = remember { mutableStateOf<Set<String>>(emptySet()) }
 
     Column(modifier = modifier.background(MaterialTheme.colorScheme.background)) {
         if (entries.isEmpty()) {
@@ -63,15 +63,16 @@ fun ActivityLogPane(
                 contentPadding = PaddingValues(vertical = 4.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                items(entries, key = { it.timestamp.toString() + ":" + it.type + ":" + it.message.hashCode() }) { entry ->
+                itemsIndexed(entries, key = ::activityEntryListKey) { index, entry ->
+                    val rowKey = activityEntryListKey(index, entry)
                     EntryRow(
                         entry = entry,
-                        isExpanded = entry.timestamp in expanded.value,
+                        isExpanded = rowKey in expanded.value,
                         onClick = {
-                            expanded.value = if (entry.timestamp in expanded.value) {
-                                expanded.value - entry.timestamp
+                            expanded.value = if (rowKey in expanded.value) {
+                                expanded.value - rowKey
                             } else {
-                                expanded.value + entry.timestamp
+                                expanded.value + rowKey
                             }
                         },
                     )
@@ -80,6 +81,11 @@ fun ActivityLogPane(
         }
     }
 }
+
+// Same-millisecond duplicate log events are valid; LazyColumn row keys still must be unique.
+internal fun activityEntryListKey(index: Int, entry: ActivityLogEngine.Entry): String =
+    "${entry.timestamp}:$index:${entry.category}:${entry.type}:" +
+        "${entry.message.hashCode()}:${entry.data.hashCode()}"
 
 /** Embedding tab: ONNX batch trace from [com.isaivazhi.app.engine.LogBuffer]. */
 @Composable
