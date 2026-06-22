@@ -16,6 +16,7 @@ public final class PlaybackCommandContract {
     /** Insert at current index and start playback on the first inserted item. */
     static final String CMD_INSERT_BEFORE_CURRENT_AND_PLAY = "isaivazhi.playback.INSERT_BEFORE_CURRENT_AND_PLAY";
     static final String CMD_APPEND_TO_QUEUE = "isaivazhi.playback.APPEND_TO_QUEUE";
+    static final String CMD_APPEND_TO_QUEUE_AND_PLAY = "isaivazhi.playback.APPEND_TO_QUEUE_AND_PLAY";
     static final String CMD_CLEAR_QUEUE_AFTER_CURRENT = "isaivazhi.playback.CLEAR_QUEUE_AFTER_CURRENT";
     static final String CMD_PLAY_INDEX = "isaivazhi.playback.PLAY_INDEX";
     static final String CMD_NEXT_TRACK = "isaivazhi.playback.NEXT_TRACK";
@@ -44,7 +45,7 @@ public final class PlaybackCommandContract {
     static final String EVT_AUDIO_PLAY_STATE_CHANGED = "isaivazhi.playback.event.AUDIO_PLAY_STATE_CHANGED";
     static final String EVT_QUEUE_CURRENT_CHANGED = "isaivazhi.playback.event.QUEUE_CURRENT_CHANGED";
     static final String EVT_QUEUE_CHANGED = "isaivazhi.playback.event.QUEUE_CHANGED";
-    static final String EVT_QUEUE_ENDED = "isaivazhi.playback.event.QUEUE_ENDED";
+    public static final String EVT_QUEUE_ENDED = "isaivazhi.playback.event.QUEUE_ENDED";
     static final String EVT_AUDIO_ERROR = "isaivazhi.playback.event.AUDIO_ERROR";
     public static final String EVT_MEDIA_ACTION = "isaivazhi.playback.event.MEDIA_ACTION";
 
@@ -89,6 +90,7 @@ public final class PlaybackCommandContract {
                 .add(command(CMD_INSERT_AFTER_CURRENT))
                 .add(command(CMD_INSERT_BEFORE_CURRENT_AND_PLAY))
                 .add(command(CMD_APPEND_TO_QUEUE))
+                .add(command(CMD_APPEND_TO_QUEUE_AND_PLAY))
                 .add(command(CMD_CLEAR_QUEUE_AFTER_CURRENT))
                 .add(command(CMD_PLAY_INDEX))
                 .add(command(CMD_NEXT_TRACK))

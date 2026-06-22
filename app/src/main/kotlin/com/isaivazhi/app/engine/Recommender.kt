@@ -451,14 +451,11 @@ class Recommender(
         frozenZoneSize: Int = 5,
         stableZoneEnd: Int = 15,
     ): List<Song> {
-        if (upcoming.size <= frozenZoneSize) return upcoming
-        val frozenZone = upcoming.subList(0, minOf(frozenZoneSize, upcoming.size))
-        val stableSrc = if (upcoming.size > frozenZoneSize)
-            upcoming.subList(frozenZoneSize, minOf(stableZoneEnd, upcoming.size))
-        else emptyList()
-        val fluidSrc = if (upcoming.size > stableZoneEnd)
-            upcoming.subList(stableZoneEnd, upcoming.size)
-        else emptyList()
+        val zones = SoftRefreshPlanner.split(upcoming, frozenZoneSize, stableZoneEnd)
+        if (!zones.hasRefreshableTail) return upcoming
+        val frozenZone = zones.frozen
+        val stableSrc = zones.stable
+        val fluidSrc = zones.fluid
 
         // Re-rank stable zone by blended-vec similarity.
         val stableHashes = stableSrc.mapNotNull { it.contentHash }
@@ -479,15 +476,13 @@ class Recommender(
                 song to sim
             }.sortedByDescending { it.second }.map { it.first }
         }
-        val stableFiltered = RecommendationPolicy.filterSongsForUpNext(stableSorted, policyExcludes)
-
         // Rebuild fluid zone with fresh recommendations against the
         // blended vector, excluding frozen+stable+current.
-        val excludeFns = (frozenZone + stableFiltered).map { it.filename }.toMutableSet().also {
+        val excludeFns = (frozenZone + stableSorted).map { it.filename }.toMutableSet().also {
             it += currentSong.filename
             it += extraExcludeFilenames
         }
-        val fluidTarget = (upcoming.size - frozenZone.size - stableFiltered.size).coerceAtLeast(20)
+        val fluidTarget = (upcoming.size - frozenZone.size - stableSorted.size).coerceAtLeast(20)
         val fluidNew = runCatching {
             recommendUpcoming(
                 currentSong = currentSong,
@@ -501,7 +496,14 @@ class Recommender(
                 blendedQueryVec = blendedQueryVec,
             )
         }.getOrDefault(fluidSrc)
-        return frozenZone + stableFiltered + fluidNew
+        return RecommendationRefreshFinalizer.finalizeSoftRefresh(
+            frozenZone = frozenZone,
+            stableCandidates = stableSorted,
+            fluidCandidates = fluidNew,
+            currentFilename = currentSong.filename,
+            policyExcludes = policyExcludes,
+            cooldownFilenames = extraExcludeFilenames,
+        ).finalTail
     }
 
     suspend fun softRefreshTail(

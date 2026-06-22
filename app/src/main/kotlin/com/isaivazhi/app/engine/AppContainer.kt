@@ -23,6 +23,9 @@ class AppContainer(private val appContext: Context) {
     val toaster: Toaster by lazy { Toaster() }
 
     val embeddingDb: EmbeddingDbFacade by lazy { EmbeddingDbFacade(appContext) }
+    val recommendationInputRevisions: RecommendationInputRevisionTracker by lazy {
+        RecommendationInputRevisionTracker()
+    }
 
     // Scope used to fan out async work from synchronous engine callbacks
     // (favorite toggle → similarity propagation, etc.). Kept small and
@@ -61,6 +64,7 @@ class AppContainer(private val appContext: Context) {
                     taste.propagateSimilarityBoost(fn, delta, "favorite_toggle")
                     _rebuildSignal.emit("favorite_toggle")
                 }
+                invalidateRecommendationInputs("favorite_toggle")
                 // Push #74: mirror the favorites set to the CapacitorStorage
                 // SharedPreferences the Java service reads in
                 // Media3PlaybackService.isCurrentFavorite (line 1157). Without
@@ -174,6 +178,7 @@ class AppContainer(private val appContext: Context) {
                     taste.propagateSimilarityBoost(fn, delta, "dislike_toggle")
                     _rebuildSignal.emit("dislike_toggle")
                 }
+                invalidateRecommendationInputs("dislike_toggle")
                 if (nowDis) {
                     playback.removeFilenamesFromUpcoming(setOf(fn))
                 }
@@ -235,7 +240,11 @@ class AppContainer(private val appContext: Context) {
         PlaybackEngine(
             appContext, preferences, history, taste, signalTimeline, session, toaster,
             activityLog, favorites, recentlySurfacedTracker,
-        )
+        ).also { engine ->
+            engine.onRecommendationInputsChanged = { reason ->
+                invalidateRecommendationInputs(reason)
+            }
+        }
     }
 
     val recommender: Recommender by lazy { Recommender(embeddingDb) }
@@ -273,6 +282,10 @@ class AppContainer(private val appContext: Context) {
      */
     val recommendationCache: RecommendationCache by lazy {
         RecommendationCache(this, applicationScope)
+    }
+
+    val recommendationRefresh: RecommendationRefreshCoordinator by lazy {
+        RecommendationRefreshCoordinator(this, applicationScope)
     }
 
     /**
@@ -331,6 +344,7 @@ class AppContainer(private val appContext: Context) {
             "AppContainer",
             "Engine reset: preserved ${favSet.size} favorites + ${disSet.size} dislikes; re-applied priors for ${(favSet + disSet).size} songs"
         )
+        invalidateRecommendationInputs("engine_reset")
 
         // After reseeding manual priors, re-apply a similarity halo around each
         // favorite so its top-N similar songs regain a positive boost.
@@ -354,5 +368,61 @@ class AppContainer(private val appContext: Context) {
         sideEffectScope.launch {
             try { preferences.clear() } catch (t: Throwable) { android.util.Log.w("AppContainer", "preferences.clear failed: ${t.message}") }
         }
+    }
+
+    fun invalidateRecommendationInputs(reason: String, triggerPrecompute: Boolean = true) {
+        val revision = recommendationInputRevisions.invalidate()
+        activityLog.log(
+            category = "queue",
+            type = "REC_INPUTS_INVALIDATED",
+            message = "Recommendation inputs invalidated: $reason (r$revision)",
+            data = mapOf(
+                "reason" to reason,
+                "revision" to revision,
+                "triggerPrecompute" to triggerPrecompute,
+            ),
+        )
+        recommendationCache.invalidate(reason, revision, triggerPrecompute)
+    }
+
+    fun setTasteAdventurous(value: Float) {
+        taste.setAdventurous(value)
+        invalidateRecommendationInputs("tuning_adventurous")
+    }
+
+    fun setTasteSessionBias(value: Float) {
+        taste.setSessionBias(value)
+        invalidateRecommendationInputs("tuning_session_bias")
+    }
+
+    fun setTasteNegativeStrength(value: Float) {
+        taste.setNegativeStrength(value)
+        invalidateRecommendationInputs("tuning_negative_strength")
+    }
+
+    fun resetTasteAdventurous() = setTasteAdventurous(TasteEngine.DEFAULT_ADVENTUROUS)
+
+    fun resetTasteSessionBias() = setTasteSessionBias(TasteEngine.DEFAULT_SESSION_BIAS)
+
+    fun resetTasteNegativeStrength() = setTasteNegativeStrength(TasteEngine.DEFAULT_NEGATIVE_STRENGTH)
+
+    fun resetTasteSignalForSong(filename: String) {
+        taste.resetSignalForSong(filename)
+        invalidateRecommendationInputs("taste_signal_reset")
+    }
+
+    fun releaseRecommendationCooldown(filename: String): Boolean {
+        val removed = recentlySurfacedTracker.remove(filename)
+        if (removed) {
+            invalidateRecommendationInputs("cooldown_release")
+        }
+        return removed
+    }
+
+    fun clearRecommendationCooldown(): Boolean {
+        if (recentlySurfacedTracker.activeEntries().isEmpty()) return false
+        recentlySurfacedTracker.clearAll()
+        invalidateRecommendationInputs("cooldown_clear")
+        return true
     }
 }

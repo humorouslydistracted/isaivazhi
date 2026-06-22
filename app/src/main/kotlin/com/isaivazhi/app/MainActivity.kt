@@ -80,6 +80,7 @@ import com.isaivazhi.app.engine.ArtPrefetch
 import com.isaivazhi.app.engine.DebugLogCapture
 import com.isaivazhi.app.engine.EmbeddingsImport
 import com.isaivazhi.app.engine.LibraryCache
+import com.isaivazhi.app.engine.QueueContinuationPolicy
 import com.isaivazhi.app.engine.Song
 import com.isaivazhi.app.engine.TasteEngine
 import com.isaivazhi.app.engine.signedDirectScore
@@ -659,7 +660,7 @@ private fun AppRoot(container: AppContainer) {
             dislikedSet,
         )
     }
-    var lastBlendInfo by remember { mutableStateOf<LastBlendInfo?>(null) }
+    var lastBlendInfo by remember { mutableStateOf<com.isaivazhi.app.engine.RecommendationBlendInfo?>(null) }
     val timelineEvents by container.signalTimeline.events.collectAsState()
     // Push #57: filepaths the user marked "skip embedding" for. The AI
     // page's Pending list excludes these.
@@ -819,7 +820,7 @@ private fun AppRoot(container: AppContainer) {
                 container.embeddingDb.clearVecHeapCache()
                 container.embeddingDb.prewarmFromLibrary(songs)
                 container.embeddingDb.fullWarmFromDb()
-                container.recommendationCache.precomputeNow(reason = "import_done")
+                container.invalidateRecommendationInputs("import_done")
                 refreshDbStats(container) { rc, dim, ext, fns, fps ->
                     embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                     embeddedFilenames = fns
@@ -1589,6 +1590,12 @@ private fun AppRoot(container: AppContainer) {
         songs.firstOrNull { it.filename == id }?.title?.takeIf { it.isNotBlank() } ?: id
     }
     val refreshInProgress by container.playback.refreshBusy.collectAsState()
+    val hardRefreshBlendInfo by container.recommendationRefresh.lastBlendInfo.collectAsState()
+    LaunchedEffect(hardRefreshBlendInfo) {
+        if (hardRefreshBlendInfo != null) {
+            lastBlendInfo = hardRefreshBlendInfo
+        }
+    }
     LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, songs.size, similarFrozen) {
         val mediaId = playbackState.currentMediaId
         if (mediaId == null || songs.isEmpty() || (embeddingsRowCount ?: 0) == 0) {
@@ -1632,180 +1639,9 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
-    val refreshUpcomingWithAI: () -> Unit = refreshUpcomingWithAI@ {
-        val mediaId = playbackState.currentMediaId ?: return@refreshUpcomingWithAI
-        val current = songs.firstOrNull { it.filename == mediaId } ?: return@refreshUpcomingWithAI
-        // Phase 2 (2026-06-01): re-entrancy guard + busy state. Flips the
-        // Refresh icon to a spinner across MiniPlayer / NowPlaying /
-        // lockscreen until the queue rebuild completes. Context-aware
-        // pre-toast lets the user know when embeddings are still indexing
-        // so the result reflects only what's ready so far.
-        if (container.playback.refreshBusy.value) return@refreshUpcomingWithAI
-        container.playback.setRefreshBusy(true)
-
-        // Bugfix 2026-06-01d: cache-pop fast path. RecommendationCache
-        // continuously precomputes a tail as the current song changes
-        // (process-lifetime, so it works even when MainActivity has been
-        // destroyed during a long lockscreen). If a tail is ready we
-        // serve it instantly — no sqlite-vec mmap reload, no Recommender
-        // call. Falls through to the live-compute path only on cache miss.
-        val cachedTail = container.recommendationCache.popTail()
-        if (cachedTail != null && cachedTail.isNotEmpty()) {
-            val playNextSet = playbackState.playNextFilenames
-            val byFn = songs.associateBy { it.filename }
-            val playNextSongs = playNextSet.mapNotNull { byFn[it] }
-            val recentlySurfacedForCache = container.recentlySurfacedTracker.recentlySurfaced()
-            val policyFilteredTail = com.isaivazhi.app.engine.RecommendationPolicy.filterSongsForUpNext(
-                cachedTail,
-                upNextPolicyExcludes,
-            )
-            val finalCacheTail = policyFilteredTail.filter {
-                it.filename !in playNextSet &&
-                    it.filename != mediaId &&
-                    it.filename !in recentlySurfacedForCache
-            }
-            val finalUpcoming = playNextSongs + finalCacheTail
-            container.activityLog.log(
-                category = "queue",
-                type = "REFRESH_CACHE_HIT",
-                message = "Served upcoming from RecommendationCache (size=${cachedTail.size}, afterPolicy=${policyFilteredTail.size}, afterRecency=${finalCacheTail.size})",
-                data = mapOf(
-                    "tailSize" to cachedTail.size,
-                    "policyFilteredSize" to policyFilteredTail.size,
-                    "afterRecencySize" to finalCacheTail.size,
-                    "mediaId" to mediaId,
-                ),
-            )
-            // Recency suppression applied via recentlySurfaced() excludes at recommend time.
-            container.toaster.show("Up Next refreshed")
-            container.playback.replaceUpcoming(
-                newUpcoming = finalUpcoming,
-                newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
-            )
-            container.playback.setRefreshBusy(false)
-            return@refreshUpcomingWithAI
-        }
-
-        val embStatus = container.embedding.status.value
-        if (embStatus.inProgress && embStatus.total > 0) {
-            container.toaster.show(
-                "AI is still indexing (${embStatus.processed}/${embStatus.total}) — " +
-                    "refresh uses what's ready."
-            )
-        }
-        // Bugfix 2026-06-01b: dispatch on Dispatchers.Default, NOT the
-        // default Compose rememberCoroutineScope dispatcher
-        // (AndroidUiDispatcher.Main). That dispatcher runs via Choreographer
-        // frame callbacks; while the activity is STOPPED (screen locked) no
-        // frames tick, so a launch body queued there does not execute until
-        // the user unlocks. Lockscreen Refresh taps were appearing to take
-        // 10s–60s because the recommend work was deferred until unlock.
-        // Running on Dispatchers.Default decouples the recommend pipeline
-        // from the UI lifecycle.
-        val dispatchStartedAt = android.os.SystemClock.elapsedRealtime()
-        coroutineScope.launch(kotlinx.coroutines.Dispatchers.Default) {
-            val dispatchLatencyMs = android.os.SystemClock.elapsedRealtime() - dispatchStartedAt
-            container.activityLog.log(
-                category = "queue",
-                type = "REFRESH_DISPATCH_START",
-                message = "refreshUpcomingWithAI body dispatched",
-                data = mapOf(
-                    "dispatchLatencyMs" to dispatchLatencyMs,
-                    "mediaId" to mediaId,
-                ),
-            )
-            val recommendStartedAt = android.os.SystemClock.elapsedRealtime()
-            try {
-            val playNextSet = playbackState.playNextFilenames
-            val byFn = songs.associateBy { it.filename }
-            val playNextSongs = playNextSet.mapNotNull { byFn[it] }
-            val excludeFns = playNextSet + mediaId
-            val blendedTriple = runCatching {
-                container.recommender.buildBlendedVec(
-                    currentSongHash = current.contentHash,
-                    sessionListened = container.session.listened.value,
-                    profileVec = cachedProfileVec,
-                    library = songs,
-                    mode = "refresh",
-                    sessionBias = tuning.sessionBias,
-                )
-            }.getOrNull()
-            blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
-            val blendedVec = blendedTriple?.first
-            // Recency suppression: exclude songs the algorithm surfaced within
-            // the last 6 hours so recently queued tracks don't immediately
-            // resurface. Manual user taps are never recorded in this tracker.
-            val recentlySurfaced = container.recentlySurfacedTracker.recentlySurfaced()
-            val excludeFnsWithRecency = excludeFns + recentlySurfaced
-            val newTail: List<Song> = if (recMode && (embeddingsRowCount ?: 0) > 0) {
-                runCatching {
-                    container.recommender.recommendUpcoming(
-                        current, songs, k = 50,
-                        adventurous = tuning.adventurous,
-                        extraExcludeFilenames = excludeFnsWithRecency,
-                        hardBlockedFilenames = upNextHardBlocked,
-                        dislikedFilenames = dislikedSet,
-                        softExcludedFilenames = upNextSoftExcluded,
-                        blendedQueryVec = blendedVec,
-                    )
-                }.getOrDefault(emptyList())
-            } else {
-                songs.filter { it.filePath != null && it.filename !in excludeFnsWithRecency }
-                    .shuffled().take(50)
-            }
-            val recommendElapsedMs = android.os.SystemClock.elapsedRealtime() - recommendStartedAt
-            container.activityLog.log(
-                category = "queue",
-                type = "REFRESH_RECOMMEND_DONE",
-                message = "recommendUpcoming returned ${newTail.size} tracks",
-                data = mapOf(
-                    "elapsedMs" to recommendElapsedMs,
-                    "tailSize" to newTail.size,
-                    "blend" to (blendedTriple?.third ?: "n/a"),
-                ),
-            )
-            container.toaster.show("Up Next refreshed (blend=${blendedTriple?.third ?: "current"})")
-            val finalUpcoming = playNextSongs + newTail
-            android.util.Log.i(
-                "QueueOp",
-                "Refresh: blend=${blendedTriple?.third ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} AI"
-            )
-            val replaceStartedAt = android.os.SystemClock.elapsedRealtime()
-            container.playback.replaceUpcoming(
-                newUpcoming = finalUpcoming,
-                newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
-            )
-            container.activityLog.log(
-                category = "queue",
-                type = "REFRESH_REPLACE_DONE",
-                message = "replaceUpcoming done",
-                data = mapOf(
-                    "elapsedMs" to (android.os.SystemClock.elapsedRealtime() - replaceStartedAt),
-                    "finalUpcomingSize" to finalUpcoming.size,
-                ),
-            )
-            } finally {
-                container.playback.setRefreshBusy(false)
-            }
-        }
+    val refreshUpcomingWithAI: () -> Unit = {
+        container.recommendationRefresh.requestRefresh(reason = "ui")
     }
-
-    // Phase E (2026-06-01): bridge the lockscreen Refresh button into the
-    // shared lambda above. PlaybackEngine emits on refreshRequests when the
-    // service forwards EVT_MEDIA_ACTION action="refresh_queue" from the
-    // notification CommandButton tap. We keep all recommender state in this
-    // UI process; the service is intentionally state-free for the AI side.
-    LaunchedEffect(Unit) {
-        container.playback.refreshRequests.collect {
-            container.activityLog.log(
-                category = "notification",
-                type = "LOCKSCREEN_REFRESH_TAP",
-                message = "Lockscreen/notification Refresh tap received by UI",
-            )
-            refreshUpcomingWithAI()
-        }
-    }
-
     /**
      * Auto-build queue helper for single-song taps. Mirrors the Capacitor
      * app's `_doRefresh('manual')` — tapping a card plays that song AND
@@ -1865,7 +1701,7 @@ private fun AppRoot(container: AppContainer) {
                     sessionBias = tuning.sessionBias,
                 )
             }.getOrNull()
-            blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
+            blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
             val blendedVec = blendedTriple?.first
             // Recency suppression for generated tails. The manually-tapped
             // song remains playable as the current item but is removed from
@@ -2005,83 +1841,94 @@ private fun AppRoot(container: AppContainer) {
     // (REPEAT_ALL loops the section; REPEAT_ONE loops the song), append
     // 50 AI recommendations as a tail so playback continues seamlessly
     // after the section ends. Capacitor parity: `_doRefresh('queue_exhausted')`.
-    LaunchedEffect(playbackState.currentMediaId, playbackState.queueFilenames.size, playbackState.queueContext) {
-        val mediaId = playbackState.currentMediaId ?: return@LaunchedEffect
-        val queueSize = playbackState.queueFilenames.size
-        if (queueSize == 0) return@LaunchedEffect
-        // Only fire when we're on the LAST item of the queue.
-        val curIdx = playbackState.queueIndex
+    suspend fun appendQueueExhaustRecommendations(
+        trigger: String,
+        playFirstWhenStopped: Boolean,
+        debounceMs: Long,
+        drainLedgerFirst: Boolean,
+    ) {
+        var stateNow = container.playback.state.value
+        val mediaId = stateNow.currentMediaId ?: return
+        val queueSize = stateNow.queueFilenames.size
+        if (queueSize == 0) return
+        val curIdx = stateNow.queueIndex
         if (curIdx < queueSize - 1) {
             container.activityLog.log(
                 category = "engine",
                 type = "QUEUE_EXHAUST_SKIP",
-                message = "not on last item (curIdx=$curIdx of $queueSize, ctx=${playbackState.queueContext})",
-                data = mapOf("reason" to "not_last", "curIdx" to curIdx, "queueSize" to queueSize),
+                message = "not on last item (curIdx=$curIdx of $queueSize, ctx=${stateNow.queueContext})",
+                data = mapOf("reason" to "not_last", "curIdx" to curIdx, "queueSize" to queueSize, "trigger" to trigger),
             )
-            return@LaunchedEffect
+            return
         }
-        // Push #70: queueContext drives the AI-append decision before loop mode.
-        //   ALBUM / BROWSE_SECTION → never append AI. Section is finite.
-        //   LIBRARY / DISCOVER_SECTION / AI_RECOMMENDED → append AI when loop=OFF.
-        val ctx = playbackState.queueContext
-        if (ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM ||
-            ctx == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION
-        ) {
+
+        val ctx = stateNow.queueContext
+        if (!QueueContinuationPolicy.shouldAppendAiTail(ctx, stateNow.repeatMode)) {
+            val reason = if (stateNow.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
+                "loop_on"
+            } else {
+                "finite_section"
+            }
             container.activityLog.log(
                 category = "engine",
                 type = "QUEUE_EXHAUST_SKIP",
-                message = "section context $ctx (no AI ever)",
-                data = mapOf("reason" to "finite_section", "ctx" to ctx.name),
+                message = if (reason == "loop_on") {
+                    "repeat=${stateNow.repeatMode} (OFF=0 ONE=1 ALL=2)"
+                } else {
+                    "section context $ctx (no AI ever)"
+                },
+                data = mapOf("reason" to reason, "repeatMode" to stateNow.repeatMode, "ctx" to ctx.name, "trigger" to trigger),
             )
-            return@LaunchedEffect
+            return
         }
-        // Respect repeat modes: ALL loops the section; ONE loops the song.
-        // Both = no append. Only OFF gets the recommender tail.
-        if (playbackState.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
-            container.activityLog.log(
-                category = "engine",
-                type = "QUEUE_EXHAUST_SKIP",
-                message = "repeat=${playbackState.repeatMode} (OFF=0 ONE=1 ALL=2)",
-                data = mapOf("reason" to "loop_on", "repeatMode" to playbackState.repeatMode),
-            )
-            return@LaunchedEffect
-        }
-        val current = songs.firstOrNull { it.filename == mediaId } ?: return@LaunchedEffect
+
+        val current = songs.firstOrNull { it.filename == mediaId } ?: return
         if ((embeddingsRowCount ?: 0) == 0) {
             container.activityLog.log(
                 category = "engine",
                 type = "QUEUE_EXHAUST_SKIP",
                 message = "no embeddings (rowCount=0)",
-                data = mapOf("reason" to "no_embeddings"),
+                data = mapOf("reason" to "no_embeddings", "trigger" to trigger),
             )
-            return@LaunchedEffect
+            return
         }
-        // Debounce + check that we're still on the last item after the delay
-        // (user may have already tapped Next to a different queue).
-        kotlinx.coroutines.delay(500)
-        if (playbackState.currentMediaId != mediaId) return@LaunchedEffect
-        if (playbackState.queueIndex < playbackState.queueFilenames.size - 1) return@LaunchedEffect
+
+        if (debounceMs > 0L) {
+            kotlinx.coroutines.delay(debounceMs)
+            stateNow = container.playback.state.value
+            if (stateNow.currentMediaId != mediaId) return
+            if (stateNow.queueIndex < stateNow.queueFilenames.size - 1) return
+        }
+
+        if (drainLedgerFirst) {
+            runCatching {
+                container.playbackSignalProcessor.processPending(
+                    songs = songs,
+                    reason = trigger,
+                    logWhenEmpty = false,
+                )
+            }.onFailure {
+                android.util.Log.w("QueueExhaust", "ledger drain failed before $trigger: ${it.message}")
+            }
+        }
+
         android.util.Log.i(
             "QueueExhaust",
-            "appending AI tail: ctx=$ctx queueSize=$queueSize mediaId=$mediaId"
+            "appending AI tail: trigger=$trigger playFirst=$playFirstWhenStopped ctx=$ctx queueSize=$queueSize mediaId=$mediaId"
         )
         val recentlySurfacedForExhaust = container.recentlySurfacedTracker.recentlySurfaced()
-        val excludeFns = playbackState.queueFilenames.toSet() + recentlySurfacedForExhaust
-        // Push #67: build a blended query vector that mixes the current
-        // song with the session-listened rolling window and the long-
-        // term profile centroid. This is the recommender's view of
-        // "what should come next" instead of pure neighbors-of-current.
+        val excludeFns = stateNow.queueFilenames.toSet() + recentlySurfacedForExhaust
         val blendedTriple = runCatching {
             container.recommender.buildBlendedVec(
                 currentSongHash = current.contentHash,
                 sessionListened = container.session.listened.value,
-                profileVec = cachedProfileVec,  // Push #68: persisted centroid.
+                profileVec = cachedProfileVec,
                 library = songs,
                 mode = "play",
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
-        blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
+        blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
         val blendedVec = blendedTriple?.first
         val tail = runCatching {
             container.recommender.recommendUpcoming(
@@ -2097,8 +1944,38 @@ private fun AppRoot(container: AppContainer) {
             )
         }.getOrDefault(emptyList())
         if (tail.isNotEmpty()) {
-            container.playback.appendToQueue(tail)
+            if (playFirstWhenStopped) {
+                container.playback.appendToQueueAndPlayFirst(tail)
+            } else {
+                container.playback.appendToQueue(tail)
+            }
             container.toaster.show("Up Next refreshed with recommendations (${blendedTriple?.third ?: "current"})")
+        }
+    }
+
+    LaunchedEffect(playbackState.currentMediaId, playbackState.queueFilenames.size, playbackState.queueContext, playbackState.repeatMode) {
+        appendQueueExhaustRecommendations(
+            trigger = "last_item_preappend",
+            playFirstWhenStopped = false,
+            debounceMs = 500L,
+            drainLedgerFirst = false,
+        )
+    }
+
+    val latestAppendQueueExhaustRecommendations by rememberUpdatedState<suspend (String, Boolean, Long, Boolean) -> Unit>(
+        newValue = { trigger, playFirstWhenStopped, debounceMs, drainLedgerFirst ->
+            appendQueueExhaustRecommendations(
+                trigger = trigger,
+                playFirstWhenStopped = playFirstWhenStopped,
+                debounceMs = debounceMs,
+                drainLedgerFirst = drainLedgerFirst,
+            )
+        }
+    )
+
+    LaunchedEffect(Unit) {
+        container.playback.queueEndedEvents.collect {
+            latestAppendQueueExhaustRecommendations("queue_ended_event", true, 0L, true)
         }
     }
 
@@ -2144,7 +2021,7 @@ private fun AppRoot(container: AppContainer) {
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
-        blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
+        blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
         val blendedVec = blendedTriple?.first ?: return@LaunchedEffect
         val newTail = runCatching {
             container.recommender.softRefreshUpcomingTail(
@@ -2320,6 +2197,30 @@ private fun AppRoot(container: AppContainer) {
                         onRefresh = refreshUpcomingWithAI,
                         refreshEnabled = playbackState.currentMediaId != null,
                         refreshInProgress = refreshInProgress,
+                        similarSongs = similarToCurrent,
+                        similarLoading = similarLoading,
+                        similarFrozen = similarFrozen,
+                        similarSeedTitle = similarSeedTitle,
+                        queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
+                        onSimilarTap = { song -> playFromTap(song) },
+                        onSimilarPlayNext = { song ->
+                            container.playback.playNext(song)
+                            container.toaster.show("Playing next")
+                        },
+                        onSimilarLongPress = { song ->
+                            menuPlaylistContext = null
+                            menuSongsTabIndex = null
+                            menuSong = song
+                        },
+                        onQueueAllSimilar = queueAllSimilarAfterCurrent,
+                        onToggleSimilarFrozen = {
+                            if (similarFrozen) {
+                                similarFrozen = false
+                            } else {
+                                similarFrozen = true
+                                similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
+                            }
+                        },
                     )
                     NavigationBar {
                         Tab.entries.forEachIndexed { idx, tab ->
@@ -2545,7 +2446,7 @@ private fun AppRoot(container: AppContainer) {
                                             sessionBias = tuning.sessionBias,
                                         )
                                     }.getOrNull()
-                                    blendedTriple?.let { (_, w, label) -> lastBlendInfo = LastBlendInfo(w, label) }
+                                    blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
                                     val blendedVec = blendedTriple?.first
                                     val newTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
@@ -2702,11 +2603,23 @@ private fun AppRoot(container: AppContainer) {
         exit = slideOutVertically(targetOffsetY = { -it })) {
         SearchOverlay(
             songs = songs,
+            playlists = playlistsList,
+            folders = container.folderExclusion.allFolders(
+                rawSongs,
+                manualFolderPaths,
+                excludedFolderPaths,
+            ),
             onDismiss = { overlay = Overlay.None },
-            // Push #70: Search result tap = single song + AI tail (LIBRARY).
-            onPlay = { queue, idx ->
-                queue.getOrNull(idx)?.let { playFromTap(it) }
+            onPlaySong = { playFromTap(it) },
+            onOpenAlbum = { albumName ->
+                albumToExpand = albumName
+                albumRevealRequestId += 1
+                coroutineScope.launch { pagerState.animateScrollToPage(Tab.Albums.ordinal) }
             },
+            onOpenPlaylist = { id ->
+                overlay = Overlay.PlaylistDetail(id)
+            },
+            onOpenFolders = { overlay = Overlay.Folders },
         )
     }
 
@@ -2784,7 +2697,7 @@ private fun AppRoot(container: AppContainer) {
                             LibraryCache.invalidate(ctx)
                             rawSongs = LibraryCache.loadOrScan(ctx, force = true)
                             container.library.value = songs
-                            container.recommendationCache.precomputeNow(reason = "folder_add")
+                            container.invalidateRecommendationInputs("folder_add")
                             container.toaster.show("Folder added to library")
                         }
                     },
@@ -2808,7 +2721,7 @@ private fun AppRoot(container: AppContainer) {
                 coroutineScope.launch {
                     container.folderExclusion.setExcluded(path, true)
                     // songs derived state auto-updates; resync recommendation queue
-                    container.recommendationCache.precomputeNow(reason = "folder_exclude")
+                    container.invalidateRecommendationInputs("folder_exclude")
                 }
             },
             onIncludeFolder = { path ->
@@ -2820,10 +2733,10 @@ private fun AppRoot(container: AppContainer) {
                         it.filePath?.let { fp -> java.io.File(fp).parent } == path
                     }
                     targets.forEach { s ->
-                        container.taste.resetSignalForSong(s.filename)
+                        container.resetTasteSignalForSong(s.filename)
                         container.history.resetStatsForSong(s.filename)
                     }
-                    container.recommendationCache.precomputeNow(reason = "folder_include")
+                    container.invalidateRecommendationInputs("folder_include")
                 }
             },
             onAddFolder = { folderPickerLauncher.launch(null) },
@@ -2929,32 +2842,32 @@ private fun AppRoot(container: AppContainer) {
             ),
             onBack = { overlay = Overlay.None },
             onAdventurousChange = {
-                container.taste.setAdventurous(it)
+                container.setTasteAdventurous(it)
                 container.toaster.show("Adventurous: ${(it * 100).toInt()}%")
             },
             onSessionBiasChange = {
-                container.taste.setSessionBias(it)
+                container.setTasteSessionBias(it)
                 container.toaster.show("Session weight: ${(it * 100).toInt()}%")
             },
             onNegativeStrengthChange = {
-                container.taste.setNegativeStrength(it)
+                container.setTasteNegativeStrength(it)
                 container.toaster.show("Negative guard: ${(it * 100).toInt()}%")
             },
             onAdventurousReset = {
-                container.taste.resetAdventurous()
+                container.resetTasteAdventurous()
                 container.toaster.show("Adventurous reset to ${(TasteEngine.DEFAULT_ADVENTUROUS * 100).toInt()}%")
             },
             onSessionBiasReset = {
-                container.taste.resetSessionBias()
+                container.resetTasteSessionBias()
                 container.toaster.show("Session weight reset to ${(TasteEngine.DEFAULT_SESSION_BIAS * 100).toInt()}%")
             },
             onNegativeStrengthReset = {
-                container.taste.resetNegativeStrength()
+                container.resetTasteNegativeStrength()
                 container.toaster.show("Negative guard reset to ${(TasteEngine.DEFAULT_NEGATIVE_STRENGTH * 100).toInt()}%")
             },
             onResetSongStats = { fn ->
                 container.history.resetStatsForSong(fn)
-                container.taste.resetSignalForSong(fn)
+                container.resetTasteSignalForSong(fn)
             },
             onResetEngineConfirmed = {
                 container.resetEngine()
@@ -3308,7 +3221,7 @@ private fun AppRoot(container: AppContainer) {
                 },
                 onTrailingAction = if (viewAllCat == BrowseCategory.ResumesIn) {
                     { song ->
-                        if (container.recentlySurfacedTracker.remove(song.filename)) {
+                        if (container.releaseRecommendationCooldown(song.filename)) {
                             cooldownEntries = container.recentlySurfacedTracker.activeEntries()
                             container.toaster.show("Released — eligible for recommendations again")
                         }
@@ -3321,9 +3234,10 @@ private fun AppRoot(container: AppContainer) {
                 },
                 onClearAll = if (viewAllCat == BrowseCategory.ResumesIn) {
                     {
-                        container.recentlySurfacedTracker.clearAll()
-                        cooldownEntries = container.recentlySurfacedTracker.activeEntries()
-                        container.toaster.show("All songs released — eligible for recommendations again")
+                        if (container.clearRecommendationCooldown()) {
+                            cooldownEntries = container.recentlySurfacedTracker.activeEntries()
+                            container.toaster.show("All songs released - eligible for recommendations again")
+                        }
                     }
                 } else null,
                 clearAllConfirmMessage = if (viewAllCat == BrowseCategory.ResumesIn && listSongs.isNotEmpty()) {
@@ -3411,7 +3325,7 @@ private fun AppRoot(container: AppContainer) {
                 coroutineScope.launch { pagerState.animateScrollToPage(Tab.Albums.ordinal) }
             },
             onResetTasteSignal = {
-                container.taste.resetSignalForSong(sheetSong.filename)
+                container.resetTasteSignalForSong(sheetSong.filename)
                 container.toaster.show("Taste signal reset")
             },
             // Push #40 Tier 1C: explicit "Embed this song" entry. Always
@@ -3888,14 +3802,9 @@ private fun ingestPendingEvidence(
     container.history.recordCompleted(mediaId, System.currentTimeMillis(), frac)
 }
 
-private data class LastBlendInfo(
-    val weights: com.isaivazhi.app.engine.Recommender.BlendWeights,
-    val label: String,
-)
-
 private fun buildEngineSnapshot(
     tuning: com.isaivazhi.app.engine.TasteEngine.Tuning,
-    lastBlend: LastBlendInfo?,
+    lastBlend: com.isaivazhi.app.engine.RecommendationBlendInfo?,
     queueSize: Int,
     aiMode: Boolean,
     embeddingsCovered: Int,

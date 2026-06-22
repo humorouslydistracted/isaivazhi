@@ -47,6 +47,7 @@ class IsaiVazhiApp : Application() {
             )
             return
         }
+        container.recommendationRefresh.start()
 
         val startedAt = System.currentTimeMillis()
         container.activityLog.log(

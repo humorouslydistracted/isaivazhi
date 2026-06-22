@@ -302,6 +302,11 @@ public class Media3PlaybackService extends MediaSessionService {
                         appendToQueue(items);
                         return success();
                     }
+                    case PlaybackCommandContract.CMD_APPEND_TO_QUEUE_AND_PLAY: {
+                        ArrayList<PlaybackQueueItem> items = PlaybackQueueItem.fromCommandBundle(safeArgs);
+                        appendToQueueAndPlay(items);
+                        return success();
+                    }
                     case PlaybackCommandContract.CMD_CLEAR_QUEUE_AFTER_CURRENT:
                         clearQueueAfterCurrent();
                         return success();
@@ -565,7 +570,9 @@ public class Media3PlaybackService extends MediaSessionService {
             }
 
             PlaybackQueueItem current = queue.get(currentIndex);
+            ArrayList<PlaybackQueueItem> prefix = new ArrayList<>(queue.subList(0, currentIndex));
             ArrayList<PlaybackQueueItem> rebuilt = new ArrayList<>();
+            rebuilt.addAll(prefix);
             rebuilt.add(current);
             if (upcomingItems != null) rebuilt.addAll(upcomingItems);
             queue = rebuilt;
@@ -575,12 +582,8 @@ public class Media3PlaybackService extends MediaSessionService {
             if (oldIndex + 1 < total) {
                 player.removeMediaItems(oldIndex + 1, total);
             }
-            if (oldIndex > 0) {
-                player.removeMediaItems(0, oldIndex);
-            }
-            currentIndex = 0;
             if (upcomingItems != null && !upcomingItems.isEmpty()) {
-                player.addMediaItems(1, PlaybackQueueItem.toMediaItems(upcomingItems));
+                player.addMediaItems(oldIndex + 1, PlaybackQueueItem.toMediaItems(upcomingItems));
             }
             StringBuilder finalIds = new StringBuilder();
             for (int i = 0; i < Math.min(5, queue.size()); i++) {
@@ -590,7 +593,7 @@ public class Media3PlaybackService extends MediaSessionService {
             Log.i(TAG, "replaceUpcoming: after rebuild queueSize=" + queue.size()
                     + " currentIndex=" + currentIndex
                     + " firstIds=[" + finalIds + "]"
-                    + " normalizedFromIndex=" + oldIndex + ")");
+                    + " preservedPrefix=" + prefix.size() + ")");
             emitQueueChanged();
         }
     }
@@ -645,6 +648,37 @@ public class Media3PlaybackService extends MediaSessionService {
             if (items == null || items.isEmpty()) return;
             queue.addAll(items);
             player.addMediaItems(PlaybackQueueItem.toMediaItems(items));
+            emitQueueChanged();
+        }
+    }
+
+    private void appendToQueueAndPlay(List<PlaybackQueueItem> items) {
+        synchronized (queueLock) {
+            if (items == null || items.isEmpty()) return;
+            if (queue.isEmpty() || currentIndex == C.INDEX_UNSET) {
+                setQueue(items, 0, 0L, true);
+                return;
+            }
+
+            int firstNewIndex = queue.size();
+            queue.addAll(items);
+            player.addMediaItems(PlaybackQueueItem.toMediaItems(items));
+            currentIndex = firstNewIndex;
+            currentPlaybackInstanceId = nextPlaybackInstanceId();
+            resetPlayedProgress(0L);
+            playbackCompletedState = false;
+            suppressUpcomingTransition(firstNewIndex);
+
+            PlaybackQueueItem startItem = queue.get(currentIndex);
+            rememberKnownItem(startItem);
+            Log.i(TAG, "appendToQueueAndPlay: added=" + items.size()
+                    + " firstNewIndex=" + firstNewIndex
+                    + " queueSize=" + queue.size()
+                    + " first=" + summarizePath(startItem.filePath));
+
+            player.seekToDefaultPosition(firstNewIndex);
+            player.play();
+            refreshNotificationUiState();
             emitQueueChanged();
         }
     }

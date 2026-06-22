@@ -1,5 +1,8 @@
 package com.isaivazhi.app.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +17,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Pause
@@ -41,10 +46,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.media3.common.Player
 import com.isaivazhi.app.engine.PlaybackEngine
+import com.isaivazhi.app.engine.Song
 
 /**
  * Mini player — 3 visible sections matching the Capacitor reference layout:
@@ -85,15 +92,70 @@ fun MiniPlayer(
     onRefresh: (() -> Unit)? = null,
     refreshEnabled: Boolean = false,
     refreshInProgress: Boolean = false,
+    similarSongs: List<Song> = emptyList(),
+    similarLoading: Boolean = false,
+    similarFrozen: Boolean = false,
+    similarSeedTitle: String? = null,
+    queueAllSimilarEnabled: Boolean = false,
+    onSimilarTap: (Song) -> Unit = {},
+    onSimilarPlayNext: (Song) -> Unit = {},
+    onSimilarLongPress: (Song) -> Unit = {},
+    onQueueAllSimilar: () -> Unit = {},
+    onToggleSimilarFrozen: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     if (state.currentMediaId == null) return
+
+    var similarExpanded by remember { mutableStateOf(false) }
+    val showSimilar = similarLoading || similarSongs.isNotEmpty()
+    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
+    val headerReserve = 56.dp
+    val listMaxHeight = (screenHeight * 0.5f - headerReserve).coerceAtLeast(120.dp)
 
     Column(
         modifier = modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface),
     ) {
+        if (showSimilar) {
+            AnimatedVisibility(
+                visible = similarExpanded,
+                enter = expandVertically(expandFrom = Alignment.Bottom),
+                exit = shrinkVertically(shrinkTowards = Alignment.Bottom),
+            ) {
+                SimilarSongsRow(
+                    songs = similarSongs,
+                    loading = similarLoading,
+                    frozen = similarFrozen,
+                    seedTitle = similarSeedTitle,
+                    queueAllEnabled = queueAllSimilarEnabled,
+                    onTap = onSimilarTap,
+                    onPlayNext = onSimilarPlayNext,
+                    onLongPress = onSimilarLongPress,
+                    onQueueAll = onQueueAllSimilar,
+                    onToggleFrozen = onToggleSimilarFrozen,
+                    layout = SimilarSongsLayout.VerticalList,
+                    listMaxHeight = listMaxHeight,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(20.dp)
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+                    .clickable { similarExpanded = !similarExpanded },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (similarExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (similarExpanded) "Collapse similar songs" else "Expand similar songs",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+
         // Row 1 — info
         Row(
             modifier = Modifier

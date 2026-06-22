@@ -34,7 +34,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.isaivazhi.app.engine.AlbumGroup
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.engine.groupIntoAlbums
 import com.isaivazhi.app.ui.formatDuration
 import com.isaivazhi.app.ui.songHasEmbedding
 
@@ -117,26 +119,6 @@ fun AlbumsScreen(
             }
         }
     }
-}
-
-private data class AlbumGroup(val name: String, val artist: String, val tracks: List<Song>) {
-    val firstArtPath: String? get() = tracks.firstOrNull { it.filePath != null }?.filePath
-}
-
-private fun groupIntoAlbums(songs: List<Song>): List<AlbumGroup> {
-    val byAlbum = LinkedHashMap<String, MutableList<Song>>()
-    for (s in songs) {
-        if (s.filePath == null) continue
-        val key = s.album.ifBlank { "Unknown album" }
-        byAlbum.getOrPut(key) { mutableListOf() }.add(s)
-    }
-    return byAlbum.entries
-        .sortedBy { it.key.lowercase() }
-        .map { (name, tracks) ->
-            val artist = tracks.groupingBy { it.artist.ifBlank { "Unknown artist" } }
-                .eachCount().maxByOrNull { it.value }?.key ?: "Unknown artist"
-            AlbumGroup(name, artist, tracks)
-        }
 }
 
 @OptIn(ExperimentalFoundationApi::class)

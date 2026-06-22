@@ -68,6 +68,9 @@ class PlaybackEngine(
     @Volatile
     var pendingTransitionSource: String = "auto_advance"
 
+    @Volatile
+    private var queueEndRescueTransitionMarker: QueueContinuationPolicy.RescueTransitionMarker? = null
+
     /** Set from MainActivity so history-backed Prev can resolve filenames to [Song]. */
     @Volatile
     var resolveSongByFilename: ((String) -> Song?)? = null
@@ -128,6 +131,7 @@ class PlaybackEngine(
         const val CMD_INSERT_BEFORE_CURRENT_AND_PLAY =
             "isaivazhi.playback.INSERT_BEFORE_CURRENT_AND_PLAY"
         const val CMD_REPLACE_UPCOMING = "isaivazhi.playback.REPLACE_UPCOMING"
+        const val CMD_APPEND_TO_QUEUE_AND_PLAY = "isaivazhi.playback.APPEND_TO_QUEUE_AND_PLAY"
         const val CMD_PLAY_INDEX = "isaivazhi.playback.PLAY_INDEX"
         const val CMD_NEXT_TRACK = "isaivazhi.playback.NEXT_TRACK"
         const val CMD_PREV_TRACK = "isaivazhi.playback.PREV_TRACK"
@@ -135,6 +139,7 @@ class PlaybackEngine(
         const val CMD_UPDATE_NOTIFICATION_STATE = "isaivazhi.playback.UPDATE_NOTIFICATION_STATE"
 
         const val KEY_ITEMS_JSON = "itemsJson"
+        const val KEY_PREFIX_ITEMS_JSON = "prefixItemsJson"
         const val KEY_START_INDEX = "startIndex"
         const val KEY_SEEK_TO_MS = "seekToMs"
         const val KEY_PLAY_WHEN_READY = "playWhenReady"
@@ -166,28 +171,38 @@ class PlaybackEngine(
     /** False until cold-start playback recovery completes (sync or prepareForResume). */
     private val _controllerReady = MutableStateFlow(false)
     val controllerReady: StateFlow<Boolean> = _controllerReady.asStateFlow()
+    var onRecommendationInputsChanged: ((String) -> Unit)? = null
 
     fun markPlaybackRecoveryComplete() {
         _controllerReady.value = true
     }
 
     // 2026-06-01: emits when the lockscreen / notification Refresh-Up-Next
-    // button is tapped. The UI process collects this and invokes the same
-    // refreshUpcomingWithAI() lambda used by the in-app icons. Service-side
-    // we forward the tap as EVT_MEDIA_ACTION action="refresh_queue" (see
-    // controllerListener.onCustomCommand below).
+    // button is tapped. The application-scoped refresh coordinator collects
+    // this and invokes the same hard-refresh pipeline used by the in-app UI.
+    // Service-side we forward the tap as EVT_MEDIA_ACTION action="refresh_queue"
+    // (see controllerListener.onCustomCommand below).
     private val _refreshRequests = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,
     )
     val refreshRequests: kotlinx.coroutines.flow.SharedFlow<Unit> =
         _refreshRequests.asSharedFlow()
 
-    // Phase 2 (2026-06-01): broadcast when refreshUpcomingWithAI() is in
+    internal fun emitRefreshRequest() {
+        _refreshRequests.tryEmit(Unit)
+    }
+
+    private val _queueEndedEvents = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1,
+    )
+    val queueEndedEvents: kotlinx.coroutines.flow.SharedFlow<Unit> =
+        _queueEndedEvents.asSharedFlow()
+
+    // Phase 2 (2026-06-01): broadcast when a hard refresh is in
     // flight. UI swaps the Refresh icon for a CircularProgressIndicator;
     // Media3PlaybackService rebuilds the notification CommandButton with
-    // displayName "Refreshing…" + enabled=false (Phase 3) so the
-    // lockscreen reflects the busy state. Single-writer (MainActivity);
-    // safe to expose mutator publicly because no concurrent producer.
+    // displayName "Refreshing..." + enabled=false (Phase 3) so the
+    // lockscreen reflects the busy state.
     private val _refreshBusy = MutableStateFlow(false)
     val refreshBusy: StateFlow<Boolean> = _refreshBusy.asStateFlow()
     fun setRefreshBusy(busy: Boolean) {
@@ -301,6 +316,16 @@ class PlaybackEngine(
                 origin = "fallback"
             }
             if (prevMediaId != null && prevMediaId != nextMediaId) {
+                val rescueDecision = QueueContinuationPolicy.rescueTransitionDecision(
+                    marker = queueEndRescueTransitionMarker,
+                    prevFilename = prevMediaId,
+                    nextFilename = nextMediaId,
+                    nowMs = System.currentTimeMillis(),
+                )
+                if (rescueDecision.clearMarker) {
+                    queueEndRescueTransitionMarker = null
+                }
+                val suppressPlaybackSignal = rescueDecision.suppressSignal
                 val frac = if (prevDuration > 0) (prevPlayed.toFloat() / prevDuration.toFloat()).coerceIn(0f, 1f) else 0f
                 // Push #76: read the PREV song's playbackInstanceId from the
                 // dedicated snapshot field. Until #76 we read
@@ -320,12 +345,24 @@ class PlaybackEngine(
                     "PlaybackEngine",
                     "transition: prev=$prevMediaId played=${prevPlayed}ms dur=${prevDuration}ms frac=$frac source=$pendingTransitionSource origin=$origin instId=$transitionInstId → next=$nextMediaId rawNext=${mediaItem?.mediaId}"
                 )
-                history?.recordEnd(prevMediaId, frac)
-                // Feed the taste signal pipeline. Snapshot before/after and
-                // append to the timeline so the user can audit each event.
                 val source = transitionSource
-                val t = taste
-                if (t != null) {
+                if (suppressPlaybackSignal) {
+                    activityLog?.log(
+                        category = "playback",
+                        type = "QUEUE_RESCUE_TRANSITION",
+                        message = "Ignored synthetic queue-end jump $prevMediaId -> ${nextMediaId ?: "(none)"}",
+                        data = mapOf(
+                            "from" to prevMediaId,
+                            "to" to (nextMediaId ?: ""),
+                            "source" to source,
+                        ),
+                    )
+                } else {
+                    history?.recordEnd(prevMediaId, frac)
+                    // Feed the taste signal pipeline. Snapshot before/after and
+                    // append to the timeline so the user can audit each event.
+                    val t = taste
+                    if (t != null) {
                     val (before, after) = t.recordPlaybackEvent(prevMediaId, frac, source, transitionInstId)
                     val isSkip = frac < TasteEngine.SKIP_THRESHOLD
                     val isManual = source.startsWith("manual_") || source == "song_tap" ||
@@ -428,6 +465,7 @@ class PlaybackEngine(
                                 reason = if (isSkip) "playback_skip" else "playback_complete",
                             )
                         }
+                    }
                     }
                 }
                 // Reset to auto for the next implicit transition.
@@ -551,6 +589,15 @@ class PlaybackEngine(
             if (command.customAction == PlaybackCommandContract.EVT_MEDIA_ACTION) {
                 val action = args.getString("action", "")
                 val filename = args.getString(PlaybackCommandContract.KEY_FILENAME, "")
+                if (PlaybackNotificationActionRouter.handle(action) { emitRefreshRequest() }) {
+                    activityLog?.log(
+                        category = "notification",
+                        type = "REFRESH_QUEUE",
+                        message = "Lockscreen Refresh Up Next tapped",
+                        data = mapOf("filename" to filename),
+                    )
+                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
                 when (action) {
                     "favorite" -> {
                         val isFav = args.getBoolean("isFavorite", false)
@@ -572,19 +619,15 @@ class PlaybackEngine(
                             data = mapOf("filename" to filename),
                         )
                     }
-                    "refresh_queue" -> {
-                        // 2026-06-01: bridge service → UI for the lockscreen
-                        // Refresh button. tryEmit is non-blocking and OK to
-                        // drop overlapping taps (extraBufferCapacity=1).
-                        _refreshRequests.tryEmit(Unit)
-                        activityLog?.log(
-                            category = "notification",
-                            type = "REFRESH_QUEUE",
-                            message = "Lockscreen Refresh Up Next tapped",
-                            data = mapOf("filename" to filename),
-                        )
-                    }
                 }
+            }
+            if (command.customAction == PlaybackCommandContract.EVT_QUEUE_ENDED) {
+                _queueEndedEvents.tryEmit(Unit)
+                activityLog?.log(
+                    category = "queue",
+                    type = "QUEUE_ENDED",
+                    message = "Playback service reported queue end",
+                )
             }
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
         }
@@ -684,6 +727,15 @@ class PlaybackEngine(
             putInt(KEY_START_INDEX, startIndex)
             putLong(KEY_SEEK_TO_MS, seekToMs.coerceAtLeast(0L))
             putBoolean(KEY_PLAY_WHEN_READY, playWhenReady)
+        }
+    }
+
+    private fun replaceUpcomingCommandArgs(
+        prefixSongs: List<Song>,
+        upcomingSongs: List<Song>,
+    ): Bundle {
+        return queueCommandArgs(upcomingSongs).apply {
+            putString(KEY_PREFIX_ITEMS_JSON, songsToJsonArray(prefixSongs).toString())
         }
     }
 
@@ -1321,6 +1373,7 @@ class PlaybackEngine(
                 if (kotlin.math.abs(delta) > 0.001f) {
                     t.propagateSimilarityBoost(removedFilename, delta, "queue_remove")
                 }
+                onRecommendationInputsChanged?.invoke("queue_remove")
                 signalTimeline?.append(
                     SignalTimelineEngine.Event(
                         timestamp = System.currentTimeMillis(),
@@ -1414,6 +1467,72 @@ class PlaybackEngine(
             android.util.Log.i(
                 "QueueOp",
                 "appendToQueue: added ${toAdd.size} (deduped from ${playable.size}); total=${nextFilenames.size} ctx=${cur.queueContext}→$newCtx"
+            )
+        }
+    }
+
+    fun appendToQueueAndPlayFirst(songs: List<Song>) {
+        val playable = songs.filter { !it.filePath.isNullOrEmpty() }
+        if (playable.isEmpty()) return
+        scope.launch {
+            val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val cur = _state.value
+            val have = cur.queueFilenames.toSet()
+            val toAdd = playable.filter { it.filename !in have }
+            if (toAdd.isEmpty()) {
+                android.util.Log.i("QueueOp", "appendToQueueAndPlayFirst SKIP: all ${playable.size} already in queue")
+                return@launch
+            }
+
+            val first = toAdd.first()
+            val firstNewIndex = cur.queueFilenames.size
+            queueEndRescueTransitionMarker = QueueContinuationPolicy.RescueTransitionMarker(
+                fromFilename = cur.currentMediaId,
+                toFilename = first.filename,
+                createdAtMs = System.currentTimeMillis(),
+            )
+            pendingTransitionSource = "queue_exhaust_rescue"
+            sendPlaybackCommand(ctrl, CMD_APPEND_TO_QUEUE_AND_PLAY, queueCommandArgs(toAdd))
+
+            val nextFilenames = cur.queueFilenames + toAdd.map { it.filename }
+            val newCtx = when (cur.queueContext) {
+                QueueContext.LIBRARY,
+                QueueContext.DISCOVER_SECTION,
+                QueueContext.AI_RECOMMENDED -> QueueContext.AI_RECOMMENDED
+                else -> cur.queueContext
+            }
+            _state.value = cur.copy(
+                currentSongId = first.id,
+                currentMediaId = first.filename,
+                title = first.title,
+                artist = first.artist,
+                album = first.album,
+                isPlaying = true,
+                queueFilenames = nextFilenames,
+                queueIndex = firstNewIndex,
+                preparedNotPlaying = false,
+                queueContext = newCtx,
+            )
+            _livePosition.value = 0L
+            _liveDuration.value = 0L
+            recentlySurfacedTracker?.record(listOf(first.filename))
+            activityLog?.log(
+                category = "queue",
+                type = "COOLDOWN_ENTER",
+                message = "${first.filename} entered recommendation cooldown",
+                data = mapOf(
+                    "mediaId" to first.filename,
+                    "source" to "queue_exhaust_rescue",
+                    "ctx" to newCtx.name,
+                ),
+            )
+            persistQueue(nextFilenames, firstNewIndex)
+            persistCurrent(first.filename, 0L)
+            pendingTransitionSource = "auto_advance"
+            android.util.Log.i(
+                "QueueOp",
+                "appendToQueueAndPlayFirst: added ${toAdd.size} (deduped from ${playable.size}); " +
+                    "first=${first.filename} index=$firstNewIndex ctx=${cur.queueContext}->$newCtx"
             )
         }
     }
@@ -1591,8 +1710,17 @@ class PlaybackEngine(
             val nextSongs = cooldownFiltered.filter {
                 !it.filePath.isNullOrEmpty() && seen.add(it.filename)
             }
-            sendPlaybackCommand(ctrl, CMD_REPLACE_UPCOMING, queueCommandArgs(nextSongs))
+            val prefixSongs = curState.queueFilenames
+                .take(curIdx.coerceAtLeast(0))
+                .mapNotNull { resolveSongByFilename?.invoke(it) }
+                .filter { !it.filePath.isNullOrEmpty() }
+            sendPlaybackCommand(
+                ctrl,
+                CMD_REPLACE_UPCOMING,
+                replaceUpcomingCommandArgs(prefixSongs, nextSongs),
+            )
             val nextFilenames = buildList {
+                addAll(prefixSongs.map { it.filename })
                 if (curFilename != null) add(curFilename)
                 addAll(nextSongs.map { it.filename })
             }
@@ -1613,7 +1741,7 @@ class PlaybackEngine(
             }
             android.util.Log.i(
                 "QueueOp",
-                "replaceUpcoming newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +
+                "replaceUpcoming prefix=${prefixSongs.size} newUpcoming=${newUpcoming.size} final=${nextSongs.size} " +
                     "ctx=${curState.queueContext}→$resolvedContext playNextSet=${curState.playNextFilenames.size}"
             )
             syncQueueStateAfterReplace(ctrl, curState, nextFilenames, curFilename, resolvedContext)

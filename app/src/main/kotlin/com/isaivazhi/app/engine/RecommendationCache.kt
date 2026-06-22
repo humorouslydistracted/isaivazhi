@@ -49,8 +49,8 @@ class RecommendationCache(
     private val container: AppContainer,
     private val appScope: CoroutineScope,
 ) {
-    private val _tail = MutableStateFlow<List<Song>?>(null)
-    val tail: StateFlow<List<Song>?> = _tail.asStateFlow()
+    private val _tail = MutableStateFlow<CachedRecommendationTail?>(null)
+    val tail: StateFlow<CachedRecommendationTail?> = _tail.asStateFlow()
 
     private val _computing = MutableStateFlow(false)
     val computing: StateFlow<Boolean> = _computing.asStateFlow()
@@ -76,14 +76,6 @@ class RecommendationCache(
                     }
                 }
         }
-        appScope.launch {
-            container.rebuildSignal.collect { reason ->
-                val mediaId = container.playback.state.value.currentMediaId
-                if (!mediaId.isNullOrBlank()) {
-                    requestCompute(mediaId, reason = "rebuild_$reason")
-                }
-            }
-        }
     }
 
     /**
@@ -97,9 +89,15 @@ class RecommendationCache(
      * refill safe: if a song_change is already debouncing or in flight,
      * the pop_refill request coalesces with it instead of stampeding.
      */
-    fun popTail(): List<Song>? {
+    fun popTail(): CachedRecommendationTail? {
         val taken = _tail.value
         if (taken != null) {
+            val currentSeed = container.playback.state.value.currentMediaId
+            val currentRevision = container.recommendationInputRevisions.currentRevision()
+            if (!taken.isUsableFor(currentSeed, currentRevision)) {
+                _tail.value = null
+                return null
+            }
             _tail.value = null
             val seed = container.playback.state.value.currentMediaId
             if (!seed.isNullOrBlank()) {
@@ -113,6 +111,14 @@ class RecommendationCache(
     fun precomputeNow(reason: String = "manual") {
         val seed = container.playback.state.value.currentMediaId ?: return
         requestCompute(seed, reason)
+    }
+
+    fun invalidate(reason: String, revision: Long, triggerPrecompute: Boolean = true) {
+        _tail.value = null
+        val seed = container.playback.state.value.currentMediaId
+        if (triggerPrecompute && !seed.isNullOrBlank()) {
+            requestCompute(seed, reason = "invalidate_${reason}_r$revision")
+        }
     }
 
     private fun requestCompute(seed: String, reason: String) {
@@ -136,14 +142,23 @@ class RecommendationCache(
             try {
                 _computing.value = true
                 val startedAt = System.currentTimeMillis()
+                val revisionAtStart = container.recommendationInputRevisions.currentRevision()
                 var tailSize = 0
                 var status = "ok"
                 try {
-                    val tail = computeTail(seed)
-                    tailSize = tail.size
-                    if (tail.isNotEmpty()) {
-                        _tail.value = tail
-                        lastSeed = seed
+                    val cachedTail = computeTail(seed, revisionAtStart)
+                    tailSize = cachedTail.tail.size
+                    if (cachedTail.tail.isNotEmpty()) {
+                        if (cachedTail.isUsableFor(
+                                currentSeedFilename = seed,
+                                currentRevision = container.recommendationInputRevisions.currentRevision(),
+                            )
+                        ) {
+                            _tail.value = cachedTail
+                            lastSeed = seed
+                        } else {
+                            status = "stale"
+                        }
                     } else {
                         status = "empty"
                     }
@@ -165,6 +180,7 @@ class RecommendationCache(
                             "seed" to seed,
                             "reason" to reason,
                             "status" to status,
+                            "revision" to revisionAtStart,
                             "vecCacheSize" to container.embeddingDb.vecCacheSize,
                         ),
                     )
@@ -189,10 +205,11 @@ class RecommendationCache(
         }
     }
 
-    private suspend fun computeTail(seedFilename: String): List<Song> {
+    private suspend fun computeTail(seedFilename: String, revision: Long): CachedRecommendationTail {
         val library = container.library.value
-        if (library.isEmpty()) return emptyList()
-        val current = library.firstOrNull { it.filename == seedFilename } ?: return emptyList()
+        if (library.isEmpty()) return CachedRecommendationTail(seedFilename, revision, emptyList())
+        val current = library.firstOrNull { it.filename == seedFilename }
+            ?: return CachedRecommendationTail(seedFilename, revision, emptyList())
 
         val recMode = container.preferences.recMode.first()
         val playbackState = container.playback.state.value
@@ -204,8 +221,13 @@ class RecommendationCache(
             container.embeddingDb.rowCount()
         }.getOrDefault(0)
         if (!recMode || embeddingRows == 0) {
-            return library.filter { it.filePath != null && it.filename !in excludeFns }
-                .shuffled().take(50)
+            return CachedRecommendationTail(
+                seedFilename = seedFilename,
+                revision = revision,
+                tail = library.filter { it.filePath != null && it.filename !in excludeFns }
+                    .shuffled()
+                    .take(50),
+            )
         }
         val tuning = container.taste.tuning.value
         val hardBlockedFilenames = container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
@@ -234,9 +256,10 @@ class RecommendationCache(
             android.util.Log.w("RecommendationCache", "buildBlendedVec failed: ${t.message}")
             null
         }
+        val blendInfo = blendedTriple?.let { RecommendationBlendInfo(it.second, it.third) }
         val blendedVec = blendedTriple?.first
 
-        return try {
+        val tail = try {
             container.recommender.recommendUpcoming(
                 current, library, k = 50,
                 adventurous = tuning.adventurous,
@@ -252,6 +275,12 @@ class RecommendationCache(
             android.util.Log.w("RecommendationCache", "recommendUpcoming failed: ${t.message}")
             emptyList()
         }
+        return CachedRecommendationTail(
+            seedFilename = seedFilename,
+            revision = revision,
+            tail = tail,
+            blendInfo = blendInfo,
+        )
     }
 
     companion object {
