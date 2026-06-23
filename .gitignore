@@ -1,3 +1,5 @@
+.gradle-local/
+debug-ec7494.log
 .gradle/
 .kotlin/
 build/

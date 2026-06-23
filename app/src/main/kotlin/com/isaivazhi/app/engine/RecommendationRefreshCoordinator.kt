@@ -50,6 +50,13 @@ class RecommendationRefreshCoordinator(
 
     private suspend fun refreshUpcomingWithAI(reason: String) {
         val playbackState = container.playback.state.value
+        if (QueueContinuationPolicy.shouldForceRepeatOffForContinuation(
+                playbackState.queueContext,
+                playbackState.repeatMode,
+            )
+        ) {
+            container.playback.setRepeatMode(androidx.media3.common.Player.REPEAT_MODE_OFF)
+        }
         val mediaId = playbackState.currentMediaId ?: return
         val songs = container.library.value
         val current = songs.firstOrNull { it.filename == mediaId } ?: return

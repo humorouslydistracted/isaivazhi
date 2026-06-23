@@ -1596,6 +1596,12 @@ private fun AppRoot(container: AppContainer) {
             lastBlendInfo = hardRefreshBlendInfo
         }
     }
+    val continuationBlendInfo by container.queueContinuation.lastBlendInfo.collectAsState()
+    LaunchedEffect(continuationBlendInfo) {
+        if (continuationBlendInfo != null) {
+            lastBlendInfo = continuationBlendInfo
+        }
+    }
     LaunchedEffect(playbackState.currentMediaId, embeddingsRowCount, songs.size, similarFrozen) {
         val mediaId = playbackState.currentMediaId
         if (mediaId == null || songs.isEmpty() || (embeddingsRowCount ?: 0) == 0) {
@@ -1836,147 +1842,32 @@ private fun AppRoot(container: AppContainer) {
     // runs when the upcoming queue has more than 5 tracks. Explicit
     // Refresh still replaces the tail on demand.
 
-    // Push #42 Tier 2G: queue-exhaust recommender append. When the
-    // current song is the LAST one in the queue AND repeat mode is OFF
-    // (REPEAT_ALL loops the section; REPEAT_ONE loops the song), append
-    // 50 AI recommendations as a tail so playback continues seamlessly
-    // after the section ends. Capacitor parity: `_doRefresh('queue_exhausted')`.
-    suspend fun appendQueueExhaustRecommendations(
-        trigger: String,
-        playFirstWhenStopped: Boolean,
-        debounceMs: Long,
-        drainLedgerFirst: Boolean,
+    // Push #42 Tier 2G: queue-exhaust recommender append — handled by
+    // QueueContinuationCoordinator on applicationScope (preappend + queue-end rescue).
+    LaunchedEffect(
+        playbackState.currentMediaId,
+        playbackState.queueIndex,
+        playbackState.queueFilenames.size,
+        playbackState.queueContext,
+        playbackState.repeatMode,
+        embeddingsRowCount,
+        recMode,
     ) {
-        var stateNow = container.playback.state.value
-        val mediaId = stateNow.currentMediaId ?: return
-        val queueSize = stateNow.queueFilenames.size
-        if (queueSize == 0) return
-        val curIdx = stateNow.queueIndex
-        if (curIdx < queueSize - 1) {
-            container.activityLog.log(
-                category = "engine",
-                type = "QUEUE_EXHAUST_SKIP",
-                message = "not on last item (curIdx=$curIdx of $queueSize, ctx=${stateNow.queueContext})",
-                data = mapOf("reason" to "not_last", "curIdx" to curIdx, "queueSize" to queueSize, "trigger" to trigger),
+        val state = playbackState
+        if (state.currentMediaId == null || state.queueFilenames.isEmpty()) return@LaunchedEffect
+        if (state.queueIndex < state.queueFilenames.size - 1) return@LaunchedEffect
+        if (QueueContinuationPolicy.shouldForceRepeatOffForContinuation(
+                state.queueContext,
+                state.repeatMode,
             )
-            return
+        ) {
+            container.playback.setRepeatMode(androidx.media3.common.Player.REPEAT_MODE_OFF)
+            return@LaunchedEffect
         }
-
-        val ctx = stateNow.queueContext
-        if (!QueueContinuationPolicy.shouldAppendAiTail(ctx, stateNow.repeatMode)) {
-            val reason = if (stateNow.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
-                "loop_on"
-            } else {
-                "finite_section"
-            }
-            container.activityLog.log(
-                category = "engine",
-                type = "QUEUE_EXHAUST_SKIP",
-                message = if (reason == "loop_on") {
-                    "repeat=${stateNow.repeatMode} (OFF=0 ONE=1 ALL=2)"
-                } else {
-                    "section context $ctx (no AI ever)"
-                },
-                data = mapOf("reason" to reason, "repeatMode" to stateNow.repeatMode, "ctx" to ctx.name, "trigger" to trigger),
-            )
-            return
+        if (!QueueContinuationPolicy.shouldAppendAiTail(state.queueContext, state.repeatMode)) {
+            return@LaunchedEffect
         }
-
-        val current = songs.firstOrNull { it.filename == mediaId } ?: return
-        if ((embeddingsRowCount ?: 0) == 0) {
-            container.activityLog.log(
-                category = "engine",
-                type = "QUEUE_EXHAUST_SKIP",
-                message = "no embeddings (rowCount=0)",
-                data = mapOf("reason" to "no_embeddings", "trigger" to trigger),
-            )
-            return
-        }
-
-        if (debounceMs > 0L) {
-            kotlinx.coroutines.delay(debounceMs)
-            stateNow = container.playback.state.value
-            if (stateNow.currentMediaId != mediaId) return
-            if (stateNow.queueIndex < stateNow.queueFilenames.size - 1) return
-        }
-
-        if (drainLedgerFirst) {
-            runCatching {
-                container.playbackSignalProcessor.processPending(
-                    songs = songs,
-                    reason = trigger,
-                    logWhenEmpty = false,
-                )
-            }.onFailure {
-                android.util.Log.w("QueueExhaust", "ledger drain failed before $trigger: ${it.message}")
-            }
-        }
-
-        android.util.Log.i(
-            "QueueExhaust",
-            "appending AI tail: trigger=$trigger playFirst=$playFirstWhenStopped ctx=$ctx queueSize=$queueSize mediaId=$mediaId"
-        )
-        val recentlySurfacedForExhaust = container.recentlySurfacedTracker.recentlySurfaced()
-        val excludeFns = stateNow.queueFilenames.toSet() + recentlySurfacedForExhaust
-        val blendedTriple = runCatching {
-            container.recommender.buildBlendedVec(
-                currentSongHash = current.contentHash,
-                sessionListened = container.session.listened.value,
-                profileVec = cachedProfileVec,
-                library = songs,
-                mode = "play",
-                sessionBias = tuning.sessionBias,
-            )
-        }.getOrNull()
-        blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
-        val blendedVec = blendedTriple?.first
-        val tail = runCatching {
-            container.recommender.recommendUpcoming(
-                currentSong = current,
-                library = songs,
-                k = 50,
-                adventurous = tuning.adventurous,
-                extraExcludeFilenames = excludeFns,
-                hardBlockedFilenames = upNextHardBlocked,
-                dislikedFilenames = dislikedSet,
-                softExcludedFilenames = upNextSoftExcluded,
-                blendedQueryVec = blendedVec,
-            )
-        }.getOrDefault(emptyList())
-        if (tail.isNotEmpty()) {
-            if (playFirstWhenStopped) {
-                container.playback.appendToQueueAndPlayFirst(tail)
-            } else {
-                container.playback.appendToQueue(tail)
-            }
-            container.toaster.show("Up Next refreshed with recommendations (${blendedTriple?.third ?: "current"})")
-        }
-    }
-
-    LaunchedEffect(playbackState.currentMediaId, playbackState.queueFilenames.size, playbackState.queueContext, playbackState.repeatMode) {
-        appendQueueExhaustRecommendations(
-            trigger = "last_item_preappend",
-            playFirstWhenStopped = false,
-            debounceMs = 500L,
-            drainLedgerFirst = false,
-        )
-    }
-
-    val latestAppendQueueExhaustRecommendations by rememberUpdatedState<suspend (String, Boolean, Long, Boolean) -> Unit>(
-        newValue = { trigger, playFirstWhenStopped, debounceMs, drainLedgerFirst ->
-            appendQueueExhaustRecommendations(
-                trigger = trigger,
-                playFirstWhenStopped = playFirstWhenStopped,
-                debounceMs = debounceMs,
-                drainLedgerFirst = drainLedgerFirst,
-            )
-        }
-    )
-
-    LaunchedEffect(Unit) {
-        container.playback.queueEndedEvents.collect {
-            latestAppendQueueExhaustRecommendations("queue_ended_event", true, 0L, true)
-        }
+        container.queueContinuation.requestPreappend()
     }
 
     // Push #67: SOFT-REFRESH UPCOMING TAIL after a qualified listen.

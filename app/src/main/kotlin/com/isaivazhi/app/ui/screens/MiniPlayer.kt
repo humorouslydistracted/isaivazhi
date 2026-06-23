@@ -1,5 +1,6 @@
 package com.isaivazhi.app.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
@@ -107,6 +108,9 @@ fun MiniPlayer(
     if (state.currentMediaId == null) return
 
     var similarExpanded by remember { mutableStateOf(false) }
+    BackHandler(enabled = similarExpanded) {
+        similarExpanded = false
+    }
     val showSimilar = similarLoading || similarSongs.isNotEmpty()
     val screenHeight = LocalConfiguration.current.screenHeightDp.dp
     val headerReserve = 56.dp

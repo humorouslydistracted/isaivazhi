@@ -288,6 +288,10 @@ class AppContainer(private val appContext: Context) {
         RecommendationRefreshCoordinator(this, applicationScope)
     }
 
+    val queueContinuation: QueueContinuationCoordinator by lazy {
+        QueueContinuationCoordinator(this, applicationScope)
+    }
+
     /**
      * Push #57: filepaths the user has chosen to skip embedding for. The
      * AI page's Pending list excludes these so a permanently-failing song

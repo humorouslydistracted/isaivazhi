@@ -1,6 +1,7 @@
 package com.isaivazhi.app.engine
 
 import androidx.media3.common.Player
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -52,6 +53,50 @@ class QueueContinuationPolicyTest {
                 Player.REPEAT_MODE_ONE,
             )
         )
+    }
+
+    @Test
+    fun shouldForceRepeatOffForContinuation_whenLoopOnAndAiEligible() {
+        assertTrue(
+            QueueContinuationPolicy.shouldForceRepeatOffForContinuation(
+                PlaybackEngine.QueueContext.LIBRARY,
+                Player.REPEAT_MODE_ALL,
+            )
+        )
+        assertFalse(
+            QueueContinuationPolicy.shouldForceRepeatOffForContinuation(
+                PlaybackEngine.QueueContext.ALBUM,
+                Player.REPEAT_MODE_ALL,
+            )
+        )
+        assertFalse(
+            QueueContinuationPolicy.shouldForceRepeatOffForContinuation(
+                PlaybackEngine.QueueContext.LIBRARY,
+                Player.REPEAT_MODE_OFF,
+            )
+        )
+    }
+
+    @Test
+    fun recommendExcludeFilenames_matchesRefreshPathNotFullQueue() {
+        val queueHistory = (1..50).map { "played_$it.mp3" }.toSet()
+        val playNext = setOf("play_next.mp3")
+        val current = "current.mp3"
+        val cooldown = setOf("cooldown.mp3")
+
+        val refreshStyle = QueueContinuationPolicy.recommendExcludeFilenames(
+            playNextFilenames = playNext,
+            currentFilename = current,
+            recentlySurfaced = cooldown,
+        )
+        val queueWide = queueHistory + cooldown
+
+        assertTrue("played_1.mp3" in queueWide)
+        assertFalse("played_1.mp3" in refreshStyle)
+        assertTrue(current in refreshStyle)
+        assertTrue("play_next.mp3" in refreshStyle)
+        assertTrue("cooldown.mp3" in refreshStyle)
+        assertEquals(3, refreshStyle.size)
     }
 
     @Test

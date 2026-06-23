@@ -3,6 +3,7 @@ package com.isaivazhi.app;
 import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.media.audiofx.AudioEffect;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
@@ -161,6 +162,8 @@ public class Media3PlaybackService extends MediaSessionService {
     private String lastKnownTitle = "";
     private String lastKnownArtist = "";
     private String lastKnownAlbum = "";
+    private boolean audioEffectSessionOpen = false;
+    private int lastBroadcastSessionId = C.AUDIO_SESSION_ID_UNSET;
 
     @Override
     public void onCreate() {
@@ -205,6 +208,7 @@ public class Media3PlaybackService extends MediaSessionService {
         stopProgressUpdates();
         mainHandler.removeCallbacks(keepWarmRunnable);
         connectedControllers.clear();
+        closeAudioEffectSession();
         if (mediaSession != null) {
             mediaSession.release();
             mediaSession = null;
@@ -388,9 +392,13 @@ public class Media3PlaybackService extends MediaSessionService {
             if (isPlaying) {
                 playbackCompletedState = false;
                 startProgressUpdates();
+                openAudioEffectSession();
             } else {
                 stopProgressUpdates();
                 emitAudioTimeUpdate();
+                if (player != null && !player.getPlayWhenReady()) {
+                    closeAudioEffectSession();
+                }
             }
             // 2026-05-11 #19: Media3's isPlaying flips to false during BUFFERING
             // and back to true on READY. Emitting that directly causes the JS
@@ -399,6 +407,17 @@ public class Media3PlaybackService extends MediaSessionService {
             // don't look like user-initiated pauses.
             boolean intended = player != null && player.getPlayWhenReady();
             emitPlayStateIfChanged(intended);
+        }
+
+        @Override
+        public void onAudioSessionIdChanged(int audioSessionId) {
+            if (audioSessionId == C.AUDIO_SESSION_ID_UNSET) return;
+            if (audioEffectSessionOpen) {
+                closeAudioEffectSession();
+            }
+            if (player != null && player.isPlaying()) {
+                openAudioEffectSession();
+            }
         }
 
         @Override
@@ -500,6 +519,7 @@ public class Media3PlaybackService extends MediaSessionService {
                 lastKnownPositionMs = 0L;
                 lastKnownDurationMs = 0L;
                 if (player != null) {
+                    closeAudioEffectSession();
                     player.clearMediaItems();
                     player.stop();
                 }
@@ -1313,6 +1333,7 @@ public class Media3PlaybackService extends MediaSessionService {
     private void stopPlaybackAndCleanup(boolean clearQueueEvent) {
         stopProgressUpdates();
         playbackCompletedState = false;
+        closeAudioEffectSession();
         synchronized (queueLock) {
             queue.clear();
             currentIndex = C.INDEX_UNSET;
@@ -1776,12 +1797,43 @@ public class Media3PlaybackService extends MediaSessionService {
         rememberTransition(snapshot, null);
     }
 
+    private void openAudioEffectSession() {
+        if (player == null || audioEffectSessionOpen) return;
+        int sessionId = player.getAudioSessionId();
+        if (sessionId == C.AUDIO_SESSION_ID_UNSET) return;
+        Intent intent = new Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION);
+        intent.putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId);
+        intent.putExtra(AudioEffect.EXTRA_PACKAGE_NAME, getPackageName());
+        intent.putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC);
+        sendBroadcast(intent);
+        audioEffectSessionOpen = true;
+        lastBroadcastSessionId = sessionId;
+    }
+
+    private void closeAudioEffectSession() {
+        if (!audioEffectSessionOpen) return;
+        int sessionId = lastBroadcastSessionId != C.AUDIO_SESSION_ID_UNSET
+                ? lastBroadcastSessionId
+                : (player != null ? player.getAudioSessionId() : C.AUDIO_SESSION_ID_UNSET);
+        if (sessionId == C.AUDIO_SESSION_ID_UNSET) {
+            audioEffectSessionOpen = false;
+            return;
+        }
+        Intent intent = new Intent(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION);
+        intent.putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId);
+        intent.putExtra(AudioEffect.EXTRA_PACKAGE_NAME, getPackageName());
+        sendBroadcast(intent);
+        audioEffectSessionOpen = false;
+        lastBroadcastSessionId = C.AUDIO_SESSION_ID_UNSET;
+    }
+
     private void handleQueueEndedState(String reason) {
         Log.d(TAG, "handleQueueEndedState: reason=" + reason
                 + " currentIndex=" + currentIndex
                 + " queueLength=" + queue.size());
         playbackCompletedState = false;
         stopProgressUpdates();
+        closeAudioEffectSession();
         if (player != null) {
             player.pause();
         }
