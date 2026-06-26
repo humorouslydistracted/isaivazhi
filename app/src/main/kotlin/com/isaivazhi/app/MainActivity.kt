@@ -1012,24 +1012,28 @@ private fun AppRoot(container: AppContainer) {
                 // warmup if available, avoiding a redundant MediaStore scan that
                 // can cost 1-5s on a cold process start.
                 val preloaded = container.library.value
-                val cachedSnapshot = if (preloaded.isEmpty() || LibraryCache.lastLoadSource == "stale_cache") {
-                    LibraryCache.loadCached(ctx, allowStale = true)
-                } else null
-                rawSongs = when {
-                    preloaded.isNotEmpty() -> preloaded
-                    cachedSnapshot != null -> cachedSnapshot.songs
-                    else -> {
-                        val scanned = LibraryCache.loadOrScan(ctx)
-                        if (scanned.isEmpty()) LibraryCache.loadOrScan(ctx, force = true) else scanned
+                val (loadedSongs, cachedSnapshot) = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    val cached = if (preloaded.isEmpty() || LibraryCache.lastLoadSource == "stale_cache") {
+                        LibraryCache.loadCached(ctx, allowStale = true)
+                    } else null
+                    val loaded = when {
+                        preloaded.isNotEmpty() -> preloaded
+                        cached != null -> cached.songs
+                        else -> {
+                            val scanned = LibraryCache.loadOrScan(ctx)
+                            if (scanned.isEmpty()) LibraryCache.loadOrScan(ctx, force = true) else scanned
+                        }
+                    }.let { songsLoaded ->
+                        if (songsLoaded.isEmpty()) LibraryCache.loadOrScan(ctx, force = true) else songsLoaded
                     }
+                    loaded to cached
                 }
-                if (rawSongs.isEmpty()) {
-                    rawSongs = LibraryCache.loadOrScan(ctx, force = true)
-                }
+                rawSongs = loadedSongs
                 // Bugfix 2026-06-01d: publish to container so the
                 // process-lifetime RecommendationCache can see the
                 // library even after the Activity is destroyed.
-                container.library.value = container.embeddingDb.enrichSongsWithKnownHashes(songs)
+                val filteredSongs = container.folderExclusion.filter(loadedSongs, excludedFolderPaths)
+                container.library.value = container.embeddingDb.enrichSongsWithKnownHashes(filteredSongs)
                 if (cachedSnapshot != null && !cachedSnapshot.isFresh) {
                     val staleAgeMs = cachedSnapshot.ageMs
                     coroutineScope.launch(Dispatchers.IO) {
@@ -1483,49 +1487,56 @@ private fun AppRoot(container: AppContainer) {
         if (songs.isEmpty()) return@LaunchedEffect
         if ((embeddingsRowCount ?: 0) == 0) return@LaunchedEffect
         kotlinx.coroutines.delay(300)
-        val byFilename = songs.associateBy { it.filename }
-        val topPlays = historyStats.entries
-            .asSequence()
-            .filter { it.value.plays > 0 && it.value.avgFraction >= 0.3f }
-            .filter { it.key !in dislikedSet }
-            .filter { it.key !in upNextHardBlocked }
-            .sortedByDescending { it.value.plays * it.value.avgFraction }
-            .take(30)
-            .toList()
-        if (topPlays.isEmpty()) return@LaunchedEffect
-        val anchorSongs = topPlays.mapNotNull { byFilename[it.key] }
-            .filter { !it.contentHash.isNullOrBlank() && it.filePath in embeddedFilepaths }
-        if (anchorSongs.isEmpty()) return@LaunchedEffect
-        // Include rounded play/fraction weights so the centroid rebuilds
-        // when existing top-30 songs accumulate significantly more listens,
-        // not only when the set of top-30 filenames itself changes.
-        val fingerprint = topPlays.take(30)
-            .joinToString("|") { (fn, st) -> "$fn:${st.plays}:${"%.1f".format(st.avgFraction)}" }
-            .hashCode().toString()
-        val current = runCatching { container.preferences.loadProfileVec() }.getOrNull()
-        if (current?.fingerprint == fingerprint && cachedProfileVec != null) return@LaunchedEffect
-        // Build centroid.
-        val hashes = anchorSongs.mapNotNull { it.contentHash }.distinct()
-        val vecsByHash = runCatching { container.embeddingDb.getVecsByHashes(hashes) }.getOrDefault(emptyMap())
-        if (vecsByHash.isEmpty()) return@LaunchedEffect
-        val dim = vecsByHash.values.first().size
-        val pv = FloatArray(dim)
-        var totalWeight = 0f
-        for (song in anchorSongs) {
-            val v = vecsByHash[song.contentHash ?: continue] ?: continue
-            val st = historyStats[song.filename] ?: continue
-            val w = st.plays * st.avgFraction
-            for (d in 0 until dim) pv[d] += v[d] * w
-            totalWeight += w
-        }
-        if (totalWeight <= 0f) return@LaunchedEffect
-        var n2 = 0f
-        for (d in 0 until dim) { pv[d] /= totalWeight; n2 += pv[d] * pv[d] }
-        val inv = if (n2 > 0f) 1f / kotlin.math.sqrt(n2) else 0f
-        for (d in 0 until dim) pv[d] *= inv
+        val hasCachedProfileVec = cachedProfileVec != null
+        val rebuilt = kotlinx.coroutines.withContext(Dispatchers.Default) {
+            val byFilename = songs.associateBy { it.filename }
+            val topPlays = historyStats.entries
+                .asSequence()
+                .filter { it.value.plays > 0 && it.value.avgFraction >= 0.3f }
+                .filter { it.key !in dislikedSet }
+                .filter { it.key !in upNextHardBlocked }
+                .sortedByDescending { it.value.plays * it.value.avgFraction }
+                .take(30)
+                .toList()
+            if (topPlays.isEmpty()) return@withContext null
+            val anchorSongs = topPlays.mapNotNull { byFilename[it.key] }
+                .filter { !it.contentHash.isNullOrBlank() && it.filePath in embeddedFilepaths }
+            if (anchorSongs.isEmpty()) return@withContext null
+            // Include rounded play/fraction weights so the centroid rebuilds
+            // when existing top-30 songs accumulate significantly more listens,
+            // not only when the set of top-30 filenames itself changes.
+            val fingerprint = topPlays.take(30)
+                .joinToString("|") { (fn, st) -> "$fn:${st.plays}:${"%.1f".format(st.avgFraction)}" }
+                .hashCode().toString()
+            val current = runCatching { container.preferences.loadProfileVec() }.getOrNull()
+            if (current?.fingerprint == fingerprint && hasCachedProfileVec) return@withContext null
+            // Build centroid.
+            val hashes = anchorSongs.mapNotNull { it.contentHash }.distinct()
+            val vecsByHash = runCatching { container.embeddingDb.getVecsByHashes(hashes) }.getOrDefault(emptyMap())
+            if (vecsByHash.isEmpty()) return@withContext null
+            val dim = vecsByHash.values.first().size
+            val pv = FloatArray(dim)
+            var totalWeight = 0f
+            for (song in anchorSongs) {
+                val v = vecsByHash[song.contentHash ?: continue] ?: continue
+                val st = historyStats[song.filename] ?: continue
+                val w = st.plays * st.avgFraction
+                for (d in 0 until dim) pv[d] += v[d] * w
+                totalWeight += w
+            }
+            if (totalWeight <= 0f) return@withContext null
+            var n2 = 0f
+            for (d in 0 until dim) { pv[d] /= totalWeight; n2 += pv[d] * pv[d] }
+            val inv = if (n2 > 0f) 1f / kotlin.math.sqrt(n2) else 0f
+            for (d in 0 until dim) pv[d] *= inv
+            Triple(pv, fingerprint, anchorSongs.size)
+        } ?: return@LaunchedEffect
+        val (pv, fingerprint, anchorCount) = rebuilt
         cachedProfileVec = pv
-        runCatching { container.preferences.saveProfileVec(pv, fingerprint) }
-        android.util.Log.i("MainActivity", "profileVec rebuilt dim=$dim anchors=${anchorSongs.size} fp=$fingerprint")
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            runCatching { container.preferences.saveProfileVec(pv, fingerprint) }
+        }
+        android.util.Log.i("MainActivity", "profileVec rebuilt dim=${pv.size} anchors=$anchorCount fp=$fingerprint")
     }
     // Phase 4 (2026-06-01): the Discover-cache snapshot state, the For You +
     // BYP LE, the Unexplored LE, and the cache hydrate LE that lived here
@@ -1619,14 +1630,16 @@ private fun AppRoot(container: AppContainer) {
         }
         similarLoading = true
         kotlinx.coroutines.delay(250)
-        val results = runCatching {
-            container.recommender.recommendScored(
-                currentSong = current,
-                library = songs,
-                k = 10,
-                adventurous = tuning.adventurous,
-            )
-        }.getOrDefault(emptyList())
+        val results = kotlinx.coroutines.withContext(Dispatchers.Default) {
+            runCatching {
+                container.recommender.recommendScored(
+                    currentSong = current,
+                    library = songs,
+                    k = 10,
+                    adventurous = tuning.adventurous,
+                )
+            }.getOrDefault(emptyList())
+        }
         similarToCurrent = results.map { it.song }
         similarSeedMediaId = mediaId
         similarLoading = false
@@ -1692,43 +1705,55 @@ private fun AppRoot(container: AppContainer) {
                 runCatching { AlbumArtRepository.load(ctx, path, sampleSize = 4) }
             }
         }
+        val songsSnapshot = songs
+        val profileVecSnapshot = cachedProfileVec
+        val embeddingsReadySnapshot = (embeddingsRowCount ?: 0) > 0
+        val recModeSnapshot = recMode
+        val tuningSnapshot = tuning
+        val hardBlockedSnapshot = upNextHardBlocked
+        val dislikedSnapshot = dislikedSet
+        val softExcludedSnapshot = upNextSoftExcluded
         coroutineScope.launch(Dispatchers.IO) {
             val tapStart = android.os.SystemClock.elapsedRealtime()
-            val hasEmbeddings = (embeddingsRowCount ?: 0) > 0
+            val hasEmbeddings = embeddingsReadySnapshot
             // Push #72: Phase-2 AI tail should respect the session+profile
             // blend, not just the tapped song's neighbors. Capacitor parity.
             val blendedTriple = runCatching {
                 container.recommender.buildBlendedVec(
                     currentSongHash = song.contentHash,
                     sessionListened = container.session.listened.value,
-                    profileVec = cachedProfileVec,
-                    library = songs,
+                    profileVec = profileVecSnapshot,
+                    library = songsSnapshot,
                     mode = "play",
-                    sessionBias = tuning.sessionBias,
+                    sessionBias = tuningSnapshot.sessionBias,
                 )
             }.getOrNull()
-            blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
+            blendedTriple?.let { (_, w, label) ->
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label)
+                }
+            }
             val blendedVec = blendedTriple?.first
             // Recency suppression for generated tails. The manually-tapped
             // song remains playable as the current item but is removed from
             // any generated tail.
             val recentlySurfacedForTap = container.recentlySurfacedTracker.recentlySurfaced()
             val generatedTailExcludes = recentlySurfacedForTap + song.filename
-            fun shuffledTapTail(): List<Song> = songs.asSequence()
+            fun shuffledTapTail(): List<Song> = songsSnapshot.asSequence()
                 .filter { it.filePath != null && it.filename !in generatedTailExcludes }
                 .shuffled().take(50).toList()
             var builtAiTail = false
-            val tail: List<Song> = if (recMode && hasEmbeddings) {
+            val tail: List<Song> = if (recModeSnapshot && hasEmbeddings) {
                 runCatching {
                     val queue = container.recommender.buildPlayQueue(
                         currentSong = song,
-                        library = songs,
+                        library = songsSnapshot,
                         k = 50,
-                        adventurous = tuning.adventurous,
+                        adventurous = tuningSnapshot.adventurous,
                         extraExcludeFilenames = recentlySurfacedForTap,
-                        hardBlockedFilenames = upNextHardBlocked,
-                        dislikedFilenames = dislikedSet,
-                        softExcludedFilenames = upNextSoftExcluded,
+                        hardBlockedFilenames = hardBlockedSnapshot,
+                        dislikedFilenames = dislikedSnapshot,
+                        softExcludedFilenames = softExcludedSnapshot,
                         blendedQueryVec = blendedVec,
                     )
                     builtAiTail = true
@@ -1742,7 +1767,7 @@ private fun AppRoot(container: AppContainer) {
             val buildMs = android.os.SystemClock.elapsedRealtime() - tapStart
             android.util.Log.i(
                 "PlayFromTap",
-                "tail built in ${buildMs}ms (aiMode=$recMode emb=$hasEmbeddings tailSize=${tail.size}) for ${song.filename}"
+                "tail built in ${buildMs}ms (aiMode=$recModeSnapshot emb=$hasEmbeddings tailSize=${tail.size}) for ${song.filename}"
             )
             container.playback.replaceUpcoming(
                 tail,
@@ -1899,34 +1924,39 @@ private fun AppRoot(container: AppContainer) {
         val upcomingFilenames = playbackState.queueFilenames
             .drop(playbackState.queueIndex + 1)
         if (upcomingFilenames.size <= 5) return@LaunchedEffect  // too short to bother
-        val byFn = songs.associateBy { it.filename }
-        val upcomingSongs = upcomingFilenames.mapNotNull { byFn[it] }
-        val recentlySurfacedForSoftRefresh = container.recentlySurfacedTracker.recentlySurfaced()
-        val blendedTriple = runCatching {
-            container.recommender.buildBlendedVec(
-                currentSongHash = current.contentHash,
-                sessionListened = sessionListened,
-                profileVec = cachedProfileVec,  // Push #68
-                library = songs,
-                mode = "play",
-                sessionBias = tuning.sessionBias,
-            )
-        }.getOrNull()
+        val profileVecSnapshot = cachedProfileVec
+        val softRefreshResult = kotlinx.coroutines.withContext(Dispatchers.Default) {
+            val byFn = songs.associateBy { it.filename }
+            val upcomingSongs = upcomingFilenames.mapNotNull { byFn[it] }
+            val recentlySurfacedForSoftRefresh = container.recentlySurfacedTracker.recentlySurfaced()
+            val blendedTriple = runCatching {
+                container.recommender.buildBlendedVec(
+                    currentSongHash = current.contentHash,
+                    sessionListened = sessionListened,
+                    profileVec = profileVecSnapshot,  // Push #68
+                    library = songs,
+                    mode = "play",
+                    sessionBias = tuning.sessionBias,
+                )
+            }.getOrNull()
+            val blendedVec = blendedTriple?.first ?: return@withContext null
+            val newTail = runCatching {
+                container.recommender.softRefreshUpcomingTail(
+                    currentSong = current,
+                    upcoming = upcomingSongs,
+                    library = songs,
+                    blendedQueryVec = blendedVec,
+                    adventurous = tuning.adventurous,
+                    extraExcludeFilenames = upcomingFilenames.toSet() + recentlySurfacedForSoftRefresh,
+                    hardBlockedFilenames = upNextHardBlocked,
+                    dislikedFilenames = dislikedSet,
+                    softExcludedFilenames = upNextSoftExcluded,
+                )
+            }.getOrDefault(emptyList())
+            Triple(blendedTriple, upcomingSongs, newTail)
+        } ?: return@LaunchedEffect
+        val (blendedTriple, upcomingSongs, newTail) = softRefreshResult
         blendedTriple?.let { (_, w, label) -> lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(w, label) }
-        val blendedVec = blendedTriple?.first ?: return@LaunchedEffect
-        val newTail = runCatching {
-            container.recommender.softRefreshUpcomingTail(
-                currentSong = current,
-                upcoming = upcomingSongs,
-                library = songs,
-                blendedQueryVec = blendedVec,
-                adventurous = tuning.adventurous,
-                extraExcludeFilenames = upcomingFilenames.toSet() + recentlySurfacedForSoftRefresh,
-                hardBlockedFilenames = upNextHardBlocked,
-                dislikedFilenames = dislikedSet,
-                softExcludedFilenames = upNextSoftExcluded,
-            )
-        }.getOrDefault(emptyList())
         if (newTail.isNotEmpty() && newTail != upcomingSongs) {
             container.playback.replaceUpcoming(
                 newTail,
