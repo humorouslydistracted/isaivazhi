@@ -5,6 +5,7 @@ data class CachedRecommendationTail(
     val revision: Long,
     val tail: List<Song>,
     val blendInfo: RecommendationBlendInfo? = null,
+    val explanations: List<RecommendationExplanation> = emptyList(),
 ) {
     fun isUsableFor(currentSeedFilename: String?, currentRevision: Long): Boolean =
         tail.isNotEmpty() &&

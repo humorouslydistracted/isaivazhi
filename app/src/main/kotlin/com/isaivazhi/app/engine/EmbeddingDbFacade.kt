@@ -4,6 +4,9 @@ import android.os.Handler
 import android.os.Looper
 import android.content.Context
 import com.isaivazhi.app.EmbeddingDbManager
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -17,7 +20,8 @@ import org.json.JSONObject
  */
 class EmbeddingDbFacade(appContext: Context) {
 
-    private val manager: EmbeddingDbManager = EmbeddingDbManager.get(appContext)
+    private val appContext = appContext.applicationContext
+    private val manager: EmbeddingDbManager = EmbeddingDbManager.get(this.appContext)
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // Bugfix 2026-06-01h: in-memory vec cache. sqlite-vec uses mmap for its
@@ -41,6 +45,14 @@ class EmbeddingDbFacade(appContext: Context) {
     private val hashToMetaCache = java.util.concurrent.ConcurrentHashMap<String, HeapMeta>(4096)
 
     data class HeapMeta(val filename: String, val filepath: String)
+
+    data class HeapWarmResult(
+        val success: Boolean,
+        val count: Int = 0,
+        val dim: Int = 0,
+        val source: String = "none",
+        val error: String? = null,
+    )
 
     /** Call once after library loads. Populates filename→hash and hash→meta
      *  lookups so nearestNeighborsForFilename can bypass the DB. */
@@ -123,6 +135,51 @@ class EmbeddingDbFacade(appContext: Context) {
         )
         return count
     }
+
+    /**
+     * Restore the recommendation heap directly from the atomically-maintained
+     * portable IVZ file. This deliberately does not touch SQLite, so cold
+     * startup avoids opening Room/sqlite-vec on the successful fast path.
+     */
+    suspend fun restoreHeapFromPortableBin(expectedRows: Int = 0): HeapWarmResult =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val dir = appContext.getExternalFilesDir(null) ?: appContext.filesDir
+            val file = File(dir, EmbeddingDbManager.EMBEDDINGS_BIN)
+            if (!file.exists() || file.length() <= 0L) {
+                return@withContext HeapWarmResult(
+                    success = false,
+                    source = "ivz",
+                    error = "portable IVZ snapshot missing",
+                )
+            }
+            try {
+                val parsed = PortableEmbeddingSnapshotCodec.parse(file.readBytes(), expectedRows)
+                // Publish only after the entire file validates and decodes.
+                vecHeapCache.clear()
+                filenameToHashCache.clear()
+                hashToMetaCache.clear()
+                vecHeapCache.putAll(parsed.vectors)
+                filenameToHashCache.putAll(parsed.filenameToHash)
+                hashToMetaCache.putAll(parsed.metadata)
+                android.util.Log.i(
+                    "EmbeddingDbFacade",
+                    "IVZ heap restored count=${parsed.vectors.size} dim=${parsed.dim}",
+                )
+                HeapWarmResult(
+                    success = true,
+                    count = parsed.vectors.size,
+                    dim = parsed.dim,
+                    source = "ivz",
+                )
+            } catch (t: Throwable) {
+                android.util.Log.w("EmbeddingDbFacade", "IVZ heap restore failed: ${t.message}")
+                HeapWarmResult(
+                    success = false,
+                    source = "ivz",
+                    error = t.message ?: t.javaClass.simpleName,
+                )
+            }
+        }
 
     val vecCacheSize: Int get() = vecHeapCache.size
 
@@ -544,5 +601,74 @@ class EmbeddingDbFacade(appContext: Context) {
             }
         }
         call(cb)
+    }
+}
+
+internal object PortableEmbeddingSnapshotCodec {
+    private const val HEADER_SIZE = 20
+    private const val VERSION = 1
+    private const val MAX_ROWS = 100_000
+    private const val MAX_DIM = 16_384
+    private val MAGIC = byteArrayOf('I'.code.toByte(), 'V'.code.toByte(), 'Z'.code.toByte(), '1'.code.toByte())
+
+    data class ParsedHeap(
+        val dim: Int,
+        val vectors: Map<String, FloatArray>,
+        val filenameToHash: Map<String, String>,
+        val metadata: Map<String, EmbeddingDbFacade.HeapMeta>,
+    )
+
+    fun parse(data: ByteArray, expectedRows: Int = 0): ParsedHeap {
+        require(data.size >= HEADER_SIZE) { "IVZ file too short" }
+        require(data.copyOfRange(0, 4).contentEquals(MAGIC)) { "bad IVZ magic" }
+        val header = ByteBuffer.wrap(data, 4, HEADER_SIZE - 4).order(ByteOrder.LITTLE_ENDIAN)
+        val version = header.int
+        val dim = header.int
+        val rowCount = header.int
+        val metadataLength = header.int
+        require(version == VERSION) { "unsupported IVZ version $version" }
+        require(dim in 1..MAX_DIM) { "invalid IVZ dimension $dim" }
+        require(rowCount in 1..MAX_ROWS) { "invalid IVZ row count $rowCount" }
+        require(expectedRows <= 0 || rowCount == expectedRows) {
+            "IVZ row count $rowCount does not match expected $expectedRows"
+        }
+        require(metadataLength >= 2) { "invalid IVZ metadata length" }
+        val vectorBytes = rowCount.toLong() * dim.toLong() * 4L
+        val expectedLength = HEADER_SIZE.toLong() + metadataLength.toLong() + vectorBytes
+        require(expectedLength == data.size.toLong()) { "IVZ file length mismatch" }
+
+        val metadataStart = HEADER_SIZE
+        val vectorStart = metadataStart + metadataLength
+        val metadataJson = String(
+            data,
+            metadataStart,
+            metadataLength,
+            Charsets.UTF_8,
+        )
+        val root = org.json.JSONObject(metadataJson)
+        val entries = root.optJSONArray("entries") ?: error("IVZ entries missing")
+        require(entries.length() == rowCount) { "IVZ entry count mismatch" }
+
+        val vectors = HashMap<String, FloatArray>(rowCount * 2)
+        val filenameToHash = HashMap<String, String>(rowCount * 2)
+        val metadata = HashMap<String, EmbeddingDbFacade.HeapMeta>(rowCount * 2)
+        for (i in 0 until rowCount) {
+            val entry = entries.optJSONObject(i) ?: error("IVZ entry $i missing")
+            val hash = entry.optString("contentHash", entry.optString("key", ""))
+            require(hash.isNotBlank()) { "IVZ entry $i has no content hash" }
+            val filename = entry.optString("filename", "")
+            val filepath = entry.optString("filepath", "").ifBlank { filename }
+            val offset = vectorStart + i * dim * 4
+            val vector = FloatArray(dim)
+            ByteBuffer.wrap(data, offset, dim * 4)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .asFloatBuffer()
+                .get(vector)
+            vectors[hash] = vector
+            if (filename.isNotBlank()) filenameToHash[filename] = hash
+            metadata[hash] = EmbeddingDbFacade.HeapMeta(filename, filepath)
+        }
+        require(vectors.size == rowCount) { "IVZ contains duplicate content hashes" }
+        return ParsedHeap(dim, vectors, filenameToHash, metadata)
     }
 }

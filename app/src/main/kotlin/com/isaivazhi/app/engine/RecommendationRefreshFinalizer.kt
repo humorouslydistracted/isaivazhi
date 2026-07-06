@@ -52,6 +52,12 @@ object RecommendationRefreshFinalizer {
         policyExcludes: Set<String>,
         cooldownFilenames: Set<String>,
     ): SoftRefreshResult {
+        // Bugfix: the frozen zone was previously kept verbatim, so a song
+        // that turned strongly-negative / disliked while sitting in the
+        // top-5 of Up Next would survive every soft refresh. Apply the
+        // negative policy here too — the "don't yank the user's immediate
+        // picks" intent never meant preserving songs the user rejected.
+        val frozenFiltered = RecommendationPolicy.filterSongsForUpNext(frozenZone, policyExcludes)
         val stableZone = RecommendationPolicy.filterSongsForUpNext(stableCandidates, policyExcludes)
             .distinctBy { it.filename }
         val fluidPolicyFiltered = RecommendationPolicy.filterSongsForUpNext(fluidCandidates, policyExcludes)
@@ -59,12 +65,12 @@ object RecommendationRefreshFinalizer {
             songs = fluidPolicyFiltered,
             cooldownFilenames = cooldownFilenames,
         )
-        val blockedFluidFilenames = (frozenZone + stableZone).map { it.filename }.toSet() + currentFilename
+        val blockedFluidFilenames = (frozenFiltered + stableZone).map { it.filename }.toSet() + currentFilename
         val fluidZone = fluidCooldownFiltered
             .filter { it.filename !in blockedFluidFilenames }
             .distinctBy { it.filename }
         return SoftRefreshResult(
-            frozenZone = frozenZone,
+            frozenZone = frozenFiltered,
             stableZone = stableZone,
             fluidZone = fluidZone,
         )

@@ -39,6 +39,7 @@ public final class PlaybackCommandContract {
     // Refresh CommandButton's displayName/enabled state updated so the
     // lockscreen reflects the spinner shown in MiniPlayer / NowPlaying.
     public static final String CMD_NOTIFICATION_SET_REFRESH_BUSY = "isaivazhi.playback.NOTIFICATION_SET_REFRESH_BUSY";
+    public static final String CMD_NOTIFICATION_SET_REFRESH_AVAILABLE = "isaivazhi.playback.NOTIFICATION_SET_REFRESH_AVAILABLE";
 
     static final String EVT_TRANSPORT_READY = "isaivazhi.playback.event.TRANSPORT_READY";
     static final String EVT_AUDIO_TIME_UPDATE = "isaivazhi.playback.event.AUDIO_TIME_UPDATE";
@@ -77,6 +78,7 @@ public final class PlaybackCommandContract {
     static final String KEY_ERROR = "error";
     static final String KEY_PATH = "path";
     public static final String KEY_BUSY = "busy";
+    public static final String KEY_AVAILABLE = "available";
 
     static SessionCommand command(String action) {
         return new SessionCommand(action, Bundle.EMPTY);
@@ -105,6 +107,7 @@ public final class PlaybackCommandContract {
                 .add(command(CMD_NOTIFICATION_DISMISS))
                 .add(command(CMD_NOTIFICATION_REFRESH_QUEUE))
                 .add(command(CMD_NOTIFICATION_SET_REFRESH_BUSY))
+                .add(command(CMD_NOTIFICATION_SET_REFRESH_AVAILABLE))
                 .build();
     }
 }

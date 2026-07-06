@@ -127,6 +127,7 @@ object DebugLogCapture {
         if (raw.startsWith("logcat ")) return@withContext raw
         val needles = listOf(
             "StartupTrace",
+            "STARTUP_",
             "ActivityLog",
             "LIBRARY_LOAD_",
             "PERF_DB_",
@@ -138,6 +139,7 @@ object DebugLogCapture {
             "ACTIVITY_RECREATED",
             "LibraryCache",
             "PlaybackEngine",
+            "EmbeddingDbFacade",
             "DiscoverLE",
         )
         val filtered = raw.lines()

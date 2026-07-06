@@ -14,7 +14,7 @@ internal object BlendWeightLogic {
 
     fun compute(
         mode: String,
-        nListened: Int,
+        nListened: Float,
         hasCurrent: Boolean,
         hasSession: Boolean,
         hasProfile: Boolean,
@@ -37,16 +37,16 @@ internal object BlendWeightLogic {
         }
         if (!hasSession && !hasProfile) return Weights(1.0f, 0f, 0f)
         if (!hasSession) {
-            val t = (nListened.toFloat() / 8f).coerceAtMost(1f)
+            val t = (nListened / 8f).coerceAtMost(1f)
             val wCurrent = 0.5f + 0.1f * t
             return Weights(wCurrent, 0f, 1f - wCurrent)
         }
         if (!hasProfile) {
-            val t = (nListened.toFloat() / 10f).coerceAtMost(1f)
+            val t = (nListened / 10f).coerceAtMost(1f)
             val wCurrent = 0.6f - 0.2f * t
             return Weights(wCurrent, 1f - wCurrent, 0f)
         }
-        val t = (nListened.toFloat() / 10f).coerceAtMost(1f)
+        val t = (nListened / 10f).coerceAtMost(1f)
         var wCurrent = 0.50f - 0.12f * t
         var wSession = 0.52f * t
         var wProfile = 1f - wCurrent - wSession
@@ -54,4 +54,12 @@ internal object BlendWeightLogic {
         val total = wCurrent + wSession + wProfile
         return Weights(wCurrent / total, wSession / total, wProfile / total)
     }
+
+    fun compute(
+        mode: String,
+        nListened: Int,
+        hasCurrent: Boolean,
+        hasSession: Boolean,
+        hasProfile: Boolean,
+    ): Weights = compute(mode, nListened.toFloat(), hasCurrent, hasSession, hasProfile)
 }

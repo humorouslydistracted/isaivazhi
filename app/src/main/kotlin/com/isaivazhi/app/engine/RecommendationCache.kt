@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Bugfix 2026-06-01d/e: process-lifetime recommendation precompute. The
@@ -54,6 +55,7 @@ class RecommendationCache(
 
     private val _computing = MutableStateFlow(false)
     val computing: StateFlow<Boolean> = _computing.asStateFlow()
+    private val _completionCount = MutableStateFlow(0L)
 
     private val computeMutex = Mutex()
 
@@ -99,10 +101,6 @@ class RecommendationCache(
                 return null
             }
             _tail.value = null
-            val seed = container.playback.state.value.currentMediaId
-            if (!seed.isNullOrBlank()) {
-                requestCompute(seed, reason = "pop_refill")
-            }
         }
         return taken
     }
@@ -111,6 +109,16 @@ class RecommendationCache(
     fun precomputeNow(reason: String = "manual") {
         val seed = container.playback.state.value.currentMediaId ?: return
         requestCompute(seed, reason)
+    }
+
+    suspend fun precomputeAndAwait(reason: String, timeoutMs: Long = 10_000L): Boolean {
+        val seed = container.playback.state.value.currentMediaId ?: return true
+        val before = _completionCount.value
+        requestCompute(seed, reason)
+        return withTimeoutOrNull(timeoutMs) {
+            _completionCount.first { it > before }
+            true
+        } ?: false
     }
 
     fun invalidate(reason: String, revision: Long, triggerPrecompute: Boolean = true) {
@@ -122,6 +130,8 @@ class RecommendationCache(
     }
 
     private fun requestCompute(seed: String, reason: String) {
+        val revision = container.recommendationInputRevisions.currentRevision()
+        if (_tail.value?.isUsableFor(seed, revision) == true) return
         if (computeMutex.isLocked) {
             pendingSeed = seed
             pendingReason = reason
@@ -185,6 +195,7 @@ class RecommendationCache(
                         ),
                     )
                     _computing.value = false
+                    _completionCount.value = _completionCount.value + 1L
                 }
             } finally {
                 computeMutex.unlock()
@@ -217,9 +228,8 @@ class RecommendationCache(
         val queueSet = playbackState.queueFilenames.toSet()
         val cooldownSet = container.recentlySurfacedTracker.recentlySurfaced()
         val excludeFns = playNextSet + queueSet + seedFilename + cooldownSet
-        val embeddingRows = runCatching {
-            container.embeddingDb.rowCount()
-        }.getOrDefault(0)
+        val embeddingRows = container.embeddingDb.vecCacheSize.takeIf { it > 0 }
+            ?: runCatching { container.preferences.cachedEmbedStats().rowCount }.getOrDefault(0)
         if (!recMode || embeddingRows == 0) {
             return CachedRecommendationTail(
                 seedFilename = seedFilename,
@@ -241,8 +251,8 @@ class RecommendationCache(
         // cancelled computes silently return empty and leave the cache stale.
         // Explicit try/catch lets us re-throw cancellation while still
         // tolerating real errors.
-        val blendedTriple = try {
-            container.recommender.buildBlendedVec(
+        val blendedDetails = try {
+            container.recommender.buildBlendedQuery(
                 currentSongHash = current.contentHash,
                 sessionListened = container.session.listened.value,
                 profileVec = profileVec,
@@ -256,8 +266,8 @@ class RecommendationCache(
             android.util.Log.w("RecommendationCache", "buildBlendedVec failed: ${t.message}")
             null
         }
-        val blendInfo = blendedTriple?.let { RecommendationBlendInfo(it.second, it.third) }
-        val blendedVec = blendedTriple?.first
+        val blendInfo = blendedDetails?.let { RecommendationBlendInfo(it.weights, it.label) }
+        val blendedVec = blendedDetails?.queryVector
 
         val tail = try {
             container.recommender.recommendUpcoming(
@@ -268,6 +278,8 @@ class RecommendationCache(
                 dislikedFilenames = dislikedFilenames,
                 softExcludedFilenames = softExcludedFilenames,
                 blendedQueryVec = blendedVec,
+                totalTasteScores = container.taste.directScoresByFilename(),
+                negativeGuard = tuning.negativeStrength,
             )
         } catch (ce: CancellationException) {
             throw ce
@@ -275,11 +287,21 @@ class RecommendationCache(
             android.util.Log.w("RecommendationCache", "recommendUpcoming failed: ${t.message}")
             emptyList()
         }
+        val explanations = if (blendedDetails != null) {
+            container.recommender.explainRecommendations(
+                songs = tail,
+                details = blendedDetails,
+                tasteRows = container.taste.decoratedSignals.value.rows,
+                negativeGuard = tuning.negativeStrength,
+                negativeFilteredCount = hardBlockedFilenames.size + dislikedFilenames.size,
+            )
+        } else emptyList()
         return CachedRecommendationTail(
             seedFilename = seedFilename,
             revision = revision,
             tail = tail,
             blendInfo = blendInfo,
+            explanations = explanations,
         )
     }
 

@@ -5,6 +5,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Base64;
 import android.util.Log;
+import android.util.AtomicFile;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -435,20 +436,19 @@ public final class EmbeddingDbManager {
         hdr.putInt(wrote);
         hdr.putInt(metaBytes.length);
 
-        File tmp = new File(dst.getParentFile(), dst.getName() + ".tmp");
-        FileOutputStream fos = new FileOutputStream(tmp);
+        AtomicFile atomicFile = new AtomicFile(dst);
+        FileOutputStream fos = null;
         try {
+            fos = atomicFile.startWrite();
             fos.write(hdr.array());
             fos.write(metaBytes);
             fos.write(finalBlob);
             fos.flush();
             fos.getFD().sync();
-        } finally {
-            fos.close();
-        }
-        if (dst.exists()) dst.delete();
-        if (!tmp.renameTo(dst)) {
-            throw new IOException("rename failed for IVZ export");
+            atomicFile.finishWrite(fos);
+        } catch (Throwable writeError) {
+            if (fos != null) atomicFile.failWrite(fos);
+            throw writeError;
         }
 
         JSONObject out = new JSONObject();

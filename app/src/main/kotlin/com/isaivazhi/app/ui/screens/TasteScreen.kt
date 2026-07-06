@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
@@ -54,6 +55,8 @@ import com.isaivazhi.app.engine.HistoryEngine
 import com.isaivazhi.app.engine.SignalTimelineEngine
 import com.isaivazhi.app.engine.Song
 import com.isaivazhi.app.engine.TasteEngine
+import com.isaivazhi.app.engine.SessionBlendInterval
+import com.isaivazhi.app.engine.TasteEventKind
 import com.isaivazhi.app.engine.signedDirectScore
 import kotlin.math.abs
 
@@ -77,6 +80,7 @@ fun TasteScreen(
     favoritesSet: Set<String>,
     dislikedSet: Set<String>,
     timelineEvents: List<SignalTimelineEngine.Event>,
+    sessionBlendIntervals: List<SessionBlendInterval> = emptyList(),
     engineSnapshot: EngineSnapshot,
     onBack: () -> Unit,
     onAdventurousChange: (Float) -> Unit,
@@ -138,8 +142,8 @@ fun TasteScreen(
                     song = song,
                     plays = dec.signal.plays,
                     avgFraction = dec.signal.avgFraction,
-                    xScore = dec.signal.xScore,
-                    similarityBoost = dec.signal.similarityBoost,
+                    xScore = (bd.negativeWeight - dislikePrior).coerceAtLeast(0f),
+                    similarityBoost = bd.score - bd.directScore,
                     favoritePrior = favoritePrior,
                     dislikePrior = dislikePrior,
                     isFavorite = isFavorite,
@@ -158,6 +162,15 @@ fun TasteScreen(
                     inTopPositive30 = dec.inTopPositive30,
                     inTopNegative30 = dec.inTopNegative30,
                     inTop30 = dec.inTop30,
+                    encounters = dec.signal.encounters,
+                    earlyCount = dec.signal.earlyCount,
+                    partialCount = dec.signal.partialCount,
+                    listenCount = dec.signal.listenCount,
+                    strongCount = dec.signal.strongCount,
+                    queueRemovals = dec.signal.queueRemovals,
+                    avgAllFraction = dec.signal.avgAllFraction,
+                    positiveEvidence = dec.signal.positiveEvidence,
+                    similarityContributors = dec.signal.similarityContributors,
                     isSuspicious = dec.isSuspicious,
                     suspiciousReason = dec.suspiciousReason,
                 )
@@ -189,6 +202,8 @@ fun TasteScreen(
                     inTopPositive30 = false,
                     inTopNegative30 = false,
                     inTop30 = false,
+                    encounters = 0,
+                    avgAllFraction = 0f,
                 )
             } else {
                 val st = stats[song.filename]
@@ -220,6 +235,8 @@ fun TasteScreen(
                     inTopPositive30 = false,
                     inTopNegative30 = false,
                     inTop30 = false,
+                    encounters = plays,
+                    avgAllFraction = avg,
                 )
             }
         }
@@ -363,6 +380,32 @@ fun TasteScreen(
                 item { EngineSnapshotGrid(engineSnapshot) }
             }
 
+            item {
+                Text(
+                    text = "Session blend change",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
+            if (sessionBlendIntervals.isEmpty()) {
+                item {
+                    Text(
+                        text = "No AI queue blend has been applied in this app session yet.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                    )
+                }
+            } else {
+                items(
+                    sessionBlendIntervals.take(20),
+                    key = { "blend_${it.startedAt}" },
+                ) { interval ->
+                    SessionBlendRow(interval)
+                }
+            }
+
             // Last 30 Signals (collapsible, with Copy)
             item {
                 CollapsibleHeader(
@@ -374,9 +417,8 @@ fun TasteScreen(
             if (timelineExpanded) {
                 item {
                     Text(
-                        text = "Each row is one playback result. Shows how Direct play, Similarity, Total score, " +
-                            "Session pull, Library counts, and X-score changed before/after. Very early skips (<10%) " +
-                            "are not added.",
+                        text = "Playback results and explicit taste actions. The badge describes what happened; " +
+                            "the score line shows the recommendation evidence that actually changed.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
@@ -393,8 +435,8 @@ fun TasteScreen(
                     }
                 } else {
                     // Push #72: only render the first [timelineVisibleCount]
-                    // events. Load More bumps by 10. Copy uses the visible
-                    // subset so the user gets exactly what they see.
+                    // events. Load More bumps by 10. Troubleshooting copy
+                    // always includes every retained event and every field.
                     val timelineVisible = timelineEvents.take(timelineVisibleCount)
                     val timelineRemaining = (timelineEvents.size - timelineVisible.size).coerceAtLeast(0)
                     items(timelineVisible, key = { "ev_${it.timestamp}_${it.filename}" }) { ev ->
@@ -421,14 +463,14 @@ fun TasteScreen(
                         ) {
                             TextButton(
                                 onClick = {
-                                    val text = buildTimelineCopyText(timelineVisible)
+                                    val text = buildTimelineCopyText(timelineEvents)
                                     onCopyTimelineText(text)
-                                    copyToClipboard(ctx, "IsaiVazhi Last ${timelineVisible.size} Signals", text)
+                                    copyToClipboard(ctx, "IsaiVazhi Last ${timelineEvents.size} Full Signals", text)
                                 },
                             ) {
                                 Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Copy ${timelineVisible.size} visible signals")
+                                Text("Copy all ${timelineEvents.size} full signals")
                             }
                         }
                     }
@@ -533,7 +575,7 @@ fun TasteScreen(
             title = { Text("Reset engine?") },
             text = {
                 Column {
-                    Text("Clears: Up Next, playback history, X-score, session logs, similarity boost, and saved playback state.")
+                    Text("Clears: Up Next, playback history, avoidance, session logs, similarity boost, and saved playback state.")
                     Spacer(Modifier.height(8.dp))
                     Text("Keeps: song files, embeddings, playlists, and your liked and disliked songs.")
                     Spacer(Modifier.height(8.dp))
@@ -595,6 +637,15 @@ private data class SignalRowData(
     val inTopPositive30: Boolean,
     val inTopNegative30: Boolean,
     val inTop30: Boolean,
+    val encounters: Int = 0,
+    val earlyCount: Int = 0,
+    val partialCount: Int = 0,
+    val listenCount: Int = 0,
+    val strongCount: Int = 0,
+    val queueRemovals: Int = 0,
+    val avgAllFraction: Float = 0f,
+    val positiveEvidence: Float = 0f,
+    val similarityContributors: List<TasteEngine.SimilarityContributor> = emptyList(),
     val isSuspicious: Boolean = false,
     val suspiciousReason: String = "",
 )
@@ -831,6 +882,7 @@ private fun SignalRowView(
     onPlay: () -> Unit,
     onResetSong: (filename: String) -> Unit,
 ) {
+    var expanded by remember(row.song.filename) { mutableStateOf(false) }
     val score = row.score
     val scoreColor = when {
         score > 0.05f -> ScorePositiveColor
@@ -841,7 +893,7 @@ private fun SignalRowView(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onPlay)
+            .clickable { expanded = !expanded }
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Top,
     ) {
@@ -889,14 +941,15 @@ private fun SignalRowView(
                 if (row.isFavorite) StatusChip("Favorite", ScorePositiveColor)
                 if (row.isDisliked) StatusChip("Disliked", ScoreNegativeColor)
                 if (row.isMixed) StatusChip("Mixed", ChipNeutralColor)
-                if (row.xScore > 0.05f) StatusChip("X ${"%.1f".format(row.xScore)}", ScoreNegativeColor)
+                if (row.xScore > 0.05f) {
+                    StatusChip("Avoidance ${"%.1f".format(row.xScore)}", ScoreNegativeColor)
+                }
                 if (abs(row.similarityBoost) > 0.001f) {
                     val sign = if (row.similarityBoost > 0f) "+" else ""
                     val col = if (row.similarityBoost > 0f) ScorePositiveColor else ScoreNegativeColor
                     StatusChip("Similarity $sign${"%.2f".format(row.similarityBoost)}", col)
                 }
                 if (row.isHardBlocked) StatusChip("Up Next excluded", ScoreNegativeColor)
-                if (row.isShortListened) StatusChip("Short-listened", ScoreNegativeColor)
                 if (row.isSuspicious) StatusChip("Review", Color(0xFFFBBF24)) // amber/warning
                 if (row.inTopPositive30) StatusChip("Top +30", ScorePositiveColor)
                 else if (row.inTopNegative30) StatusChip("Top -30", ScoreNegativeColor)
@@ -926,18 +979,71 @@ private fun SignalRowView(
                 text = detailLine,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+                maxLines = if (expanded) Int.MAX_VALUE else 2,
+                overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = onPlay) {
+            Icon(
+                Icons.Filled.PlayArrow,
+                contentDescription = "Play song",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(20.dp),
             )
         }
         IconButton(onClick = { onResetSong(row.song.filename) }) {
             Icon(Icons.Filled.Close, contentDescription = "Reset signal",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
         }
+        Icon(
+            if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+            contentDescription = if (expanded) "Collapse signal" else "Expand signal",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(20.dp),
+        )
     }
 }
 
 private fun buildDetailLine(row: SignalRowData): String {
+    val history = "Played ${row.encounters} • Early ${row.earlyCount} • Partial ${row.partialCount} • " +
+        "Listen ${row.listenCount} • Strong ${row.strongCount} • Avg heard ${(row.avgAllFraction * 100).toInt()}%"
+    val ownEvidence = (row.positiveWeight - row.favoritePrior).coerceAtLeast(0f)
+    val components = mutableListOf("Own ${fmt(ownEvidence)}")
+    if (row.favoritePrior > 0.001f) components += "Favorite ${fmt(row.favoritePrior)}"
+    components += "Similar ${fmt(row.similarityBoost)}"
+    components += "Avoidance ${fmt(-row.xScore)}"
+    if (row.dislikePrior > 0.001f) components += "Dislike ${fmt(-row.dislikePrior)}"
+    components += "Total ${fmt(row.score)}"
+    val score = components.joinToString(" • ")
+    val inherited = row.similarityContributors.take(5)
+        .joinToString(", ") { "${it.sourceFilename} ${fmt(it.amount)}" }
+        .takeIf { it.isNotBlank() }
+        ?.let { "\nSimilar boost sources: $it" }
+        .orEmpty()
+    val removals = if (row.queueRemovals > 0) {
+        "\nRemoved from Up Next ${row.queueRemovals} times"
+    } else ""
+    return "$history\n$score$removals$inherited"
+}
+
+internal enum class TimelineSignalTone { POSITIVE, NEGATIVE, NEUTRAL }
+
+internal fun timelineSignalTone(ev: SignalTimelineEngine.Event): TimelineSignalTone =
+    when (ev.kind) {
+        TasteEventKind.PLAYBACK -> when {
+            ev.avoidanceDelta > 0.001f -> TimelineSignalTone.NEGATIVE
+            ev.contribution > 0.001f -> TimelineSignalTone.POSITIVE
+            else -> TimelineSignalTone.NEUTRAL
+        }
+        TasteEventKind.FAVORITE,
+        TasteEventKind.UNDISLIKE -> TimelineSignalTone.POSITIVE
+        TasteEventKind.DISLIKE,
+        TasteEventKind.QUEUE_REMOVE -> TimelineSignalTone.NEGATIVE
+        TasteEventKind.UNFAVORITE -> TimelineSignalTone.NEUTRAL
+    }
+
+@Suppress("unused")
+private fun buildLegacyDetailLine(row: SignalRowData): String {
     val parts = mutableListOf<String>()
     parts += "${row.plays} starts"
     parts += "avg ${(row.avgFraction * 100).toInt()}%"
@@ -956,7 +1062,229 @@ private fun buildDetailLine(row: SignalRowData): String {
 }
 
 @Composable
+private fun SessionBlendRow(interval: SessionBlendInterval) {
+    val now = System.currentTimeMillis()
+    val end = interval.endedAt ?: now
+    val durationMs = (end - interval.startedAt).coerceAtLeast(0L)
+    val minutes = durationMs / 60_000L
+    val seconds = (durationMs % 60_000L) / 1_000L
+    val formatter = remember { java.text.SimpleDateFormat("HH:mm", java.util.Locale.US) }
+    val from = formatter.format(java.util.Date(interval.startedAt))
+    val to = interval.endedAt?.let { formatter.format(java.util.Date(it)) } ?: "now"
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 5.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(10.dp),
+    ) {
+        Text(
+            text = "Current ${interval.currentPercent}%  •  Session ${interval.sessionPercent}%  •  Long-term ${interval.profilePercent}%",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = "$from–$to  •  ${minutes}m ${seconds}s  •  ${interval.playbackResults} playback results",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = interval.reason,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
 private fun TimelineEventRow(ev: SignalTimelineEngine.Event) {
+    var expanded by remember(ev.eventId, ev.timestamp, ev.filename) { mutableStateOf(true) }
+    val whenStr = remember(ev.timestamp) {
+        java.text.SimpleDateFormat("MMM d • HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date(ev.timestamp))
+    }
+    val delta = ev.tasteAfter.direct - ev.tasteBefore.direct
+    val badge = when (ev.kind) {
+        TasteEventKind.PLAYBACK -> ev.outcome.name
+        TasteEventKind.FAVORITE -> "FAVORITED"
+        TasteEventKind.UNFAVORITE -> "UNFAVORITED"
+        TasteEventKind.DISLIKE -> "DISLIKED"
+        TasteEventKind.UNDISLIKE -> "UNDISLIKED"
+        TasteEventKind.QUEUE_REMOVE -> "REMOVED"
+    }
+    val badgeColor = when (timelineSignalTone(ev)) {
+        TimelineSignalTone.POSITIVE -> ScorePositiveColor
+        TimelineSignalTone.NEGATIVE -> ScoreNegativeColor
+        TimelineSignalTone.NEUTRAL -> ChipNeutralColor
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = ev.title.ifBlank { ev.filename },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(badgeColor.copy(alpha = 0.20f))
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+            ) {
+                Text(badge, style = MaterialTheme.typography.labelSmall, color = badgeColor)
+            }
+            Spacer(Modifier.width(6.dp))
+            Icon(
+                if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = if (expanded) "Collapse event details" else "Expand event details",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .size(20.dp)
+                    .clickable { expanded = !expanded },
+            )
+        }
+        val eventDetail = if (ev.kind == TasteEventKind.PLAYBACK) {
+            "$whenStr • ${(ev.fraction * 100).toInt()}% • ${ev.endReason.label}"
+        } else {
+            "$whenStr • ${ev.kind.name.lowercase().replace('_', ' ')}"
+        }
+        Text(
+            text = eventDetail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(5.dp))
+        val effectText = if (ev.kind == TasteEventKind.PLAYBACK) {
+            "Evidence ${fmt(ev.contribution)}"
+        } else {
+            "Song score change ${fmt(delta)}"
+        }
+        Text(
+            text = effectText,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = "Similar ${fmt(ev.tasteAfter.similarity)}  •  Total ${fmt(ev.tasteAfter.score)}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (abs(ev.avoidanceDelta) > 0.001f) {
+            val avoidanceText = if (ev.avoidanceDelta > 0f) {
+                "Avoidance ${fmt(-ev.avoidanceDelta)}"
+            } else {
+                "Avoidance repaired ${fmt(-ev.avoidanceDelta)}"
+            }
+            Text(
+                text = avoidanceText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (ev.relatedSongsChanged > 0) {
+            Text(
+                text = "${ev.relatedSongsChanged} similar songs adjusted ${fmt(ev.relatedScoreDelta)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (expanded) {
+            Spacer(Modifier.height(7.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Spacer(Modifier.height(7.dp))
+            TimelineDetail(
+                "Direct score",
+                "${fmt(ev.tasteBefore.direct)} → ${fmt(ev.tasteAfter.direct)} " +
+                    "(${fmt(ev.tasteAfter.direct - ev.tasteBefore.direct)})",
+            )
+            TimelineDetail(
+                "Similarity",
+                "${fmt(ev.tasteBefore.similarity)} → ${fmt(ev.tasteAfter.similarity)}",
+            )
+            TimelineDetail(
+                "Total score",
+                "${fmt(ev.tasteBefore.score)} → ${fmt(ev.tasteAfter.score)}",
+            )
+            if (ev.tasteAfter.detailVersion >= 2) {
+                TimelineDetail(
+                    "Song history",
+                "Played ${ev.tasteBefore.encounters} → ${ev.tasteAfter.encounters} • " +
+                    "Early ${ev.tasteBefore.early} → ${ev.tasteAfter.early} • " +
+                    "Partial ${ev.tasteBefore.partial} → ${ev.tasteAfter.partial} • " +
+                    "Listen ${ev.tasteBefore.listens} → ${ev.tasteAfter.listens} • " +
+                    "Strong ${ev.tasteBefore.strong} → ${ev.tasteAfter.strong}",
+            )
+            TimelineDetail(
+                "Average heard",
+                "${(ev.tasteBefore.avgAllFraction * 100).toInt()}% → " +
+                    "${(ev.tasteAfter.avgAllFraction * 100).toInt()}%",
+            )
+            TimelineDetail(
+                "Current components",
+                "Own ${fmt(ev.tasteAfter.ownPositive)} • " +
+                    "Favorite ${fmt(ev.tasteAfter.favorite)} • " +
+                    "Similar ${fmt(ev.tasteAfter.similarity)} • " +
+                    "Avoidance ${fmt(-ev.tasteAfter.avoidance)} • " +
+                    "Dislike ${fmt(-ev.tasteAfter.dislike)} • " +
+                    "Total ${fmt(ev.tasteAfter.score)}",
+            )
+            TimelineDetail(
+                "Queue removals",
+                "${ev.tasteBefore.queueRemovals} → ${ev.tasteAfter.queueRemovals}",
+            )
+            } else {
+                TimelineDetail(
+                    "Legacy capture",
+                    "Full outcome counters were not stored for this older event. " +
+                        "New events include complete song history and score components.",
+                )
+                TimelineDetail(
+                    "Available history",
+                    "Qualified listens ${ev.tasteBefore.plays} → ${ev.tasteAfter.plays} • " +
+                        "Average ${(ev.tasteBefore.avgFraction * 100).toInt()}% → " +
+                        "${(ev.tasteAfter.avgFraction * 100).toInt()}%",
+                )
+            }
+            TimelineDetail(
+                "Session",
+                "Results ${ev.sessionEncountersBefore} → ${ev.sessionEncountersAfter} • " +
+                    "Positive ${ev.sessionPositivesBefore} → ${ev.sessionPositivesAfter}",
+            )
+            TimelineDetail("Diagnostic reason", ev.source)
+            if (ev.eventId.isNotBlank()) TimelineDetail("Event ID", ev.eventId)
+        }
+    }
+}
+
+@Composable
+private fun TimelineDetail(label: String, value: String) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+@Suppress("unused")
+@Composable
+private fun LegacyTimelineEventRow(ev: SignalTimelineEngine.Event) {
     val whenStr = remember(ev.timestamp) {
         java.text.SimpleDateFormat("MMM d • HH:mm:ss", java.util.Locale.US)
             .format(java.util.Date(ev.timestamp))
@@ -1038,7 +1366,99 @@ private fun LineKV(label: String, value: String) {
 
 private fun fmt(v: Float): String = (if (v >= 0f) "+" else "") + "%.2f".format(v)
 
-private fun buildTimelineCopyText(events: List<SignalTimelineEngine.Event>): String {
+private fun buildTimelineCopyText(events: List<SignalTimelineEngine.Event>): String =
+    events.mapIndexed { index, event ->
+        val timestamp = java.text.SimpleDateFormat(
+            "yyyy-MM-dd HH:mm:ss",
+            java.util.Locale.US,
+        ).format(java.util.Date(event.timestamp))
+        val label = if (event.kind == TasteEventKind.PLAYBACK) event.outcome.name
+            else event.kind.name
+        val delta = event.tasteAfter.direct - event.tasteBefore.direct
+        buildString {
+            appendLine("${index + 1}. ${event.title.ifBlank { event.filename }} | $label")
+            appendLine("Time: $timestamp")
+            if (event.kind == TasteEventKind.PLAYBACK) {
+                appendLine("Heard: ${(event.fraction * 100).toInt()}% | Ended by: ${event.endReason.label}")
+            }
+            if (event.kind == TasteEventKind.PLAYBACK) {
+                appendLine("Evidence: ${fmt(event.contribution)}")
+            } else {
+                appendLine("Song score change: ${fmt(delta)}")
+            }
+            appendLine(
+                "Direct score: ${fmt(event.tasteBefore.direct)} -> ${fmt(event.tasteAfter.direct)} " +
+                    "(${fmt(event.tasteAfter.direct - event.tasteBefore.direct)})"
+            )
+            appendLine(
+                "Similarity: ${fmt(event.tasteBefore.similarity)} -> ${fmt(event.tasteAfter.similarity)}"
+            )
+            appendLine("Total score: ${fmt(event.tasteBefore.score)} -> ${fmt(event.tasteAfter.score)}")
+            if (abs(event.avoidanceDelta) > 0.001f) {
+                val avoidanceLabel = if (event.avoidanceDelta > 0f) {
+                    "Avoidance"
+                } else {
+                    "Avoidance repaired"
+                }
+                appendLine("$avoidanceLabel: ${fmt(-event.avoidanceDelta)}")
+            }
+            if (event.relatedSongsChanged > 0) {
+                appendLine("${event.relatedSongsChanged} similar songs adjusted ${fmt(event.relatedScoreDelta)}")
+            }
+            if (event.tasteAfter.detailVersion >= 2) {
+                appendLine(
+                    "Song history before: Played ${event.tasteBefore.encounters} | " +
+                    "Early ${event.tasteBefore.early} | Partial ${event.tasteBefore.partial} | " +
+                    "Listen ${event.tasteBefore.listens} | Strong ${event.tasteBefore.strong} | " +
+                    "Avg heard ${(event.tasteBefore.avgAllFraction * 100).toInt()}%"
+            )
+            appendLine(
+                "Song history after: Played ${event.tasteAfter.encounters} | " +
+                    "Early ${event.tasteAfter.early} | Partial ${event.tasteAfter.partial} | " +
+                    "Listen ${event.tasteAfter.listens} | Strong ${event.tasteAfter.strong} | " +
+                    "Avg heard ${(event.tasteAfter.avgAllFraction * 100).toInt()}%"
+            )
+            appendLine(
+                "Components before: Own ${fmt(event.tasteBefore.ownPositive)} | " +
+                    "Favorite ${fmt(event.tasteBefore.favorite)} | " +
+                    "Similar ${fmt(event.tasteBefore.similarity)} | " +
+                    "Avoidance ${fmt(-event.tasteBefore.avoidance)} | " +
+                    "Dislike ${fmt(-event.tasteBefore.dislike)} | " +
+                    "Total ${fmt(event.tasteBefore.score)}"
+            )
+            appendLine(
+                "Components after: Own ${fmt(event.tasteAfter.ownPositive)} | " +
+                    "Favorite ${fmt(event.tasteAfter.favorite)} | " +
+                    "Similar ${fmt(event.tasteAfter.similarity)} | " +
+                    "Avoidance ${fmt(-event.tasteAfter.avoidance)} | " +
+                    "Dislike ${fmt(-event.tasteAfter.dislike)} | " +
+                    "Total ${fmt(event.tasteAfter.score)}"
+            )
+            appendLine(
+                "Queue removals: ${event.tasteBefore.queueRemovals} -> ${event.tasteAfter.queueRemovals}"
+            )
+            } else {
+                appendLine(
+                    "Legacy capture: full outcome counters were not stored for this older event."
+                )
+                appendLine(
+                    "Available history: Qualified listens ${event.tasteBefore.plays} -> " +
+                        "${event.tasteAfter.plays} | Average " +
+                        "${(event.tasteBefore.avgFraction * 100).toInt()}% -> " +
+                        "${(event.tasteAfter.avgFraction * 100).toInt()}%"
+                )
+            }
+            appendLine(
+                "Session results: ${event.sessionEncountersBefore} -> ${event.sessionEncountersAfter} | " +
+                    "Positive ${event.sessionPositivesBefore} -> ${event.sessionPositivesAfter}"
+            )
+            appendLine("Diagnostic source: ${event.source}")
+            if (event.eventId.isNotBlank()) appendLine("Event ID: ${event.eventId}")
+        }.trimEnd()
+    }.joinToString("\n\n")
+
+@Suppress("unused")
+private fun buildLegacyTimelineCopyText(events: List<SignalTimelineEngine.Event>): String {
     return events.mapIndexed { idx, e ->
         val ts = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date(e.timestamp))
         val cls = if (e.classification == SignalTimelineEngine.Classification.SKIP) "skip" else "positive listen"

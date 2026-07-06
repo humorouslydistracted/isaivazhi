@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Appends AI/shuffle recommendations when the playback queue reaches its last
@@ -134,9 +135,14 @@ class QueueContinuationCoordinator(
             }
         }
 
+        val startupReady = container.startup.refreshReady.value ||
+            (withTimeoutOrNull(2_000L) {
+                container.startup.refreshReady.first { it }
+                true
+            } ?: false)
         val tuning = container.taste.tuning.value
         val recMode = container.preferences.recMode.first()
-        val embeddingRows = runCatching { container.embeddingDb.rowCount() }.getOrDefault(0)
+        val embeddingRows = if (startupReady) container.embeddingDb.vecCacheSize else 0
 
         android.util.Log.i(
             "QueueExhaust",
@@ -150,8 +156,8 @@ class QueueContinuationCoordinator(
             currentFilename = mediaId,
             recentlySurfaced = recentlySurfaced,
         )
-        val blendedTriple = runCatching {
-            container.recommender.buildBlendedVec(
+        val blendedDetails = runCatching {
+            container.recommender.buildBlendedQuery(
                 currentSongHash = current.contentHash,
                 sessionListened = container.session.listened.value,
                 profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec,
@@ -160,11 +166,12 @@ class QueueContinuationCoordinator(
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
-        blendedTriple?.let { (_, weights, label) ->
-            _lastBlendInfo.value = RecommendationBlendInfo(weights, label)
+        blendedDetails?.let {
+            _lastBlendInfo.value = RecommendationBlendInfo(it.weights, it.label)
+            container.recommendationExplainability.recordBlend(it.weights, "Queue continued")
         }
-        val blendedVec = blendedTriple?.first
-        val tail = if (recMode && embeddingRows > 0) {
+        val blendedVec = blendedDetails?.queryVector
+        val tail = if (startupReady && recMode && embeddingRows > 0) {
             runCatching {
                 container.recommender.recommendUpcoming(
                     currentSong = current,
@@ -176,6 +183,8 @@ class QueueContinuationCoordinator(
                     dislikedFilenames = container.disliked.disliked.value,
                     softExcludedFilenames = container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength),
                     blendedQueryVec = blendedVec,
+                    totalTasteScores = container.taste.directScoresByFilename(),
+                    negativeGuard = tuning.negativeStrength,
                 )
             }.getOrDefault(emptyList())
         } else {
@@ -206,8 +215,17 @@ class QueueContinuationCoordinator(
         } else {
             container.playback.appendToQueue(tail)
         }
+        if (recMode && blendedDetails != null) {
+            container.publishRecommendationExplanations(
+                songs = tail,
+                details = blendedDetails,
+                negativeFilteredCount = container.taste
+                    .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size +
+                    container.disliked.disliked.value.size,
+            )
+        }
         container.toaster.show(
-            "Up Next refreshed with recommendations (${blendedTriple?.third ?: "shuffle"})",
+            "Up Next refreshed with recommendations (${blendedDetails?.label ?: "shuffle"})",
         )
         container.activityLog.log(
             category = "engine",
@@ -216,7 +234,7 @@ class QueueContinuationCoordinator(
             data = mapOf(
                 "trigger" to trigger,
                 "tailSize" to tail.size,
-                "blend" to (blendedTriple?.third ?: "shuffle"),
+                "blend" to (blendedDetails?.label ?: "shuffle"),
                 "ctx" to ctx.name,
             ),
         )

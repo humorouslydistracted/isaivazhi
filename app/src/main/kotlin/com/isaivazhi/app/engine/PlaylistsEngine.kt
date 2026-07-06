@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -34,6 +35,7 @@ class PlaylistsEngine(private val appContext: Context) {
     val playlists: StateFlow<List<Playlist>> = _playlists.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val readyDeferred = CompletableDeferred<Unit>()
 
     private fun normalizeName(name: String): String =
         name.trim().ifBlank { "New playlist" }
@@ -47,8 +49,14 @@ class PlaylistsEngine(private val appContext: Context) {
                 }
             } catch (t: Throwable) {
                 android.util.Log.w("PlaylistsEngine", "load failed: ${t.message}")
+            } finally {
+                if (!readyDeferred.isCompleted) readyDeferred.complete(Unit)
             }
         }
+    }
+
+    suspend fun awaitReady() {
+        readyDeferred.await()
     }
 
     fun create(name: String): Playlist {

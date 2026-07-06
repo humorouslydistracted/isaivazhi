@@ -35,6 +35,18 @@ class RecommendationRefreshCoordinator(
     }
 
     fun requestRefresh(reason: String = "manual") {
+        if (!container.startup.refreshReady.value) {
+            container.activityLog.log(
+                category = "queue",
+                type = "REFRESH_NOT_READY",
+                message = "Refresh ignored while startup is ${container.startup.phase.value}",
+                data = mapOf("reason" to reason),
+            )
+            if (reason != "notification") {
+                container.toaster.show("AI is getting ready…")
+            }
+            return
+        }
         synchronized(requestGuard) {
             if (container.playback.refreshBusy.value) return
             container.playback.setRefreshBusy(true)
@@ -63,7 +75,10 @@ class RecommendationRefreshCoordinator(
 
         val cachedTail = container.recommendationCache.popTail()
         if (cachedTail != null) {
-            cachedTail.blendInfo?.let { _lastBlendInfo.value = it }
+            cachedTail.blendInfo?.let {
+                _lastBlendInfo.value = it
+                container.recommendationExplainability.recordBlend(it.weights, "Queue refreshed")
+            }
             val finalResult = buildFinalHardRefreshResult(
                 candidateTail = cachedTail.tail,
                 songs = songs,
@@ -89,6 +104,11 @@ class RecommendationRefreshCoordinator(
                 newUpcoming = finalResult.finalUpcoming,
                 newContext = PlaybackEngine.QueueContext.AI_RECOMMENDED,
             )
+            if (cachedTail.explanations.isNotEmpty()) {
+                container.recommendationExplainability
+                    .setQueueExplanations(cachedTail.explanations)
+                container.preferences.saveQueueExplanations(cachedTail.explanations)
+            }
             return
         }
 
@@ -114,12 +134,13 @@ class RecommendationRefreshCoordinator(
         val playNextSet = playbackState.playNextFilenames
         val tuning = container.taste.tuning.value
         val recMode = container.preferences.recMode.first()
-        val embeddingRows = runCatching { container.embeddingDb.rowCount() }.getOrDefault(0)
+        val embeddingRows = container.embeddingDb.vecCacheSize.takeIf { it > 0 }
+            ?: runCatching { container.preferences.cachedEmbedStats().rowCount }.getOrDefault(0)
         val byFn = songs.associateBy { it.filename }
         val playNextSongs = playNextSet.mapNotNull { byFn[it] }
         val excludeFns = playNextSet + mediaId
-        val blendedTriple = runCatching {
-            container.recommender.buildBlendedVec(
+        val blendedDetails = runCatching {
+            container.recommender.buildBlendedQuery(
                 currentSongHash = current.contentHash,
                 sessionListened = container.session.listened.value,
                 profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec,
@@ -128,9 +149,12 @@ class RecommendationRefreshCoordinator(
                 sessionBias = tuning.sessionBias,
             )
         }.getOrNull()
-        val blendInfo = blendedTriple?.let { RecommendationBlendInfo(it.second, it.third) }
-        blendInfo?.let { _lastBlendInfo.value = it }
-        val blendedVec = blendedTriple?.first
+        val blendInfo = blendedDetails?.let { RecommendationBlendInfo(it.weights, it.label) }
+        blendInfo?.let {
+            _lastBlendInfo.value = it
+            container.recommendationExplainability.recordBlend(it.weights, "Queue refreshed")
+        }
+        val blendedVec = blendedDetails?.queryVector
         val recentlySurfaced = container.recentlySurfacedTracker.recentlySurfaced()
         val excludeFnsWithRecency = excludeFns + recentlySurfaced
         val newTail = if (recMode && embeddingRows > 0) {
@@ -145,6 +169,8 @@ class RecommendationRefreshCoordinator(
                     dislikedFilenames = container.disliked.disliked.value,
                     softExcludedFilenames = container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength),
                     blendedQueryVec = blendedVec,
+                    totalTasteScores = container.taste.directScoresByFilename(),
+                    negativeGuard = tuning.negativeStrength,
                 )
             }.getOrDefault(emptyList())
         } else {
@@ -176,6 +202,15 @@ class RecommendationRefreshCoordinator(
             newUpcoming = finalResult.finalUpcoming,
             newContext = PlaybackEngine.QueueContext.AI_RECOMMENDED,
         )
+        if (recMode && blendedDetails != null) {
+            container.publishRecommendationExplanations(
+                songs = finalResult.finalTail,
+                details = blendedDetails,
+                negativeFilteredCount = container.taste
+                    .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size +
+                    container.disliked.disliked.value.size,
+            )
+        }
         container.activityLog.log(
             category = "queue",
             type = "REFRESH_REPLACE_DONE",

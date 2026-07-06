@@ -14,12 +14,20 @@ class RecommenderNegativeFilterTest {
     )
 
     @Test
-    fun softExclude_atDefaultStrength_dropsBelowThreshold() {
+    fun softExclude_doesNotRemoveSongsThatShouldBeDownranked() {
         val excluded = RecommendationPolicy.softExcludedFilenames(scores, 0.5f)
-        assertTrue("mid" in excluded)
-        assertTrue("strong" in excluded)
-        assertTrue("mild" !in excluded)
-        assertTrue("ok" !in excluded)
+        assertTrue(excluded.isEmpty())
+    }
+
+    @Test
+    fun hardBlock_becomesStricterAsNegativeGuardIncreases() {
+        val lowGuard = RecommendationPolicy.hardBlockedFilenames(scores, 0.1f)
+        val highGuard = RecommendationPolicy.hardBlockedFilenames(scores, 1f)
+
+        assertTrue(lowGuard.isEmpty())
+        assertTrue("strong" in highGuard)
+        assertTrue("mild" !in highGuard)
+        assertTrue(lowGuard.all { it in highGuard })
     }
 
     @Test

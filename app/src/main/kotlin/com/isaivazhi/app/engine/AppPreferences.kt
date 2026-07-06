@@ -50,6 +50,7 @@ class AppPreferences(private val appContext: Context) {
         // instead of waiting for the LE to recompute.
         val PROFILE_VEC_JSON = stringPreferencesKey("profile_vec_v1_json")
         val PROFILE_VEC_FINGERPRINT = stringPreferencesKey("profile_vec_fingerprint_v1")
+        val QUEUE_EXPLANATIONS_JSON = stringPreferencesKey("queue_explanations_v2_json")
         // Push #74: monotonic watermark on the highest playbackInstanceId
         // already credited to TasteEngine. Used by cold-start replay of the
         // service transitions buffer to skip entries already captured live
@@ -330,6 +331,67 @@ class AppPreferences(private val appContext: Context) {
             val out = FloatArray(arr.length()) { i -> arr.optDouble(i, 0.0).toFloat() }
             if (out.isEmpty()) null else ProfileVecCache(out, fp)
         } catch (_: Throwable) { null }
+    }
+
+    suspend fun saveQueueExplanations(items: List<RecommendationExplanation>) {
+        val array = org.json.JSONArray()
+        items.forEach { item ->
+            array.put(org.json.JSONObject().apply {
+                put("queueGenerationId", item.queueGenerationId)
+                put("itemId", item.itemId)
+                put("filename", item.filename)
+                put("origin", item.origin.name)
+                put("current", item.currentContribution.toDouble())
+                put("session", item.sessionContribution.toDouble())
+                put("profile", item.profileContribution.toDouble())
+                put("direct", item.directScore.toDouble())
+                put("similarity", item.similarityScore.toDouble())
+                put("total", item.totalScore.toDouble())
+                put("tasteAdjustment", item.tasteAdjustment.toDouble())
+                put("relevanceRank", item.relevanceRank)
+                put("finalRank", item.finalRank)
+                put("negativeFilteredCount", item.negativeFilteredCount)
+            })
+        }
+        appContext.dataStore.edit { it[Keys.QUEUE_EXPLANATIONS_JSON] = array.toString() }
+    }
+
+    suspend fun loadQueueExplanations(): List<RecommendationExplanation> {
+        val raw = appContext.dataStore.data.first()[Keys.QUEUE_EXPLANATIONS_JSON]
+            ?: return emptyList()
+        return runCatching {
+            val array = org.json.JSONArray(raw)
+            buildList {
+                for (i in 0 until array.length()) {
+                    val value = array.optJSONObject(i) ?: continue
+                    val filename = value.optString("filename", "")
+                    if (filename.isBlank()) continue
+                    add(
+                        RecommendationExplanation(
+                            queueGenerationId = value.optString(
+                                "queueGenerationId",
+                                java.util.UUID.randomUUID().toString(),
+                            ),
+                            itemId = value.optString("itemId", java.util.UUID.randomUUID().toString()),
+                            filename = filename,
+                            origin = runCatching {
+                                QueueItemOrigin.valueOf(value.optString("origin", QueueItemOrigin.RESTORED.name))
+                            }.getOrDefault(QueueItemOrigin.RESTORED),
+                            currentContribution = value.optDouble("current", 0.0).toFloat(),
+                            sessionContribution = value.optDouble("session", 0.0).toFloat(),
+                            profileContribution = value.optDouble("profile", 0.0).toFloat(),
+                            directScore = value.optDouble("direct", 0.0).toFloat(),
+                            similarityScore = value.optDouble("similarity", 0.0).toFloat(),
+                            totalScore = value.optDouble("total", 0.0).toFloat(),
+                            tasteAdjustment = value.optDouble("tasteAdjustment", 0.0).toFloat(),
+                            relevanceRank = value.optInt("relevanceRank", 0),
+                            finalRank = value.optInt("finalRank", 0),
+                            negativeFilteredCount = value.optInt("negativeFilteredCount", 0),
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
     }
 
     suspend fun loadPendingEvidence(): PendingEvidence? {

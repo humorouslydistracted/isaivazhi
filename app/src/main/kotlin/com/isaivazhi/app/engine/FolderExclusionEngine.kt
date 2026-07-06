@@ -132,12 +132,29 @@ class FolderExclusionEngine(private val appContext: Context) {
 
     /**
      * Filters [songs] by removing any whose parent directory is in [excluded].
+     *
+     * This is called from a Compose derived state during first render. Do not
+     * use [normalizeFolderPath] or [matchesSameFolder] here: both resolve
+     * canonical files, which turns a 2,500-song library with a few exclusions
+     * into tens of thousands of synchronous storage calls on the UI thread.
+     * Persisted paths are already canonicalized, so lexical normalization plus
+     * the existing two-segment suffix fallback is sufficient for this hot path.
      */
     fun filter(songs: List<Song>, excluded: Set<String>): List<Song> {
         if (excluded.isEmpty()) return songs
+        val normalizedExcluded = excluded
+            .asSequence()
+            .map(::normalizeFolderPathLexically)
+            .filter { it.isNotBlank() }
+            .toSet()
+        val excludedSuffixes = normalizedExcluded
+            .mapNotNull(::pathSuffixLexically)
+            .toSet()
         return songs.filter { song ->
             val parent = song.filePath?.let { File(it).parent } ?: return@filter true
-            !isPathExcluded(parent, excluded)
+            val normalizedParent = normalizeFolderPathLexically(parent)
+            normalizedParent !in normalizedExcluded &&
+                pathSuffixLexically(normalizedParent) !in excludedSuffixes
         }
     }
 
@@ -209,10 +226,24 @@ class FolderExclusionEngine(private val appContext: Context) {
     // ---------------------------------------------------------------------------
 
     fun normalizeFolderPath(path: String): String {
-        val cleaned = path.trim().replace('\\', '/').trimEnd('/')
+        val cleaned = normalizeFolderPathLexically(path)
         if (cleaned.isBlank()) return cleaned
         return runCatching { File(cleaned).canonicalFile.absolutePath }
             .getOrElse { cleaned }
+    }
+
+    private fun normalizeFolderPathLexically(path: String): String =
+        path.trim().replace('\\', '/').trimEnd('/')
+
+    private fun pathSuffixLexically(
+        path: String,
+        minSegments: Int = SUFFIX_MATCH_MIN_SEGMENTS,
+    ): String? {
+        val parts = normalizeFolderPathLexically(path)
+            .split('/')
+            .filter { it.isNotBlank() }
+        if (parts.size < minSegments) return null
+        return parts.takeLast(minSegments).joinToString("/")
     }
 
     private fun pathSuffix(path: String, minSegments: Int = SUFFIX_MATCH_MIN_SEGMENTS): String? {

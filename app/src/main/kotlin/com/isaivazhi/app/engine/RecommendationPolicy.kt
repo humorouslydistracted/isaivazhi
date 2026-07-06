@@ -1,10 +1,5 @@
 package com.isaivazhi.app.engine
 
-import kotlin.math.abs
-import kotlin.math.ceil
-import kotlin.math.max
-import kotlin.math.min
-
 /**
  * Pure recommendation-policy helpers (Up Next exclusions). Testable
  * without Android or DataStore.
@@ -13,11 +8,9 @@ object RecommendationPolicy {
 
     const val HARD_EXCLUDE_SHARE = 0.18f
     const val HARD_EXCLUDE_FLOOR = 1.5f
-    private const val SOFT_NEGATIVE_SCALE = 0.5f
-
     /**
-     * Top [effectiveShare] of negative direct scores with |score| >= [effectiveFloor].
-     * At strength 0 returns empty; at 1 uses full share/floor constants.
+     * Learned negatives are blocked when their guarded magnitude reaches the
+     * unified threshold. A higher Negative Guard can only add blocks.
      */
     fun hardBlockedFilenames(
         directScoresByFilename: Map<String, Float>,
@@ -25,35 +18,19 @@ object RecommendationPolicy {
         share: Float = HARD_EXCLUDE_SHARE,
         floor: Float = HARD_EXCLUDE_FLOOR,
     ): Set<String> {
-        val s = negativeStrength.coerceIn(0f, 1f)
-        if (s <= 0f || directScoresByFilename.isEmpty()) return emptySet()
-        val effectiveShare = share * s
-        val effectiveFloor = floor * s
-        val negativeStrongRows = directScoresByFilename.entries
-            .filter { it.value < 0f }
-            .sortedByDescending { abs(it.value) }
-        if (negativeStrongRows.isEmpty()) return emptySet()
-        val cap = max(1, ceil(negativeStrongRows.size * effectiveShare).toInt())
-        val out = HashSet<String>()
-        for (i in 0 until min(cap, negativeStrongRows.size)) {
-            if (abs(negativeStrongRows[i].value) >= effectiveFloor) {
-                out += negativeStrongRows[i].key
+        if (negativeStrength <= 0f || directScoresByFilename.isEmpty()) return emptySet()
+        return directScoresByFilename
+            .filterValues {
+                UnifiedTasteContract.isLearnedNegativeBlocked(it, negativeStrength)
             }
-        }
-        return out
+            .keys
     }
 
     /** Songs with directScore below -[0.5 × negativeStrength]. */
     fun softExcludedFilenames(
         directScoresByFilename: Map<String, Float>,
         negativeStrength: Float,
-    ): Set<String> {
-        val threshold = SOFT_NEGATIVE_SCALE * negativeStrength.coerceIn(0f, 1f)
-        if (threshold <= 0f) return emptySet()
-        return directScoresByFilename
-            .filter { (_, score) -> score < -threshold }
-            .keys
-    }
+    ): Set<String> = emptySet()
 
     fun unionExcludes(
         hardBlocked: Set<String>,

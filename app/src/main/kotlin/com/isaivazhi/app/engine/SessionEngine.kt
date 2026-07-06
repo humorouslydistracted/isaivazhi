@@ -28,6 +28,11 @@ class SessionEngine {
         val skips: Int = 0,
         val positives: Int = 0,
         val weightFraction: Float = 0f,
+        val early: Int = 0,
+        val partial: Int = 0,
+        val listens: Int = 0,
+        val strong: Int = 0,
+        val evidenceUnits: Float = 0f,
     )
 
     /**
@@ -41,6 +46,9 @@ class SessionEngine {
         val fraction: Float,
         val source: String,
         val timestamp: Long,
+        val contribution: Float = fraction,
+        val evidenceUnits: Float = 1f,
+        val outcome: PlaybackOutcome = UnifiedTasteContract.outcomeFor(fraction),
     )
 
     /** Max retained session listen entries (Capacitor MAX_RECENT_PLAYBACK_SIGNALS=60). */
@@ -85,9 +93,13 @@ class SessionEngine {
     ): Pair<SessionCounters, SessionCounters> {
         val before = _counters.value
         val frac = fraction.coerceIn(0f, 1f)
+        val outcome = UnifiedTasteContract.outcomeFor(frac)
+        val contribution = UnifiedTasteContract.positiveContribution(frac)
         val newEncounters = before.encounters + 1
-        val newSkips = if (isSkip && !isManual) before.skips + 1 else before.skips
-        val newPositives = if (!isSkip) before.positives + 1 else before.positives
+        // Transport/recovery reasons no longer imply preference. Preserve the
+        // legacy field for compatibility but do not add new "skip" evidence.
+        val newSkips = before.skips
+        val newPositives = if (contribution > 0f) before.positives + 1 else before.positives
         val newWeight = if (newEncounters == 0) 0f
             else ((before.weightFraction * before.encounters) + frac) / newEncounters
         val after = SessionCounters(
@@ -95,19 +107,29 @@ class SessionEngine {
             skips = newSkips,
             positives = newPositives,
             weightFraction = newWeight,
+            early = before.early + if (outcome == PlaybackOutcome.EARLY) 1 else 0,
+            partial = before.partial + if (outcome == PlaybackOutcome.PARTIAL) 1 else 0,
+            listens = before.listens + if (outcome == PlaybackOutcome.LISTEN) 1 else 0,
+            strong = before.strong + if (outcome == PlaybackOutcome.STRONG) 1 else 0,
+            evidenceUnits = before.evidenceUnits + outcome.evidenceUnits,
         )
         _counters.value = after
-        // Push #67: append to the rolling listened list (capped). This
-        // drives the session vector used by the Recommender's blended
-        // query. Skip events with frac < 0.10 (noise) are excluded.
-        if (filename.isNotBlank() && frac >= 0.10f) {
-            val entry = ListenedEntry(filename, frac, source, System.currentTimeMillis())
+        // Only outcomes with positive evidence enter the session vector.
+        if (filename.isNotBlank() && contribution > 0f) {
+            val entry = ListenedEntry(
+                filename = filename,
+                fraction = frac,
+                source = source,
+                timestamp = System.currentTimeMillis(),
+                contribution = contribution,
+                evidenceUnits = outcome.evidenceUnits,
+                outcome = outcome,
+            )
             val newList = (_listened.value + entry).takeLast(MAX_RECENT_LISTENS)
             _listened.value = newList
         }
-        // Push #64: only "qualified" listens (non-skip, non-manual, >=50%)
-        // count toward the For You auto-refresh window.
-        if (!isSkip && !isManual && frac >= 0.5f) {
+        // Any positive evidence advances the session refresh window.
+        if (contribution > 0f) {
             _forYouTick.value = _forYouTick.value + 1
         }
         return before to after

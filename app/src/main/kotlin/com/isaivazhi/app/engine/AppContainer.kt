@@ -6,6 +6,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Single source of engines for the app. Constructed once at process start
@@ -14,6 +16,11 @@ import kotlinx.coroutines.runBlocking
  * grows.
  */
 class AppContainer(private val appContext: Context) {
+
+    private val startupReconcileMutex = Mutex()
+    @Volatile private var startupStateReconciled = false
+    private val activityRecoveryMutex = Mutex()
+    @Volatile private var activityRecoveryCompleted = false
 
     val preferences: AppPreferences by lazy { AppPreferences(appContext) }
 
@@ -44,6 +51,46 @@ class AppContainer(private val appContext: Context) {
     )
     val rebuildSignal: kotlinx.coroutines.flow.SharedFlow<String> = _rebuildSignal
 
+    val recommendationExplainability: RecommendationExplainabilityEngine by lazy {
+        RecommendationExplainabilityEngine()
+    }
+
+    private fun appendManualTasteEvent(
+        filename: String,
+        kind: TasteEventKind,
+        source: String,
+        before: TasteEngine.TasteSignal,
+        after: TasteEngine.TasteSignal,
+        propagation: TasteEngine.PropagationSummary = TasteEngine.PropagationSummary(),
+    ) {
+        fun snapshot(signal: TasteEngine.TasteSignal) = timelineSnapshotOf(signal)
+        val delta = after.directScore - before.directScore
+        signalTimeline.append(
+            SignalTimelineEngine.Event(
+                timestamp = System.currentTimeMillis(),
+                filename = filename,
+                title = filename,
+                artist = "",
+                source = source,
+                fraction = 0f,
+                classification = if (delta < 0f) SignalTimelineEngine.Classification.SKIP
+                    else SignalTimelineEngine.Classification.LISTEN,
+                tasteBefore = snapshot(before),
+                tasteAfter = snapshot(after),
+                xScoreBefore = before.xScore,
+                xScoreAfter = after.xScore,
+                sessionPullBefore = taste.tuning.value.sessionBias,
+                sessionPullAfter = taste.tuning.value.sessionBias,
+                libraryAvgBefore = 0f,
+                libraryAvgAfter = 0f,
+                kind = kind,
+                contribution = delta,
+                relatedSongsChanged = propagation.changedSongs,
+                relatedScoreDelta = propagation.totalDelta,
+            )
+        )
+    }
+
     val favorites: FavoritesEngine by lazy {
         FavoritesEngine(appContext).also { fav ->
             fav.onChangeHook = { fn, _ ->
@@ -61,7 +108,15 @@ class AppContainer(private val appContext: Context) {
                     data = mapOf("filename" to fn, "delta" to delta),
                 )
                 sideEffectScope.launch {
-                    taste.propagateSimilarityBoost(fn, delta, "favorite_toggle")
+                    val propagation = taste.propagateSimilarityBoost(fn, delta, "favorite_toggle")
+                    appendManualTasteEvent(
+                        filename = fn,
+                        kind = if (nowFav) TasteEventKind.FAVORITE else TasteEventKind.UNFAVORITE,
+                        source = if (nowFav) "favorite" else "unfavorite",
+                        before = before,
+                        after = after,
+                        propagation = propagation,
+                    )
                     _rebuildSignal.emit("favorite_toggle")
                 }
                 invalidateRecommendationInputs("favorite_toggle")
@@ -158,6 +213,38 @@ class AppContainer(private val appContext: Context) {
         }
     }
 
+    /** Run legacy/manual-state migration only once per application process. */
+    suspend fun reconcileStartupStateOnce() {
+        if (startupStateReconciled) return
+        startupReconcileMutex.withLock {
+            if (startupStateReconciled) return@withLock
+            reconcileNotificationFavoriteStorage()
+            reconcileCapacitorDislikedStorage()
+            reconcileManualTasteFlags()
+            startupStateReconciled = true
+        }
+    }
+
+    /**
+     * Run durable playback/ledger recovery once per process, not once per
+     * MainActivity instance. Swiping the task away can recreate the Activity
+     * while the playback service and this container remain alive; replaying
+     * the cold-start path then stalls the first frame and needlessly resyncs
+     * the already-authoritative controller.
+     *
+     * Completion is recorded only after [block] returns. If the first
+     * Activity is cancelled mid-recovery, the next instance can safely retry.
+     */
+    suspend fun runActivityRecoveryOnce(block: suspend () -> Unit): Boolean {
+        if (activityRecoveryCompleted) return false
+        return activityRecoveryMutex.withLock {
+            if (activityRecoveryCompleted) return@withLock false
+            block()
+            activityRecoveryCompleted = true
+            true
+        }
+    }
+
     val disliked: DislikedEngine by lazy {
         DislikedEngine(appContext).also { dis ->
             dis.onChangeHook = { fn, _ ->
@@ -175,7 +262,15 @@ class AppContainer(private val appContext: Context) {
                     data = mapOf("filename" to fn, "delta" to delta),
                 )
                 sideEffectScope.launch {
-                    taste.propagateSimilarityBoost(fn, delta, "dislike_toggle")
+                    val propagation = taste.propagateSimilarityBoost(fn, delta, "dislike_toggle")
+                    appendManualTasteEvent(
+                        filename = fn,
+                        kind = if (nowDis) TasteEventKind.DISLIKE else TasteEventKind.UNDISLIKE,
+                        source = if (nowDis) "dislike" else "undislike",
+                        before = before,
+                        after = after,
+                        propagation = propagation,
+                    )
                     _rebuildSignal.emit("dislike_toggle")
                 }
                 invalidateRecommendationInputs("dislike_toggle")
@@ -239,7 +334,7 @@ class AppContainer(private val appContext: Context) {
     val playback: PlaybackEngine by lazy {
         PlaybackEngine(
             appContext, preferences, history, taste, signalTimeline, session, toaster,
-            activityLog, favorites, recentlySurfacedTracker,
+            activityLog, favorites, recentlySurfacedTracker, recommendationExplainability,
         ).also { engine ->
             engine.onRecommendationInputsChanged = { reason ->
                 invalidateRecommendationInputs(reason)
@@ -248,6 +343,31 @@ class AppContainer(private val appContext: Context) {
     }
 
     val recommender: Recommender by lazy { Recommender(embeddingDb) }
+
+    suspend fun publishRecommendationExplanations(
+        songs: List<Song>,
+        details: Recommender.BlendedQueryDetails,
+        origin: QueueItemOrigin = QueueItemOrigin.AI,
+        negativeFilteredCount: Int = 0,
+    ) {
+        val explanations = recommender.explainRecommendations(
+            songs = songs,
+            details = details,
+            tasteRows = taste.decoratedSignals.value.rows,
+            negativeGuard = taste.tuning.value.negativeStrength,
+            negativeFilteredCount = negativeFilteredCount,
+            origin = origin,
+        )
+        recommendationExplainability.setQueueExplanations(explanations)
+        preferences.saveQueueExplanations(explanations)
+    }
+
+    suspend fun hydrateRecommendationExplanations() {
+        val restored = preferences.loadQueueExplanations().map {
+            if (it.origin == QueueItemOrigin.AI) it.copy(origin = QueueItemOrigin.RESTORED) else it
+        }
+        recommendationExplainability.setQueueExplanations(restored)
+    }
 
     val embedding: EmbeddingEngine by lazy {
         EmbeddingEngine(appContext, embeddingDb, toaster, preferences)
@@ -292,6 +412,10 @@ class AppContainer(private val appContext: Context) {
         QueueContinuationCoordinator(this, applicationScope)
     }
 
+    val startup: StartupCoordinator by lazy {
+        StartupCoordinator(appContext, this, applicationScope)
+    }
+
     /**
      * Push #57: filepaths the user has chosen to skip embedding for. The
      * AI page's Pending list excludes these so a permanently-failing song
@@ -310,6 +434,7 @@ class AppContainer(private val appContext: Context) {
      */
     fun resetEngine() {
         activityLog.log("engine", "reset", "Engine reset triggered", level = ActivityLogEngine.Level.WARN)
+        startup.clearSnapshot()
         playback.stop()
         history.resetAllStats()
         signalTimeline.clear()

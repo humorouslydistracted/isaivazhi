@@ -113,6 +113,7 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
             filename = mediaId,
             source = source,
         )
+        container.recommendationExplainability.recordPlaybackResult()
         val sessionPull = container.taste.tuning.value.sessionBias.coerceIn(0f, 1f)
         val avgLib = avgLibraryFraction()
 
@@ -141,6 +142,13 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
                 sessionPositivesBefore = sessionPair.first.positives,
                 sessionPositivesAfter = sessionPair.second.positives,
                 eventId = event.eventId,
+                avoidanceDelta = after.earlySkipPenalty - before.earlySkipPenalty -
+                    if (after.strongCount > before.strongCount) {
+                        minOf(
+                            before.xScore,
+                            UnifiedTasteContract.STRONG_AVOIDANCE_REPAIR,
+                        )
+                    } else 0f,
             )
         )
         container.history.recordCompleted(
@@ -214,14 +222,7 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
     }
 
     private fun snapshotOf(s: TasteEngine.TasteSignal): SignalTimelineEngine.Snapshot =
-        SignalTimelineEngine.Snapshot(
-            score = s.directScore,
-            direct = s.directScore,
-            similarity = s.similarityBoost,
-            plays = s.plays,
-            skips = s.skips,
-            avgFraction = s.avgFraction,
-        )
+        timelineSnapshotOf(s)
 
     private fun avgLibraryFraction(): Float {
         val sigs = container.taste.signals.value

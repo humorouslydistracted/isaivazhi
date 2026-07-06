@@ -7,6 +7,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -21,26 +23,36 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragIndicator
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.Song
+import com.isaivazhi.app.engine.RecommendationBlendInfo
+import com.isaivazhi.app.engine.RecommendationExplanation
+import com.isaivazhi.app.engine.RecommendationInfluence
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 
@@ -69,6 +81,13 @@ fun UpNextScreen(
     onRemove: (index: Int) -> Unit,
     onMove: (fromIndex: Int, toIndex: Int) -> Unit,
     onRefresh: () -> Unit,
+    refreshEnabled: Boolean = true,
+    refreshInProgress: Boolean = false,
+    explanations: List<RecommendationExplanation> = emptyList(),
+    blendInfo: RecommendationBlendInfo? = null,
+    adventurous: Float = 0.8f,
+    negativeGuard: Float = 0.5f,
+    playNextFilenames: Set<String> = emptySet(),
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
     val safeIndex = currentIndex.coerceAtLeast(0)
@@ -110,13 +129,35 @@ fun UpNextScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            IconButton(onClick = onRefresh) {
-                Icon(
-                    imageVector = Icons.Filled.Refresh,
-                    contentDescription = "Refresh upcoming queue with current mode",
-                    tint = MaterialTheme.colorScheme.primary,
-                )
+            IconButton(
+                onClick = onRefresh,
+                enabled = refreshEnabled && !refreshInProgress,
+            ) {
+                if (refreshInProgress) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = "Refresh upcoming queue with current mode",
+                        tint = if (refreshEnabled) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
+        }
+        if (aiMode && blendInfo != null) {
+            BlendSummary(
+                blendInfo = blendInfo,
+                adventurous = adventurous,
+                negativeGuard = negativeGuard,
+                filteredCount = explanations.maxOfOrNull { it.negativeFilteredCount } ?: 0,
+                queueExplanations = queue.mapNotNull { song ->
+                    explanations.firstOrNull { it.filename == song.filename }
+                },
+            )
         }
 
         if (queue.isEmpty()) {
@@ -199,6 +240,7 @@ fun UpNextScreen(
                         onTap = { onJumpTo(realIndex) },
                         onLongPress = { onLongPress(song) },
                         onRemove = null,
+                        explanation = explanations.firstOrNull { it.filename == song.filename },
                     )
                 }
             }
@@ -213,6 +255,7 @@ fun UpNextScreen(
                         onTap = { onJumpTo(safeIndex) },
                         onLongPress = { onLongPress(current) },
                         onRemove = null,
+                        explanation = explanations.firstOrNull { it.filename == current.filename },
                     )
                 }
             }
@@ -258,6 +301,8 @@ fun UpNextScreen(
                             onTap = { onJumpTo(realIndex) },
                             onLongPress = { onLongPress(song) },
                             onRemove = { onRemove(realIndex) },
+                            explanation = explanations.firstOrNull { it.filename == song.filename },
+                            fallbackLabel = if (song.filename in playNextFilenames) "Play Next" else null,
                             isDragging = isDragging,
                             dragHandle = {
                                 IconButton(
@@ -328,6 +373,169 @@ private fun SectionTitle(label: String) {
     )
 }
 
+private val CurrentInfluenceColor = Color(0xFFF59E0B)
+private val SessionInfluenceColor = Color(0xFF0F9D8A)
+private val ProfileInfluenceColor = Color(0xFF3B82F6)
+private val DiversityInfluenceColor = Color(0xFF65A30D)
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BlendSummary(
+    blendInfo: RecommendationBlendInfo,
+    adventurous: Float,
+    negativeGuard: Float,
+    filteredCount: Int,
+    queueExplanations: List<RecommendationExplanation>,
+) {
+    val weights = blendInfo.weights
+    val total = (weights.wCurrent + weights.wSession + weights.wProfile)
+        .coerceAtLeast(0.0001f)
+    val current = (weights.wCurrent / total * 100f).toInt()
+    val session = (weights.wSession / total * 100f).toInt()
+    val profile = (100 - current - session).coerceAtLeast(0)
+    fun count(influence: RecommendationInfluence) =
+        queueExplanations.count { it.dominantInfluence == influence }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 2.dp),
+    ) {
+        Text(
+            text = "AI blend • Current $current% • Session $session% • Long-term $profile%",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            InfluenceLegend(CurrentInfluenceColor, count(RecommendationInfluence.CURRENT), "Current")
+            InfluenceLegend(SessionInfluenceColor, count(RecommendationInfluence.SESSION), "Session")
+            InfluenceLegend(ProfileInfluenceColor, count(RecommendationInfluence.PROFILE), "Long-term")
+            InfluenceLegend(DiversityInfluenceColor, count(RecommendationInfluence.DIVERSITY), "Diverse")
+            val other = count(RecommendationInfluence.NONE)
+            if (other > 0) {
+                InfluenceLegend(MaterialTheme.colorScheme.outline, other, "Other")
+            }
+        }
+        Text(
+            text = "Diversity ${(adventurous * 100).toInt()}% • Guard ${(negativeGuard * 100).toInt()}%" +
+                if (filteredCount > 0) " • $filteredCount filtered" else "",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Suppress("unused")
+@Composable
+private fun LegacyBlendSummary(
+    blendInfo: RecommendationBlendInfo,
+    adventurous: Float,
+    negativeGuard: Float,
+    filteredCount: Int,
+    queueExplanations: List<RecommendationExplanation>,
+) {
+    val weights = blendInfo.weights
+    val total = (weights.wCurrent + weights.wSession + weights.wProfile)
+        .coerceAtLeast(0.0001f)
+    val current = (weights.wCurrent / total * 100f).toInt()
+    val session = (weights.wSession / total * 100f).toInt()
+    val profile = (100 - current - session).coerceAtLeast(0)
+    val currentCount = queueExplanations.count {
+        it.dominantInfluence == RecommendationInfluence.CURRENT
+    }
+    val sessionCount = queueExplanations.count {
+        it.dominantInfluence == RecommendationInfluence.SESSION
+    }
+    val profileCount = queueExplanations.count {
+        it.dominantInfluence == RecommendationInfluence.PROFILE
+    }
+    val diverseCount = queueExplanations.count {
+        it.dominantInfluence == RecommendationInfluence.DIVERSITY
+    }
+    val neutralCount = queueExplanations.count {
+        it.dominantInfluence == RecommendationInfluence.NONE
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Text(
+            text = "Queue blend used to score AI songs",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)),
+        ) {
+            if (current > 0) Box(
+                Modifier.weight(current.toFloat()).height(5.dp).background(CurrentInfluenceColor)
+            )
+            if (session > 0) Box(
+                Modifier.weight(session.toFloat()).height(5.dp).background(SessionInfluenceColor)
+            )
+            if (profile > 0) Box(
+                Modifier.weight(profile.toFloat()).height(5.dp).background(ProfileInfluenceColor)
+            )
+        }
+        Spacer(Modifier.height(5.dp))
+        Text(
+            text = "Current $current%  •  Session $session%  •  Long-term $profile%",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = "Diversity ${(adventurous * 100).toInt()}%  •  Negative guard ${(negativeGuard * 100).toInt()}%" +
+                if (filteredCount > 0) "  •  $filteredCount filtered" else "",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = "Bar: amber = current song • green = session mood • blue = long-term taste",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = "Queue influence dots",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        InfluenceLegend(CurrentInfluenceColor, currentCount, "Current-song match")
+        InfluenceLegend(SessionInfluenceColor, sessionCount, "Session mood")
+        InfluenceLegend(ProfileInfluenceColor, profileCount, "Long-term taste")
+        InfluenceLegend(DiversityInfluenceColor, diverseCount, "Diverse pick")
+        if (neutralCount > 0) {
+            InfluenceLegend(MaterialTheme.colorScheme.outline, neutralCount, "No single dominant source")
+        }
+    }
+}
+
+@Composable
+private fun InfluenceLegend(
+    color: Color,
+    count: Int,
+    label: String,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(vertical = 1.dp),
+    ) {
+        Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = "$count $label",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun QueueRow(
@@ -340,8 +548,14 @@ private fun QueueRow(
     onRemove: (() -> Unit)?,
     isDragging: Boolean = false,
     dragHandle: (@Composable () -> Unit)? = null,
+    explanation: RecommendationExplanation? = null,
+    fallbackLabel: String? = null,
     modifier: Modifier = Modifier,
 ) {
+    var showWhy by remember(explanation?.itemId) { mutableStateOf(false) }
+    if (showWhy && explanation != null) {
+        WhySongDialog(explanation = explanation, onDismiss = { showWhy = false })
+    }
     val isCurrent = role == QueueRole.Current
     val rowBg = when {
         isDragging -> MaterialTheme.colorScheme.surfaceVariant
@@ -385,10 +599,33 @@ private fun QueueRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            val originLabel = fallbackLabel ?: explanation?.origin?.label
+            if (!originLabel.isNullOrBlank()) {
+                Text(
+                    text = originLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
         }
-        IconButton(onClick = onLongPress) {
-            Icon(Icons.Filled.MoreVert, contentDescription = "Menu",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        if (explanation != null) {
+            val influenceColor = when (explanation.dominantInfluence) {
+                RecommendationInfluence.CURRENT -> CurrentInfluenceColor
+                RecommendationInfluence.SESSION -> SessionInfluenceColor
+                RecommendationInfluence.PROFILE -> ProfileInfluenceColor
+                RecommendationInfluence.DIVERSITY -> DiversityInfluenceColor
+                RecommendationInfluence.NONE -> MaterialTheme.colorScheme.outline
+            }
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .clickable { showWhy = true },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(Modifier.size(9.dp).clip(CircleShape).background(influenceColor))
+            }
         }
         if (onRemove != null) {
             IconButton(onClick = onRemove) {
@@ -402,3 +639,35 @@ private fun QueueRow(
         if (dragHandle != null) dragHandle()
     }
 }
+
+@Composable
+private fun WhySongDialog(
+    explanation: RecommendationExplanation,
+    onDismiss: () -> Unit,
+) {
+    val (current, session, profile) = explanation.normalizedBlendContributions()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Why this song?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Current $current%  •  Session $session%  •  Long-term $profile%")
+                Text(
+                    "Own ${signed(explanation.directScore)}  •  Similar ${signed(explanation.similarityScore)}  •  Total ${signed(explanation.totalScore)}"
+                )
+                Text("Taste adjustment ${signed(explanation.tasteAdjustment)}")
+                if (explanation.isDiversePick) {
+                    Text(
+                        "Diverse pick: moved from relevance #${explanation.relevanceRank} to queue #${explanation.finalRank}."
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Close") }
+        },
+    )
+}
+
+private fun signed(value: Float): String =
+    (if (value >= 0f) "+" else "") + "%.2f".format(value)

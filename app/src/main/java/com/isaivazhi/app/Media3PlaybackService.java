@@ -135,6 +135,7 @@ public class Media3PlaybackService extends MediaSessionService {
     private volatile long lastTransitionPrevPlayedMs = 0L;
     private volatile long lastTransitionPrevDurationMs = 0L;
     private volatile long lastTransitionAtMs = 0L;
+    private volatile String lastTransitionAction = "auto_advance";
     // Push #76: snapshot the PREV song's playbackInstanceId (the song that
     // just ENDED) at transition time. Kotlin's onMediaItemTransition needs
     // this for its watermark and dedup paths — getCurrentPlaybackInstanceId
@@ -151,6 +152,7 @@ public class Media3PlaybackService extends MediaSessionService {
     // is in flight; we rebuild the notification so the Refresh CommandButton
     // shows "Refreshing…" and disabled until the UI clears the flag.
     private boolean refreshBusy = false;
+    private boolean refreshAvailable = false;
     // 2026-05-11 #19: track last emitted play-state so we can dedupe and avoid
     // emitting false during BUFFERING (which would make the UI flicker pause).
     private Boolean lastEmittedPlayState = null;
@@ -354,6 +356,9 @@ public class Media3PlaybackService extends MediaSessionService {
                         handleNotificationDismiss();
                         return success();
                     case PlaybackCommandContract.CMD_NOTIFICATION_REFRESH_QUEUE:
+                        if (!refreshAvailable || refreshBusy) {
+                            return success();
+                        }
                         // 2026-06-01: forward to controllers. The actual refresh
                         // (recommender call + queue replace) runs in the UI
                         // process where the embedding/recommender state lives.
@@ -363,6 +368,16 @@ public class Media3PlaybackService extends MediaSessionService {
                         boolean busy = args != null && args.getBoolean(PlaybackCommandContract.KEY_BUSY, false);
                         if (refreshBusy != busy) {
                             refreshBusy = busy;
+                            Log.i(TAG, "Notification refresh busy=" + refreshBusy);
+                            mainHandler.post(Media3PlaybackService.this::refreshNotificationFromController);
+                        }
+                        return success();
+                    }
+                    case PlaybackCommandContract.CMD_NOTIFICATION_SET_REFRESH_AVAILABLE: {
+                        boolean available = args != null && args.getBoolean(PlaybackCommandContract.KEY_AVAILABLE, false);
+                        if (refreshAvailable != available) {
+                            refreshAvailable = available;
+                            Log.i(TAG, "Notification refresh available=" + refreshAvailable);
                             mainHandler.post(Media3PlaybackService.this::refreshNotificationFromController);
                         }
                         return success();
@@ -910,6 +925,7 @@ public class Media3PlaybackService extends MediaSessionService {
 
     private void stashLastTransitionSnapshot(TransitionSnapshot snapshot) {
         if (snapshot == null) return;
+        lastTransitionAction = snapshot.action != null ? snapshot.action : "auto_advance";
         lastTransitionPrevPlayedMs = snapshot.prevPlayedMs;
         lastTransitionPrevDurationMs = snapshot.prevDurationMs;
         lastTransitionPrevPlaybackInstanceId = snapshot.prevPlaybackInstanceId;
@@ -1059,6 +1075,8 @@ public class Media3PlaybackService extends MediaSessionService {
      *  was captured. PlaybackEngine uses this to decide whether the
      *  snapshot belongs to the transition it's currently handling. */
     public long getLastTransitionAtMs() { return lastTransitionAtMs; }
+
+    public String getLastTransitionActionSnapshot() { return lastTransitionAction; }
 
     /** Push #76: prev song's playbackInstanceId from the last transition.
      *  Kotlin PlaybackEngine reads this for watermark + dedup so it tracks
@@ -1416,13 +1434,19 @@ public class Media3PlaybackService extends MediaSessionService {
         // Refresh button "vanish" mid-refresh. The reentrancy guard in
         // MainActivity.refreshUpcomingWithAI already prevents double-runs;
         // a stale tap during refresh is harmless.
-        buttons.add(new CommandButton.Builder(CommandButton.ICON_UNDEFINED)
-                .setSessionCommand(PlaybackCommandContract.command(PlaybackCommandContract.CMD_NOTIFICATION_REFRESH_QUEUE))
-                .setCustomIconResId(R.drawable.ic_refresh_24)
-                .setDisplayName("Refresh Up Next")
-                .setEnabled(hasCurrentMedia)
-                .setSlots(CommandButton.SLOT_OVERFLOW)
-                .build());
+        // Keep the action present while busy. The command handler above
+        // already rejects taps during an active refresh, and removing the
+        // overflow button makes Android's lockscreen appear to permanently
+        // lose the action if a layout update is delayed.
+        if (refreshAvailable) {
+            buttons.add(new CommandButton.Builder(CommandButton.ICON_UNDEFINED)
+                    .setSessionCommand(PlaybackCommandContract.command(PlaybackCommandContract.CMD_NOTIFICATION_REFRESH_QUEUE))
+                    .setCustomIconResId(R.drawable.ic_refresh_24)
+                    .setDisplayName(refreshBusy ? "Refreshing Up Next" : "Refresh Up Next")
+                    .setEnabled(hasCurrentMedia)
+                    .setSlots(CommandButton.SLOT_OVERFLOW)
+                    .build());
+        }
 
         return buttons;
     }

@@ -25,10 +25,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -58,6 +61,7 @@ class PlaybackEngine(
     // EVT_MEDIA_ACTION can sync notification taps into the Kotlin state.
     private val favorites: FavoritesEngine? = null,
     private val recentlySurfacedTracker: RecentlySurfacedTracker? = null,
+    private val recommendationExplainability: RecommendationExplainabilityEngine? = null,
 ) {
 
     /**
@@ -177,6 +181,25 @@ class PlaybackEngine(
         _controllerReady.value = true
     }
 
+    /** Display-only cold-start hydration; Media3 reconciliation remains authoritative. */
+    fun hydrateOptimistic(snapshot: StartupUiSnapshot) {
+        if (_state.value.currentMediaId != null || snapshot.currentMediaId == null) return
+        _state.value = _state.value.copy(
+            currentMediaId = snapshot.currentMediaId,
+            title = snapshot.currentTitle,
+            artist = snapshot.currentArtist,
+            album = snapshot.currentAlbum,
+            positionMs = snapshot.currentPositionMs,
+            queueFilenames = snapshot.queueFilenames,
+            queueIndex = snapshot.queueIndex.coerceIn(
+                0,
+                (snapshot.queueFilenames.size - 1).coerceAtLeast(0),
+            ),
+            preparedNotPlaying = true,
+        )
+        _livePosition.value = snapshot.currentPositionMs
+    }
+
     // 2026-06-01: emits when the lockscreen / notification Refresh-Up-Next
     // button is tapped. The application-scoped refresh coordinator collects
     // this and invokes the same hard-refresh pipeline used by the in-app UI.
@@ -205,6 +228,38 @@ class PlaybackEngine(
     // lockscreen reflects the busy state.
     private val _refreshBusy = MutableStateFlow(false)
     val refreshBusy: StateFlow<Boolean> = _refreshBusy.asStateFlow()
+    private val _refreshAvailable = MutableStateFlow(false)
+    val refreshAvailable: StateFlow<Boolean> = _refreshAvailable.asStateFlow()
+
+    fun setRefreshAvailable(available: Boolean) {
+        _refreshAvailable.value = available
+        // StartupCoordinator runs on Dispatchers.Default/IO, while Media3
+        // controllers must be accessed on their application looper. Calling
+        // sendCustomCommand directly here used to throw a wrong-thread
+        // exception inside runCatching, silently leaving the service at its
+        // initial refreshAvailable=false state.
+        scope.launch {
+            val ctrl = controller ?: return@launch
+            sendRefreshAvailability(ctrl, _refreshAvailable.value)
+        }
+    }
+
+    private fun sendRefreshAvailability(
+        ctrl: androidx.media3.session.MediaController,
+        available: Boolean,
+    ) {
+        val args = android.os.Bundle().apply {
+            putBoolean(com.isaivazhi.app.PlaybackCommandContract.KEY_AVAILABLE, available)
+        }
+        runCatching {
+            sendPlaybackCommand(
+                ctrl,
+                com.isaivazhi.app.PlaybackCommandContract.CMD_NOTIFICATION_SET_REFRESH_AVAILABLE,
+                args,
+            )
+        }
+    }
+
     fun setRefreshBusy(busy: Boolean) {
         _refreshBusy.value = busy
         // Phase 3 (2026-06-01): mirror the flag to the playback service so
@@ -212,16 +267,21 @@ class PlaybackEngine(
         // disabled while a refresh is in flight. Fire-and-forget — if the
         // controller isn't connected yet the next buildNotificationButtons()
         // will pick the default (busy=false) anyway.
-        val ctrl = controller ?: return
-        val args = android.os.Bundle().apply {
-            putBoolean(com.isaivazhi.app.PlaybackCommandContract.KEY_BUSY, busy)
-        }
-        runCatching {
-            sendPlaybackCommand(
-                ctrl,
-                com.isaivazhi.app.PlaybackCommandContract.CMD_NOTIFICATION_SET_REFRESH_BUSY,
-                args,
-            )
+        scope.launch {
+            val ctrl = controller ?: return@launch
+            val args = android.os.Bundle().apply {
+                putBoolean(
+                    com.isaivazhi.app.PlaybackCommandContract.KEY_BUSY,
+                    _refreshBusy.value,
+                )
+            }
+            runCatching {
+                sendPlaybackCommand(
+                    ctrl,
+                    com.isaivazhi.app.PlaybackCommandContract.CMD_NOTIFICATION_SET_REFRESH_BUSY,
+                    args,
+                )
+            }
         }
     }
 
@@ -249,7 +309,11 @@ class PlaybackEngine(
     private fun serviceRef(): Media3PlaybackService? = Media3PlaybackService.INSTANCE
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val controllerMutex = Mutex()
+    private val playbackRecoveryStarted = AtomicBoolean(false)
     private var controllerJob: Job? = null
+    private var pendingToggleJob: Job? = null
+    private var pendingToggleRequested = false
     private var controller: MediaController? = null
     private var lastSavedPositionMs: Long = -1L
 
@@ -345,7 +409,9 @@ class PlaybackEngine(
                     "PlaybackEngine",
                     "transition: prev=$prevMediaId played=${prevPlayed}ms dur=${prevDuration}ms frac=$frac source=$pendingTransitionSource origin=$origin instId=$transitionInstId → next=$nextMediaId rawNext=${mediaItem?.mediaId}"
                 )
-                val source = transitionSource
+                val source = svc?.getLastTransitionActionSnapshot()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: transitionSource
                 if (suppressPlaybackSignal) {
                     activityLog?.log(
                         category = "playback",
@@ -369,13 +435,15 @@ class PlaybackEngine(
                         source == "queue_tap" || source == "neutral_skip"
                     // Push #63 + #67: session counters before/after, with
                     // filename + source so the listened rolling list grows.
-                    val sessionPair = session?.recordEvent(
+                    val signalApplied = before != after
+                    val sessionPair = if (signalApplied) session?.recordEvent(
                         fraction = frac,
                         isSkip = isSkip,
                         isManual = isManual,
                         filename = prevMediaId,
                         source = source,
-                    )
+                    ) else null
+                    if (signalApplied) recommendationExplainability?.recordPlaybackResult()
                     activityLog?.log(
                         category = "playback",
                         type = if (isSkip) "SKIP" else "LISTEN",
@@ -399,7 +467,7 @@ class PlaybackEngine(
                             "directAfter" to after.directScore,
                         ),
                     )
-                    signalTimeline?.let { tl ->
+                    if (signalApplied) signalTimeline?.let { tl ->
                         val cls = if (isSkip) SignalTimelineEngine.Classification.SKIP
                             else SignalTimelineEngine.Classification.LISTEN
                         val avgLib = avgLibraryFraction()
@@ -429,6 +497,13 @@ class PlaybackEngine(
                                 sessionSkipsAfter = sAfter?.skips ?: 0,
                                 sessionPositivesBefore = sBefore?.positives ?: 0,
                                 sessionPositivesAfter = sAfter?.positives ?: 0,
+                                avoidanceDelta = after.earlySkipPenalty - before.earlySkipPenalty -
+                                    if (after.strongCount > before.strongCount) {
+                                        minOf(
+                                            before.xScore,
+                                            UnifiedTasteContract.STRONG_AVOIDANCE_REPAIR,
+                                        )
+                                    } else 0f,
                             )
                         )
                     }
@@ -581,6 +656,15 @@ class PlaybackEngine(
      * matches the notification's heart icon.
      */
     private val controllerListener = object : MediaController.Listener {
+        override fun onDisconnected(controller: MediaController) {
+            if (this@PlaybackEngine.controller === controller) {
+                controller.removeListener(playerListener)
+                this@PlaybackEngine.controller = null
+                _controllerReady.value = false
+                playbackRecoveryStarted.set(false)
+            }
+        }
+
         override fun onCustomCommand(
             controller: MediaController,
             command: SessionCommand,
@@ -636,34 +720,43 @@ class PlaybackEngine(
     /** Lazily connect to the Media3 session. */
     suspend fun ensureController(): MediaController {
         controller?.let { return it }
-        return withContext(Dispatchers.Main.immediate) {
-            controller?.let { return@withContext it }
-            val token = SessionToken(
-                appContext,
-                ComponentName(appContext, Media3PlaybackService::class.java)
-            )
-            val ctrl = suspendCancellableCoroutine<MediaController> { cont ->
-                // Push #74: setListener supplies the MediaController.Listener
-                // (separate interface from Player.Listener). Required for
-                // onCustomCommand to fire when the service emits
-                // EVT_MEDIA_ACTION on notification button taps.
-                val future = MediaController.Builder(appContext, token)
-                    .setListener(controllerListener)
-                    .buildAsync()
-                future.addListener({
-                    try {
-                        val c = future.get()
-                        cont.resume(c)
-                    } catch (t: Throwable) {
-                        cont.resumeWithException(t)
-                    }
-                }, { it.run() })
+        return controllerMutex.withLock {
+            controller?.let { return@withLock it }
+            withContext(Dispatchers.Main.immediate) {
+                controller?.let { return@withContext it }
+                val token = SessionToken(
+                    appContext,
+                    ComponentName(appContext, Media3PlaybackService::class.java)
+                )
+                val ctrl = suspendCancellableCoroutine<MediaController> { cont ->
+                    // Push #74: setListener supplies the MediaController.Listener
+                    // (separate interface from Player.Listener). Required for
+                    // onCustomCommand to fire when the service emits
+                    // EVT_MEDIA_ACTION on notification button taps.
+                    val future = MediaController.Builder(appContext, token)
+                        .setListener(controllerListener)
+                        .buildAsync()
+                    future.addListener({
+                        try {
+                            val c = future.get()
+                            cont.resume(c)
+                        } catch (t: Throwable) {
+                            cont.resumeWithException(t)
+                        }
+                    }, { it.run() })
+                }
+                ctrl.addListener(playerListener)
+                controller = ctrl
+                sendRefreshAvailability(ctrl, _refreshAvailable.value)
+                hydrateLiveStateFromService(ctrl)
+                // A live Media3 queue is immediately safe to control. Transport
+                // buttons must not wait for embedding/recommendation startup.
+                if (ctrl.mediaItemCount > 0) {
+                    _controllerReady.value = true
+                }
+                startPositionPoll()
+                ctrl
             }
-            ctrl.addListener(playerListener)
-            controller = ctrl
-            hydrateLiveStateFromService(ctrl)
-            startPositionPoll()
-            ctrl
         }
     }
 
@@ -942,6 +1035,7 @@ class PlaybackEngine(
     fun prepareForResume(songs: List<Song>, startIndex: Int, seekToMs: Long) {
         val playable = songs.filter { !it.filePath.isNullOrEmpty() }
         if (playable.isEmpty()) return
+        if (!playbackRecoveryStarted.compareAndSet(false, true)) return
         val safeStart = startIndex.coerceIn(0, playable.size - 1)
         // Push #65: log the seek target + first item filename so we can
         // confirm cross-session position-resume is actually happening.
@@ -953,7 +1047,11 @@ class PlaybackEngine(
             "prepareForResume queueSize=${playable.size} safeStart=$safeStart seekToMs=$seekToMs first=${playable.getOrNull(safeStart)?.filename ?: "?"}"
         )
         scope.launch {
-            val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
+            val ctrl = runCatching { ensureController() }.getOrNull()
+            if (ctrl == null) {
+                playbackRecoveryStarted.set(false)
+                return@launch
+            }
             val targetSong = playable[safeStart]
             val targetMediaId = targetSong.filename
             val currentMediaId = mediaIdToFilename(ctrl.currentMediaItem?.mediaId)
@@ -1010,25 +1108,42 @@ class PlaybackEngine(
     }
 
     fun togglePause() {
-        if (!_controllerReady.value) return
+        if (!_controllerReady.value) {
+            // Accept an optimistic mini-player tap while Media3 is reconnecting.
+            // The prepared snapshot queue will become authoritative shortly;
+            // replay the user's intent once that happens.
+            pendingToggleRequested = !pendingToggleRequested
+            if (pendingToggleJob?.isActive != true) {
+                pendingToggleJob = scope.launch {
+                    val ctrl = runCatching { ensureController() }.getOrNull()
+                        ?: return@launch
+                    for (attempt in 0 until 120) {
+                        if (_controllerReady.value) break
+                        delay(25L)
+                    }
+                    if (_controllerReady.value && pendingToggleRequested) {
+                        pendingToggleRequested = false
+                        toggleController(ctrl)
+                    }
+                }
+            }
+            return
+        }
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
-            val nowPlaying = runCatching { ctrl.playWhenReady }.getOrDefault(_state.value.isPlaying)
-            val nextPlaying = !nowPlaying
-            _state.value = _state.value.copy(isPlaying = nextPlaying, preparedNotPlaying = false)
-            if (nowPlaying) ctrl.pause() else ctrl.play()
+            toggleController(ctrl)
         }
     }
 
+    private fun toggleController(ctrl: MediaController) {
+        val nowPlaying = runCatching { ctrl.playWhenReady }.getOrDefault(_state.value.isPlaying)
+        val nextPlaying = !nowPlaying
+        _state.value = _state.value.copy(isPlaying = nextPlaying, preparedNotPlaying = false)
+        if (nowPlaying) ctrl.pause() else ctrl.play()
+    }
+
     private fun snapshotOf(s: TasteEngine.TasteSignal): SignalTimelineEngine.Snapshot =
-        SignalTimelineEngine.Snapshot(
-            score = s.directScore,
-            direct = s.directScore,
-            similarity = s.similarityBoost,
-            plays = s.plays,
-            skips = s.skips,
-            avgFraction = s.avgFraction,
-        )
+        timelineSnapshotOf(s)
 
     private fun avgLibraryFraction(): Float {
         val sigs = taste?.signals?.value ?: return 0f
@@ -1370,9 +1485,9 @@ class PlaybackEngine(
             if (t != null && !removedFilename.isNullOrBlank()) {
                 val (before, after) = t.bumpXScoreForQueueRemove(removedFilename)
                 val delta = after.directScore - before.directScore
-                if (kotlin.math.abs(delta) > 0.001f) {
+                val propagation = if (kotlin.math.abs(delta) > 0.001f) {
                     t.propagateSimilarityBoost(removedFilename, delta, "queue_remove")
-                }
+                } else TasteEngine.PropagationSummary()
                 onRecommendationInputsChanged?.invoke("queue_remove")
                 signalTimeline?.append(
                     SignalTimelineEngine.Event(
@@ -1391,6 +1506,11 @@ class PlaybackEngine(
                         sessionPullAfter = t.tuning.value.sessionBias.coerceIn(0f, 1f),
                         libraryAvgBefore = avgLibraryFraction(),
                         libraryAvgAfter = avgLibraryFraction(),
+                        kind = TasteEventKind.QUEUE_REMOVE,
+                        contribution = delta,
+                        avoidanceDelta = UnifiedTasteContract.QUEUE_REMOVAL_AVOIDANCE,
+                        relatedSongsChanged = propagation.changedSongs,
+                        relatedScoreDelta = propagation.totalDelta,
                     ),
                 )
             }
@@ -1867,6 +1987,7 @@ class PlaybackEngine(
         controller?.release()
         controller = null
         _controllerReady.value = false
+        playbackRecoveryStarted.set(false)
     }
 
     /**

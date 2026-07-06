@@ -3,6 +3,7 @@ package com.isaivazhi.app.engine
 import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +72,34 @@ class TasteEngine(private val appContext: Context) {
         // touch, so unrelated activity doesn't reset their freshness.
         val xScoreUpdatedAt: Long = 0L,
         val similarityBoostUpdatedAt: Long = 0L,
+        // Unified contract counters. `plays` remains the >=50% count for
+        // compatibility and manual-prior decay; encounters is every result.
+        val encounters: Int = 0,
+        val earlyCount: Int = 0,
+        val partialCount: Int = 0,
+        val listenCount: Int = 0,
+        val strongCount: Int = 0,
+        val queueRemovals: Int = 0,
+        val avgAllFraction: Float = 0f,
+        // Decaying positive evidence accumulated with the same contribution
+        // used by session/profile recommendation vectors.
+        val positiveEvidence: Float = 0f,
+        val positiveEvidenceUpdatedAt: Long = 0L,
+        val similarityContributors: List<SimilarityContributor> = emptyList(),
+        val earlySkipCount: Int = 0,
+        val earlySkipPenalty: Float = 0f,
+    )
+
+    data class SimilarityContributor(
+        val sourceFilename: String,
+        val amount: Float,
+        val reason: String,
+        val updatedAt: Long,
+    )
+
+    data class PropagationSummary(
+        val changedSongs: Int = 0,
+        val totalDelta: Float = 0f,
     )
 
     /**
@@ -135,9 +164,6 @@ class TasteEngine(private val appContext: Context) {
         // Push #63 (Capacitor parity): xScore deltas.
         // engine-state.js: USER_SKIP_NEGATIVE_STEP=0.1, NEG_LISTEN_DECAY=0.5,
         // NEG_X_DELTA=0.5 (queue-remove), NEG_SCORE_MAX=10.
-        private const val USER_SKIP_NEGATIVE_STEP = 0.1f
-        private const val NEG_LISTEN_DECAY = 0.5f
-        private const val NEG_X_DELTA = 0.5f
         private const val NEG_SCORE_MAX = 10f
 
         // Prior coefficients from engine-favorites.js / engine-disliked.js.
@@ -178,14 +204,10 @@ class TasteEngine(private val appContext: Context) {
         /** Pure xScore update for playback events — used by [recordPlaybackEvent] and unit tests. */
         fun nextXScoreAfterPlayback(beforeXScore: Float, fraction: Float, source: String): Float {
             val frac = fraction.coerceIn(0f, 1f)
-            val isUserSkip = source == "next_button" || source == "prev_button"
-            val isSkip = frac < SKIP_THRESHOLD
-            val isFullListen = frac >= FULL_LISTEN_THRESHOLD
             return when {
-                isSkip && isUserSkip ->
-                    (beforeXScore + USER_SKIP_NEGATIVE_STEP).coerceAtMost(NEG_SCORE_MAX)
-                isFullListen ->
-                    (beforeXScore - NEG_LISTEN_DECAY).coerceAtLeast(0f)
+                frac >= UnifiedTasteContract.STRONG_THRESHOLD ->
+                    (beforeXScore - UnifiedTasteContract.STRONG_AVOIDANCE_REPAIR)
+                        .coerceAtLeast(0f)
                 else -> beforeXScore
             }
         }
@@ -201,6 +223,7 @@ class TasteEngine(private val appContext: Context) {
     private val KEY_FAM_LEGACY = floatPreferencesKey("taste_familiarity")
     private val KEY_SIGNALS = stringPreferencesKey("taste_signals_v1_json")
     private val KEY_PROCESSED_EVENT_IDS = stringPreferencesKey("taste_processed_playback_event_ids_v1_json")
+    private val KEY_CONTRACT_VERSION = intPreferencesKey("taste_contract_version")
 
     private val _tuning = MutableStateFlow(Tuning())
     val tuning: StateFlow<Tuning> = _tuning.asStateFlow()
@@ -296,23 +319,24 @@ class TasteEngine(private val appContext: Context) {
     fun directScoresByFilename(): Map<String, Float> {
         val dec = _decorated.value
         if (dec.rows.isNotEmpty()) {
-            return dec.rows.mapValues { it.value.breakdown.directScore }
+            return dec.rows.mapValues { it.value.breakdown.score }
         }
         val now = System.currentTimeMillis()
         return _signals.value.mapValues { (_, sig) ->
-            computeDirectScore(
-                plays = sig.plays,
-                avgFraction = sig.avgFraction,
+            computeUnifiedScore(
+                positiveEvidence = sig.positiveEvidence.takeIf { it > 0f }
+                    ?: (sig.plays * sig.avgFraction),
+                positiveEvidenceUpdatedAt = sig.positiveEvidenceUpdatedAt
+                    .takeIf { it > 0L } ?: sig.lastPlayedAt,
                 xScore = sig.xScore,
                 favoritePrior = sig.favoritePrior,
                 dislikePrior = sig.dislikePrior,
                 similarityBoost = sig.similarityBoost,
-                lastPlayedAt = sig.lastPlayedAt,
                 xScoreUpdatedAt = sig.xScoreUpdatedAt,
                 similarityBoostUpdatedAt = sig.similarityBoostUpdatedAt,
                 lastUpdatedAt = sig.lastUpdatedAt,
                 now = now,
-            ).directScore
+            ).score
         }
     }
 
@@ -323,6 +347,109 @@ class TasteEngine(private val appContext: Context) {
         RecommendationPolicy.softExcludedFilenames(directScoresByFilename(), negativeStrength)
 
     fun signalFor(filename: String): TasteSignal = _signals.value[filename] ?: TasteSignal()
+
+    /**
+     * One-time v2 rebuild from the durable history ledger. Manual flags and
+     * avoidance survive; playback-derived positive evidence and counters are
+     * recalculated under the unified thresholds.
+     */
+    suspend fun migrateUnifiedContractIfNeeded(historyEvents: List<HistoryEngine.Event>) {
+        awaitReady()
+        val version = appContext.dataStoreLocal.data.first()[KEY_CONTRACT_VERSION] ?: 0
+        if (version >= 2) return
+        val now = System.currentTimeMillis()
+        val grouped = historyEvents.groupBy { it.filename }
+        val filenames = _signals.value.keys + grouped.keys
+        val rebuilt = HashMap<String, TasteSignal>(filenames.size)
+
+        for (filename in filenames) {
+            val existing = signalFor(filename)
+            val events = grouped[filename].orEmpty().sortedBy { it.startedAt }
+            var positive = 0f
+            var positiveAt = 0L
+            var encounters = 0
+            var early = 0
+            var partial = 0
+            var listens = 0
+            var strong = 0
+            var qualifiedSum = 0f
+            var allSum = 0f
+            for (event in events) {
+                val timestamp = event.startedAt.takeIf { it > 0L } ?: now
+                if (positive > 0f && positiveAt > 0L) {
+                    val days = (timestamp - positiveAt).coerceAtLeast(0L).toFloat() / PROFILE_DAY_MS
+                    positive *= 0.5f.pow(days / PROFILE_HALF_LIFE_DAYS)
+                }
+                val fraction = event.fractionPlayed.coerceIn(0f, 1f)
+                val outcome = UnifiedTasteContract.outcomeFor(fraction)
+                positive += UnifiedTasteContract.positiveContribution(fraction)
+                if (outcome != PlaybackOutcome.EARLY) positiveAt = timestamp
+                encounters++
+                allSum += fraction
+                when (outcome) {
+                    PlaybackOutcome.EARLY -> early++
+                    PlaybackOutcome.PARTIAL -> partial++
+                    PlaybackOutcome.LISTEN -> {
+                        listens++
+                        qualifiedSum += fraction
+                    }
+                    PlaybackOutcome.STRONG -> {
+                        strong++
+                        qualifiedSum += fraction
+                    }
+                }
+            }
+            val qualified = listens + strong
+            val favoritePrior = if (existing.isFavorite) computeFavoritePrior(qualified) else 0f
+            val dislikePrior = if (existing.isDisliked) computeDislikePrior(strong) else 0f
+            val base = existing.copy(
+                plays = qualified,
+                avgFraction = if (qualified > 0) qualifiedSum / qualified else 0f,
+                similarityBoost = 0f,
+                similarityBoostUpdatedAt = 0L,
+                similarityContributors = emptyList(),
+                favoritePrior = favoritePrior,
+                dislikePrior = dislikePrior,
+                encounters = encounters,
+                earlyCount = early,
+                partialCount = partial,
+                listenCount = listens,
+                strongCount = strong,
+                avgAllFraction = if (encounters > 0) allSum / encounters else 0f,
+                positiveEvidence = positive,
+                positiveEvidenceUpdatedAt = positiveAt,
+                fullListens = strong,
+                lastPlayedAt = positiveAt,
+                lastUpdatedAt = now,
+            )
+            val breakdown = computeUnifiedScore(
+                positiveEvidence = base.positiveEvidence,
+                positiveEvidenceUpdatedAt = base.positiveEvidenceUpdatedAt,
+                xScore = base.xScore,
+                favoritePrior = base.favoritePrior,
+                dislikePrior = base.dislikePrior,
+                similarityBoost = 0f,
+                xScoreUpdatedAt = base.xScoreUpdatedAt,
+                similarityBoostUpdatedAt = 0L,
+                lastUpdatedAt = now,
+                now = now,
+            )
+            rebuilt[filename] = base.copy(directScore = breakdown.directScore)
+        }
+        _signals.value = rebuilt
+        refreshDecorated()
+        persistSignals()
+        appContext.dataStoreLocal.edit { it[KEY_CONTRACT_VERSION] = 2 }
+
+        // Rebuild one non-recursive halo from each song's direct evidence.
+        scope.launch {
+            for ((filename, signal) in rebuilt) {
+                if (abs(signal.directScore) >= 0.001f) {
+                    propagateSimilarityBoost(filename, signal.directScore, "v2_migration")
+                }
+            }
+        }
+    }
 
     /**
      * Apply a playback event. Returns the (before, after) snapshot pair so
@@ -370,25 +497,60 @@ class TasteEngine(private val appContext: Context) {
         // background_recovery, cold_start_*) is an encounter only — the
         // listen evidence still updates plays/avgFraction but the song
         // doesn't get a skip-penalty.
-        val isUserSkip = source == "next_button" || source == "prev_button"
-        val isSkip = frac < SKIP_THRESHOLD
-        val isFullListen = frac >= FULL_LISTEN_THRESHOLD
+        val outcome = UnifiedTasteContract.outcomeFor(frac)
+        val contribution = UnifiedTasteContract.positiveContribution(frac)
         val now = System.currentTimeMillis()
 
         // Plays counter: only increments on non-skip (fraction >= 0.50).
-        val newPlays = if (isSkip) before.plays else before.plays + 1
-        val newSkips = if (isSkip && isUserSkip) before.skips + 1 else before.skips
+        val isQualifiedListen = outcome == PlaybackOutcome.LISTEN ||
+            outcome == PlaybackOutcome.STRONG
+        val isStrong = outcome == PlaybackOutcome.STRONG
+        val newPlays = if (isQualifiedListen) before.plays + 1 else before.plays
+        val newSkips = before.skips
         // Push #73: fullListens only increments on >=0.70 non-skip.
         // Used to decay the dislike prior asymmetrically.
-        val newFullListens = if (!isSkip && isFullListen) before.fullListens + 1 else before.fullListens
+        val newFullListens = if (isStrong) before.fullListens + 1 else before.fullListens
         // avgFraction tracks only non-skip listens. When the event is a
         // skip, the existing avgFraction is preserved.
         val newAvgFrac = when {
-            isSkip -> before.avgFraction
+            !isQualifiedListen -> before.avgFraction
             before.plays == 0 -> frac
             else -> ((before.avgFraction * before.plays) + frac) / newPlays
         }
-        val newX = nextXScoreAfterPlayback(before.xScore, frac, source)
+        val newEncounters = before.encounters + 1
+        val newAvgAll = ((before.avgAllFraction * before.encounters) + frac) / newEncounters
+        val oldEvidence = before.positiveEvidence.takeIf { it > 0f }
+            ?: (before.plays * before.avgFraction)
+        val oldEvidenceAt = before.positiveEvidenceUpdatedAt.takeIf { it > 0L }
+            ?: before.lastPlayedAt
+        val decayedEvidence = if (oldEvidence > 0f && oldEvidenceAt > 0L) {
+            val days = (now - oldEvidenceAt).coerceAtLeast(0L).toFloat() / PROFILE_DAY_MS
+            oldEvidence * 0.5f.pow(days / PROFILE_HALF_LIFE_DAYS)
+        } else oldEvidence
+        val newEvidence = decayedEvidence + contribution
+        val newEvidenceAt = if (contribution > 0f || oldEvidence > 0f) now
+            else before.positiveEvidenceUpdatedAt
+        val endReason = PlaybackEndReason.fromSource(source)
+        val isEarlyUserRejection = frac < UnifiedTasteContract.EARLY_REJECTION_THRESHOLD &&
+            UnifiedTasteContract.isUserInitiated(endReason)
+        val newEarlySkipCount = before.earlySkipCount + if (isEarlyUserRejection) 1 else 0
+        val newEarlySkipPenalty = if (isEarlyUserRejection) {
+            UnifiedTasteContract.earlyRejectionPenalty(newEarlySkipCount)
+        } else before.earlySkipPenalty
+        val earlyPenaltyDelta = (newEarlySkipPenalty - before.earlySkipPenalty).coerceAtLeast(0f)
+        val changesAvoidance = isStrong || earlyPenaltyDelta > 0f
+        val avoidanceBase = if (changesAvoidance) {
+            decayedLearnedValue(
+                value = before.xScore,
+                updatedAt = before.xScoreUpdatedAt,
+                fallbackAt = before.lastUpdatedAt,
+                now = now,
+            )
+        } else before.xScore
+        val newX = if (changesAvoidance) {
+            (nextXScoreAfterPlayback(avoidanceBase, frac, source) + earlyPenaltyDelta)
+                .coerceAtMost(NEG_SCORE_MAX)
+        } else before.xScore
         val xScoreChanged = newX != before.xScore
         // Push #73: stamp xScoreUpdatedAt only when xScore actually
         // changed. Stale timestamps would defeat the recency decay.
@@ -400,15 +562,14 @@ class TasteEngine(private val appContext: Context) {
         val newDisPrior = if (before.isDisliked) computeDislikePrior(newFullListens) else 0f
         // lastPlayedAt — only stamp on real listens, not skips. A skip
         // doesn't mean "I played this," it means "I rejected this."
-        val newLastPlayedAt = if (isSkip) before.lastPlayedAt else now
-        val newBreakdown = computeDirectScore(
-            plays = newPlays,
-            avgFraction = newAvgFrac,
+        val newLastPlayedAt = if (contribution > 0f) now else before.lastPlayedAt
+        val newBreakdown = computeUnifiedScore(
+            positiveEvidence = newEvidence,
+            positiveEvidenceUpdatedAt = newEvidenceAt,
             xScore = newX,
             favoritePrior = newFavPrior,
             dislikePrior = newDisPrior,
             similarityBoost = before.similarityBoost,
-            lastPlayedAt = newLastPlayedAt,
             xScoreUpdatedAt = newXScoreUpdatedAt,
             similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
             lastUpdatedAt = now,
@@ -426,10 +587,20 @@ class TasteEngine(private val appContext: Context) {
             lastUpdatedAt = now,
             fullListens = newFullListens,
             xScoreUpdatedAt = newXScoreUpdatedAt,
+            encounters = newEncounters,
+            earlyCount = before.earlyCount + if (outcome == PlaybackOutcome.EARLY) 1 else 0,
+            partialCount = before.partialCount + if (outcome == PlaybackOutcome.PARTIAL) 1 else 0,
+            listenCount = before.listenCount + if (outcome == PlaybackOutcome.LISTEN) 1 else 0,
+            strongCount = before.strongCount + if (outcome == PlaybackOutcome.STRONG) 1 else 0,
+            avgAllFraction = newAvgAll,
+            positiveEvidence = newEvidence,
+            positiveEvidenceUpdatedAt = newEvidenceAt,
+            earlySkipCount = newEarlySkipCount,
+            earlySkipPenalty = newEarlySkipPenalty,
         )
         android.util.Log.i(
             "TasteEngine",
-            "recordPlaybackEvent fn=$filename frac=$frac src=$source isUserSkip=$isUserSkip isFull=$isFullListen " +
+            "recordPlaybackEvent fn=$filename frac=$frac src=$source outcome=$outcome contribution=$contribution earlyReject=$isEarlyUserRejection " +
                 "plays=${before.plays}→$newPlays skips=${before.skips}→$newSkips avg=${"%.2f".format(before.avgFraction)}→${"%.2f".format(newAvgFrac)} " +
                 "x=${"%.2f".format(before.xScore)}→${"%.2f".format(newX)} direct=${"%.2f".format(before.directScore)}→${"%.2f".format(newBreakdown.directScore)} recencyMult=${"%.2f".format(newBreakdown.recencyMult)} instId=$playbackInstanceId"
         )
@@ -458,14 +629,15 @@ class TasteEngine(private val appContext: Context) {
         val newFavPrior = if (isFavorite) computeFavoritePrior(before.plays) else 0f
         val newDisPrior = if (isDisliked) computeDislikePrior(before.fullListens) else 0f
         val now = System.currentTimeMillis()
-        val newBreakdown = computeDirectScore(
-            plays = before.plays,
-            avgFraction = before.avgFraction,
+        val newBreakdown = computeUnifiedScore(
+            positiveEvidence = before.positiveEvidence.takeIf { it > 0f }
+                ?: (before.plays * before.avgFraction),
+            positiveEvidenceUpdatedAt = before.positiveEvidenceUpdatedAt
+                .takeIf { it > 0L } ?: before.lastPlayedAt,
             xScore = before.xScore,
             favoritePrior = newFavPrior,
             dislikePrior = newDisPrior,
             similarityBoost = before.similarityBoost,
-            lastPlayedAt = before.lastPlayedAt,
             xScoreUpdatedAt = before.xScoreUpdatedAt,
             similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
             lastUpdatedAt = now,
@@ -498,16 +670,24 @@ class TasteEngine(private val appContext: Context) {
     fun bumpXScoreForQueueRemove(filename: String): Pair<TasteSignal, TasteSignal> {
         if (filename.isBlank()) return TasteSignal() to TasteSignal()
         val before = signalFor(filename)
-        val newX = (before.xScore + NEG_X_DELTA).coerceAtMost(NEG_SCORE_MAX)
         val now = System.currentTimeMillis()
-        val newBreakdown = computeDirectScore(
-            plays = before.plays,
-            avgFraction = before.avgFraction,
+        val avoidanceBase = decayedLearnedValue(
+            value = before.xScore,
+            updatedAt = before.xScoreUpdatedAt,
+            fallbackAt = before.lastUpdatedAt,
+            now = now,
+        )
+        val newX = (avoidanceBase + UnifiedTasteContract.QUEUE_REMOVAL_AVOIDANCE)
+            .coerceAtMost(NEG_SCORE_MAX)
+        val newBreakdown = computeUnifiedScore(
+            positiveEvidence = before.positiveEvidence.takeIf { it > 0f }
+                ?: (before.plays * before.avgFraction),
+            positiveEvidenceUpdatedAt = before.positiveEvidenceUpdatedAt
+                .takeIf { it > 0L } ?: before.lastPlayedAt,
             xScore = newX,
             favoritePrior = before.favoritePrior,
             dislikePrior = before.dislikePrior,
             similarityBoost = before.similarityBoost,
-            lastPlayedAt = before.lastPlayedAt,
             xScoreUpdatedAt = now,
             similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
             lastUpdatedAt = now,
@@ -518,6 +698,7 @@ class TasteEngine(private val appContext: Context) {
             directScore = newBreakdown.directScore,
             lastUpdatedAt = now,
             xScoreUpdatedAt = now,
+            queueRemovals = before.queueRemovals + 1,
         )
         _signals.value = _signals.value + (filename to after)
         android.util.Log.i(
@@ -546,20 +727,21 @@ class TasteEngine(private val appContext: Context) {
         sourceFilename: String,
         scoreDelta: Float,
         reason: String,
-    ) {
-        if (sourceFilename.isBlank() || abs(scoreDelta) < 0.001f) return
+    ): PropagationSummary {
+        if (sourceFilename.isBlank() || abs(scoreDelta) < 0.001f) return PropagationSummary()
         val lookup = neighborLookup ?: run {
             android.util.Log.w("TasteEngine", "propagate src=$sourceFilename Δ=$scoreDelta reason=$reason: no neighborLookup wired")
-            return
+            return PropagationSummary()
         }
         val neighbors = try { lookup(sourceFilename, SIMILARITY_NEIGHBOR_COUNT) }
             catch (t: Throwable) {
                 android.util.Log.w("TasteEngine", "propagate: lookup failed: ${t.message}")
-                return
+                return PropagationSummary()
             }
-        if (neighbors.isEmpty()) return
+        if (neighbors.isEmpty()) return PropagationSummary()
         val now = System.currentTimeMillis()
         var changedCount = 0
+        var totalDelta = 0f
         var next = _signals.value
         val limit = minOf(neighbors.size, SIMILARITY_NEIGHBOR_WEIGHTS.size)
         for (i in 0 until limit) {
@@ -569,16 +751,42 @@ class TasteEngine(private val appContext: Context) {
             val delta = scoreDelta * w
             if (abs(delta) < 0.001f) continue
             val cur = next[nfn] ?: TasteSignal()
-            val newBoost = (cur.similarityBoost + delta).coerceIn(-SIMILARITY_BOOST_MAX, SIMILARITY_BOOST_MAX)
-            if (newBoost == cur.similarityBoost) continue
-            val nb = computeDirectScore(
-                plays = cur.plays,
-                avgFraction = cur.avgFraction,
+            val effectiveBoost = decayedLearnedValue(
+                value = cur.similarityBoost,
+                updatedAt = cur.similarityBoostUpdatedAt,
+                fallbackAt = cur.lastUpdatedAt,
+                now = now,
+            )
+            val newBoost = (effectiveBoost + delta)
+                .coerceIn(-SIMILARITY_BOOST_MAX, SIMILARITY_BOOST_MAX)
+            if (newBoost == effectiveBoost) continue
+            val appliedDelta = newBoost - effectiveBoost
+            val priorContributor = cur.similarityContributors
+                .firstOrNull { it.sourceFilename == sourceFilename }
+            val contributor = SimilarityContributor(
+                sourceFilename = sourceFilename,
+                amount = decayedLearnedValue(
+                    value = priorContributor?.amount ?: 0f,
+                    updatedAt = priorContributor?.updatedAt ?: 0L,
+                    fallbackAt = cur.lastUpdatedAt,
+                    now = now,
+                ) + appliedDelta,
+                reason = reason,
+                updatedAt = now,
+            )
+            val contributors = (cur.similarityContributors
+                .filterNot { it.sourceFilename == sourceFilename } + contributor)
+                .sortedByDescending { abs(it.amount) }
+                .take(5)
+            val nb = computeUnifiedScore(
+                positiveEvidence = cur.positiveEvidence.takeIf { it > 0f }
+                    ?: (cur.plays * cur.avgFraction),
+                positiveEvidenceUpdatedAt = cur.positiveEvidenceUpdatedAt
+                    .takeIf { it > 0L } ?: cur.lastPlayedAt,
                 xScore = cur.xScore,
                 favoritePrior = cur.favoritePrior,
                 dislikePrior = cur.dislikePrior,
                 similarityBoost = newBoost,
-                lastPlayedAt = cur.lastPlayedAt,
                 xScoreUpdatedAt = cur.xScoreUpdatedAt,
                 similarityBoostUpdatedAt = now,
                 lastUpdatedAt = now,
@@ -589,8 +797,10 @@ class TasteEngine(private val appContext: Context) {
                 directScore = nb.directScore,
                 lastUpdatedAt = now,
                 similarityBoostUpdatedAt = now,
+                similarityContributors = contributors,
             ))
             changedCount++
+            totalDelta += appliedDelta
         }
         if (changedCount > 0) {
             _signals.value = next
@@ -601,6 +811,7 @@ class TasteEngine(private val appContext: Context) {
             "TasteEngine",
             "propagate src=$sourceFilename Δ=${"%.3f".format(scoreDelta)} reason=$reason changed=$changedCount"
         )
+        return PropagationSummary(changedSongs = changedCount, totalDelta = totalDelta)
     }
 
     /**
@@ -661,14 +872,15 @@ class TasteEngine(private val appContext: Context) {
             val isDisliked = fn in disSet
             val newFavPrior = if (isFavorite) computeFavoritePrior(0) else 0f
             val newDisPrior = if (isDisliked) computeDislikePrior(0) else 0f
-            val bd = computeDirectScore(
-                plays = 0,
-                avgFraction = 0f,
+            val bd = computeUnifiedScore(
+                positiveEvidence = 0f,
+                positiveEvidenceUpdatedAt = 0L,
                 xScore = 0f,
                 favoritePrior = newFavPrior,
                 dislikePrior = newDisPrior,
                 similarityBoost = 0f,
-                lastPlayedAt = 0L,
+                xScoreUpdatedAt = 0L,
+                similarityBoostUpdatedAt = 0L,
                 lastUpdatedAt = now,
                 now = now,
             )
@@ -750,14 +962,15 @@ class TasteEngine(private val appContext: Context) {
         val rows = src.entries.map { (fn, sig) ->
             Row(
                 fn, sig,
-                computeDirectScore(
-                    plays = sig.plays,
-                    avgFraction = sig.avgFraction,
+                computeUnifiedScore(
+                    positiveEvidence = sig.positiveEvidence.takeIf { it > 0f }
+                        ?: (sig.plays * sig.avgFraction),
+                    positiveEvidenceUpdatedAt = sig.positiveEvidenceUpdatedAt
+                        .takeIf { it > 0L } ?: sig.lastPlayedAt,
                     xScore = sig.xScore,
                     favoritePrior = sig.favoritePrior,
                     dislikePrior = sig.dislikePrior,
                     similarityBoost = sig.similarityBoost,
-                    lastPlayedAt = sig.lastPlayedAt,
                     xScoreUpdatedAt = sig.xScoreUpdatedAt,
                     similarityBoostUpdatedAt = sig.similarityBoostUpdatedAt,
                     lastUpdatedAt = sig.lastUpdatedAt,
@@ -857,6 +1070,27 @@ class TasteEngine(private val appContext: Context) {
                     put("fullListens", s.fullListens)
                     put("xScoreUpdatedAt", s.xScoreUpdatedAt)
                     put("similarityBoostUpdatedAt", s.similarityBoostUpdatedAt)
+                    put("encounters", s.encounters)
+                    put("earlyCount", s.earlyCount)
+                    put("partialCount", s.partialCount)
+                    put("listenCount", s.listenCount)
+                    put("strongCount", s.strongCount)
+                    put("queueRemovals", s.queueRemovals)
+                    put("avgAllFraction", s.avgAllFraction.toDouble())
+                    put("positiveEvidence", s.positiveEvidence.toDouble())
+                    put("positiveEvidenceUpdatedAt", s.positiveEvidenceUpdatedAt)
+                    put("earlySkipCount", s.earlySkipCount)
+                    put("earlySkipPenalty", s.earlySkipPenalty.toDouble())
+                    put("similarityContributors", JSONArray().apply {
+                        s.similarityContributors.forEach { contributor ->
+                            put(JSONObject().apply {
+                                put("source", contributor.sourceFilename)
+                                put("amount", contributor.amount.toDouble())
+                                put("reason", contributor.reason)
+                                put("updatedAt", contributor.updatedAt)
+                            })
+                        }
+                    })
                 })
             }
             appContext.dataStoreLocal.edit {
@@ -892,12 +1126,45 @@ class TasteEngine(private val appContext: Context) {
                     fullListens = v.optInt("fullListens", 0),
                     xScoreUpdatedAt = v.optLong("xScoreUpdatedAt", 0L),
                     similarityBoostUpdatedAt = v.optLong("similarityBoostUpdatedAt", 0L),
+                    encounters = v.optInt("encounters", 0),
+                    earlyCount = v.optInt("earlyCount", 0),
+                    partialCount = v.optInt("partialCount", 0),
+                    listenCount = v.optInt("listenCount", 0),
+                    strongCount = v.optInt("strongCount", 0),
+                    queueRemovals = v.optInt("queueRemovals", 0),
+                    avgAllFraction = v.optDouble("avgAllFraction", 0.0).toFloat(),
+                    positiveEvidence = v.optDouble("positiveEvidence", 0.0).toFloat(),
+                    positiveEvidenceUpdatedAt = v.optLong("positiveEvidenceUpdatedAt", 0L),
+                    earlySkipCount = v.optInt("earlySkipCount", 0),
+                    earlySkipPenalty = v.optDouble("earlySkipPenalty", 0.0).toFloat(),
+                    similarityContributors = parseSimilarityContributors(
+                        v.optJSONArray("similarityContributors"),
+                    ),
                 )
             }
             out
         } catch (t: Throwable) {
             android.util.Log.w("TasteEngine", "parseSignals failed: ${t.message}")
             emptyMap()
+        }
+    }
+
+    private fun parseSimilarityContributors(arr: JSONArray?): List<SimilarityContributor> {
+        if (arr == null) return emptyList()
+        return buildList {
+            for (i in 0 until arr.length()) {
+                val value = arr.optJSONObject(i) ?: continue
+                val source = value.optString("source", "")
+                if (source.isBlank()) continue
+                add(
+                    SimilarityContributor(
+                        sourceFilename = source,
+                        amount = value.optDouble("amount", 0.0).toFloat(),
+                        reason = value.optString("reason", ""),
+                        updatedAt = value.optLong("updatedAt", 0L),
+                    )
+                )
+            }
         }
     }
 
@@ -1038,6 +1305,50 @@ fun computeDirectScore(
         directScore = direct,
         score = direct + effectiveBoost,
         recencyMult = recencyMult,
+    )
+}
+
+/**
+ * Unified v2 scoring. Playback contribution is accumulated directly instead
+ * of being reconstructed from a positive-only average, so PARTIAL evidence is
+ * represented consistently in song, session, and profile calculations.
+ */
+fun computeUnifiedScore(
+    positiveEvidence: Float,
+    positiveEvidenceUpdatedAt: Long,
+    xScore: Float,
+    favoritePrior: Float,
+    dislikePrior: Float,
+    similarityBoost: Float,
+    xScoreUpdatedAt: Long,
+    similarityBoostUpdatedAt: Long,
+    lastUpdatedAt: Long,
+    now: Long = System.currentTimeMillis(),
+): TasteEngine.DirectScoreBreakdown {
+    fun recency(reference: Long, legacyAgeDays: Long = 90L): Float {
+        val ref = when {
+            reference > 0L -> reference
+            lastUpdatedAt > 0L -> lastUpdatedAt
+            else -> now - legacyAgeDays * TasteEngine.PROFILE_DAY_MS
+        }
+        val days = (now - ref).coerceAtLeast(0L).toFloat() / TasteEngine.PROFILE_DAY_MS
+        return 0.5f.pow(days / TasteEngine.PROFILE_HALF_LIFE_DAYS).coerceIn(0f, 1f)
+    }
+
+    val positive = positiveEvidence.coerceAtLeast(0f) * recency(positiveEvidenceUpdatedAt, 0L)
+    val avoidance = xScore.coerceAtLeast(0f) * recency(xScoreUpdatedAt)
+    val similarity = similarityBoost * recency(similarityBoostUpdatedAt)
+    val positiveWeight = positive + favoritePrior
+    val negativeWeight = avoidance + dislikePrior
+    val direct = positiveWeight - negativeWeight
+    return TasteEngine.DirectScoreBreakdown(
+        positiveWeight = positiveWeight,
+        negativeWeight = negativeWeight,
+        effectivePositive = positiveWeight + maxOf(0f, similarity),
+        effectiveNegative = negativeWeight + maxOf(0f, -similarity),
+        directScore = direct,
+        score = direct + similarity,
+        recencyMult = recency(positiveEvidenceUpdatedAt, 0L),
     )
 }
 
