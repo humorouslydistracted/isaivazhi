@@ -21,8 +21,10 @@ internal object BlendWeightLogic {
     ): Weights {
         @Suppress("UNUSED_VARIABLE")
         val ignoredMode = mode
-        val progress = (nListened / 10f).coerceIn(0f, 1f)
-        val current = if (hasCurrent) 0.60f * (1f - progress) else 0f
+        // Let the explicitly chosen song guide the opening recs, then
+        // hand control to session evidence within the first few listens.
+        val progress = (nListened / 5f).coerceIn(0f, 1f)
+        val current = if (hasCurrent) 0.35f * (1f - progress) else 0f
         val remaining = 1f - current
         val session = if (hasSession) remaining * 0.60f * progress else 0f
         val profile = if (hasProfile) (remaining - session).coerceAtLeast(0f) else 0f

@@ -1,7 +1,9 @@
 package com.isaivazhi.app.ui.screens
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,7 +30,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,11 +43,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.AlbumGroup
 import com.isaivazhi.app.engine.FolderEntry
+import com.isaivazhi.app.engine.LibrarySearchIndex
 import com.isaivazhi.app.engine.OtherHit
 import com.isaivazhi.app.engine.PlaylistsEngine
 import com.isaivazhi.app.engine.Song
-import com.isaivazhi.app.engine.searchLibrary
+import com.isaivazhi.app.engine.emptySearchResults
 import com.isaivazhi.app.ui.highlightedText
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+
+private const val SEARCH_DEBOUNCE_MS = 120L
 
 /**
  * Full-screen overlay search across songs, albums, playlists, and folders.
@@ -59,19 +66,38 @@ fun SearchOverlay(
     folders: List<FolderEntry> = emptyList(),
     onDismiss: () -> Unit,
     onPlaySong: (Song) -> Unit,
+    onSongLongPress: (Song) -> Unit,
     onOpenAlbum: (albumName: String) -> Unit,
+    onAlbumLongPress: (albumTracks: List<Song>, albumName: String) -> Unit,
     onOpenPlaylist: (playlistId: String) -> Unit,
     onOpenFolders: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
+    var results by remember { mutableStateOf(emptySearchResults()) }
     val focusRequester = remember { FocusRequester() }
+    val searchIndex = remember(songs, playlists, folders) {
+        LibrarySearchIndex(
+            songs = songs,
+            playlists = playlists,
+            folders = folders,
+        )
+    }
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
     }
 
-    val results by remember(songs, playlists, folders, query) {
-        derivedStateOf { searchLibrary(query, songs, playlists, folders) }
+    LaunchedEffect(query, searchIndex) {
+        val trimmedQuery = query.trim()
+        if (trimmedQuery.isBlank()) {
+            results = emptySearchResults()
+            return@LaunchedEffect
+        }
+
+        delay(SEARCH_DEBOUNCE_MS)
+        results = withContext(Dispatchers.Default) {
+            searchIndex.search(trimmedQuery)
+        }
     }
 
     val highlightColor = MaterialTheme.colorScheme.primary
@@ -144,6 +170,9 @@ fun SearchOverlay(
                                     onPlaySong(hit.song)
                                     onDismiss()
                                 },
+                                onLongClick = {
+                                    onSongLongPress(hit.song)
+                                },
                             )
                         }
                     }
@@ -164,6 +193,9 @@ fun SearchOverlay(
                                 onClick = {
                                     onOpenAlbum(hit.album.name)
                                     onDismiss()
+                                },
+                                onLongClick = {
+                                    onAlbumLongPress(hit.album.tracks, hit.album.name)
                                 },
                             )
                         }
@@ -191,6 +223,9 @@ fun SearchOverlay(
                                     onClick = {
                                         onPlaySong(hit.song)
                                         onDismiss()
+                                    },
+                                    onLongClick = {
+                                        onSongLongPress(hit.song)
                                     },
                                 )
                                 is OtherHit.Playlist -> SearchPlaylistRow(
@@ -232,22 +267,29 @@ private fun SearchSectionHeader(title: String) {
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SearchSongRow(
     song: Song,
     query: String,
     highlightColor: androidx.compose.ui.graphics.Color,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
 ) {
     val title = song.title.ifBlank { song.filename }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ArtThumbnail(filePath = song.filePath, size = 44.dp, cornerRadius = 4.dp)
+        ArtThumbnail(
+            filePath = song.filePath,
+            size = 44.dp,
+            cornerRadius = 4.dp,
+            loadFromCacheOnly = true,
+        )
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
             Text(
@@ -270,21 +312,28 @@ private fun SearchSongRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SearchAlbumRow(
     album: AlbumGroup,
     query: String,
     highlightColor: androidx.compose.ui.graphics.Color,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ArtThumbnail(filePath = album.firstArtPath, size = 56.dp, cornerRadius = 6.dp)
+        ArtThumbnail(
+            filePath = album.firstArtPath,
+            size = 56.dp,
+            cornerRadius = 6.dp,
+            loadFromCacheOnly = true,
+        )
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
             Text(
@@ -306,23 +355,30 @@ private fun SearchAlbumRow(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SearchArtistSongRow(
     song: Song,
     query: String,
     highlightColor: androidx.compose.ui.graphics.Color,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
 ) {
     val title = song.title.ifBlank { song.filename }
     val artist = song.artist.ifBlank { "Unknown artist" }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ArtThumbnail(filePath = song.filePath, size = 44.dp, cornerRadius = 4.dp)
+        ArtThumbnail(
+            filePath = song.filePath,
+            size = 44.dp,
+            cornerRadius = 4.dp,
+            loadFromCacheOnly = true,
+        )
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
             Text(

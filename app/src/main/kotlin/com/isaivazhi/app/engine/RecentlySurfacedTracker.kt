@@ -4,17 +4,16 @@ import android.content.Context
 import org.json.JSONObject
 
 /**
- * Persisted recommendation cooldown: songs that entered the player from AI
- * recommendation flows and must not be re-suggested until a listening-time
- * budget expires.
+ * Persisted recommendation cooldown: songs that actually became the current
+ * track and must not be re-suggested until a listening-time budget expires.
  *
  * Cooldown is **listening-time bound**, not wall-clock bound: a 6-hour budget
  * decays only while music is actively playing (`isPlaying`). App-closed or
  * paused time does not count.
  *
- * Recorded when a song becomes the current track (play, skip, auto-advance).
- * Manual picks (Songs / Albums / Browse) and unplayed Up Next rows are
- * excluded. Play Next is recorded once it becomes current.
+ * Recorded when a song becomes the current track (play, queue jump, skip,
+ * auto-advance). Unplayed Up Next rows are excluded because they have not
+ * actually been heard yet. Recovery/reconnect transitions are also excluded.
  *
  * Storage: SharedPreferences ("algo_surfacing_cache"), survives process death.
  */
@@ -194,15 +193,16 @@ fun shouldRecordRecommendationCooldown(
 ): Boolean {
     if (enteringFilename.isBlank()) return false
     if (enteringFilename in prevState.playNextFilenames) return true
-    if (transitionSource == "manual_tap" ||
-        transitionSource == "album" ||
-        transitionSource == "browse_section"
-    ) {
-        return false
-    }
+    val normalizedSource = transitionSource.trim().lowercase()
     return when (PlaybackEndReason.fromSource(transitionSource)) {
-        PlaybackEndReason.NEXT,
-        PlaybackEndReason.AUTO_ADVANCE -> true
-        else -> false
+        PlaybackEndReason.RECOVERY,
+        PlaybackEndReason.QUEUE_END,
+        PlaybackEndReason.DISMISS -> false
+        PlaybackEndReason.UNKNOWN ->
+            normalizedSource == "album" ||
+                normalizedSource == "album_shuffle" ||
+                normalizedSource == "browse_section" ||
+                normalizedSource == "queue_exhaust_rescue"
+        else -> true
     }
 }

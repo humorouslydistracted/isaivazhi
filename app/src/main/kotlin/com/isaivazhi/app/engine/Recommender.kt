@@ -31,14 +31,39 @@ class Recommender(
     private val embeddingDb: EmbeddingDbFacade,
 ) {
 
+    companion object {
+        internal fun resolveSimilarCandidates(
+            candidates: List<EmbeddingDbFacade.NnResult>,
+            library: List<Song>,
+            policyExcludes: Set<String>,
+            k: Int,
+        ): List<ScoredSong> {
+            if (candidates.isEmpty() || k <= 0) return emptyList()
+            val byFilename = library.associateBy { it.filename }
+            val byHash: Map<String, Song> = library
+                .filter { it.contentHash != null }
+                .associateBy { it.contentHash!! }
+            return candidates.asSequence().mapNotNull { row ->
+                if (row.filename in policyExcludes) return@mapNotNull null
+                val song = byFilename[row.filename]
+                    ?: row.contentHash.takeIf { it.isNotBlank() }?.let { byHash[it] }
+                    ?: return@mapNotNull null
+                if (song.filePath == null) return@mapNotNull null
+                if (song.filename in policyExcludes) return@mapNotNull null
+                ScoredSong(song, row.similarity)
+            }.take(k).toList()
+        }
+    }
+
     var traceSink: ((RecommendationGenerationTrace) -> Unit)? = null
 
     /**
      * Push #67: blend weight schedule. Capacitor parity (`_blendWeights`
      * in engine.js:653). Mode controls which entry point we're building
      * for; the weights ramp based on how many session listens have
-     * accumulated so the first-of-session recs are current-song-heavy,
-     * and as the session grows the weights shift toward session+profile.
+     * accumulated so the first-of-session recs can follow the explicit
+     * anchor, and as the session grows the weights shift toward
+     * session+profile.
      */
     data class BlendWeights(
         val wCurrent: Float,
@@ -67,8 +92,8 @@ class Recommender(
     }
 
     /**
-     * Push #67: build a blended query vector that mixes the current
-     * song's embedding with the session vector (last-N qualified
+     * Push #67: build a blended query vector that mixes the explicit
+     * anchor song's embedding with the session vector (last-N qualified
      * listens) and the profile vector (top-30 long-term centroid).
      * Used as the query for `recommendUpcoming` so the recommender
      * reflects all three time scales.
@@ -891,7 +916,6 @@ class Recommender(
         currentSong: Song,
         library: List<Song>,
         k: Int = 10,
-        adventurous: Float = 0.2f,
         dislikedFilenames: Set<String> = emptySet(),
         hardBlockedFilenames: Set<String> = emptySet(),
         softExcludedFilenames: Set<String> = emptySet(),
@@ -911,20 +935,7 @@ class Recommender(
             k = fetchK,
             excludeHashes = excludeHashes,
         )
-        if (candidates.isEmpty()) return emptyList()
-        val byFilename = library.associateBy { it.filename }
-        val byHash: Map<String, Song> = library
-            .filter { it.contentHash != null }
-            .associateBy { it.contentHash!! }
-        return candidates.asSequence().mapNotNull { row ->
-            if (row.filename in policyExcludes) return@mapNotNull null
-            val song = byFilename[row.filename]
-                ?: row.contentHash.takeIf { it.isNotBlank() }?.let { byHash[it] }
-                ?: return@mapNotNull null
-            if (song.filePath == null) return@mapNotNull null
-            if (song.filename in policyExcludes) return@mapNotNull null
-            ScoredSong(song, row.similarity)
-        }.take(k).toList()
+        return resolveSimilarCandidates(candidates, library, policyExcludes, k)
     }
 
     /**
@@ -980,9 +991,8 @@ class Recommender(
         val seen = HashSet<String>()
         anchors.forEach { seen += it.filename }
         val out = ArrayList<ScoredSong>()
-        // adventurous knob controls MMR diversity in each anchor's neighbor list.
         val perAnchor = anchors.map {
-            recommendScored(it, library, k = k, adventurous = tuning.adventurous)
+            recommendScored(it, library, k = k)
         }
         var i = 0
         while (out.size < k && perAnchor.any { it.size > i }) {
@@ -1063,7 +1073,7 @@ class Recommender(
         }
         if (anchors.isEmpty()) return emptyList()
         return anchors.map { src ->
-            val sims = recommendScored(src, library, k = kPerSource, adventurous = tuning.adventurous)
+            val sims = recommendScored(src, library, k = kPerSource)
                 .filter { it.song.filename !in hardBlockedFilenames }
             src to applyDislikedFilter(sims, dislikedFilenames)
         }

@@ -55,7 +55,7 @@ final class EmbeddingDb {
     private static final class FallbackSnapshot {
         final int dim;
         final int rowCount;
-        final float[] flat;          // rowCount * dim
+        final float[] flat;          // rowCount * dim, each row unit-normalized
         final String[] contentHashes;
         final String[] filepaths;
         final String[] filenames;
@@ -799,17 +799,27 @@ final class EmbeddingDb {
         }
     }
 
-    List<NnResult> nearestNeighbors(byte[] queryBytes, int k, java.util.Set<String> excludeHashes) {
-        if (queryBytes == null || queryBytes.length == 0) return new ArrayList<>();
-        if (k <= 0) return new ArrayList<>();
+    static final class NnResponse {
+        final List<NnResult> results;
+        final String source;
+
+        NnResponse(List<NnResult> results, String source) {
+            this.results = results;
+            this.source = source;
+        }
+    }
+
+    NnResponse nearestNeighbors(byte[] queryBytes, int k, java.util.Set<String> excludeHashes) {
+        if (queryBytes == null || queryBytes.length == 0) return new NnResponse(new ArrayList<>(), "empty");
+        if (k <= 0) return new NnResponse(new ArrayList<>(), "empty");
         if (isVecExtensionLoaded()) {
             try {
-                return sqliteVecNearestNeighbors(queryBytes, k, excludeHashes);
+                return new NnResponse(sqliteVecNearestNeighbors(queryBytes, k, excludeHashes), "sqlite_vec");
             } catch (Throwable t) {
                 Log.w(TAG, "sqlite-vec query failed, falling back to NativeAccelerator: " + t.getMessage());
             }
         }
-        return nativeAccelNearestNeighbors(queryBytes, k, excludeHashes);
+        return new NnResponse(nativeAccelNearestNeighbors(queryBytes, k, excludeHashes), "native_fallback");
     }
 
     private List<NnResult> sqliteVecNearestNeighbors(byte[] queryBytes, int k, java.util.Set<String> excludeHashes) {
@@ -855,6 +865,7 @@ final class EmbeddingDb {
         float[] query = new float[dim];
         java.nio.ByteBuffer qb = java.nio.ByteBuffer.wrap(queryBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
         for (int i = 0; i < dim; i++) query[i] = qb.getFloat();
+        query = normalizeVector(query);
 
         float[] sims = new float[snap.rowCount];
         boolean usedNative = false;
@@ -922,7 +933,7 @@ final class EmbeddingDb {
                 java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(vec).order(java.nio.ByteOrder.LITTLE_ENDIAN);
                 float[] row = new float[rowDim];
                 for (int i = 0; i < rowDim; i++) row[i] = bb.getFloat();
-                rows.add(row);
+                rows.add(normalizeVector(row));
                 hashes.add(c.getString(0));
                 paths.add(c.getString(1));
                 filenames.add(c.getString(2));
@@ -960,5 +971,15 @@ final class EmbeddingDb {
             hex[i * 2 + 1] = HEX[b & 0x0F];
         }
         return new String(hex);
+    }
+
+    private static float[] normalizeVector(float[] vector) {
+        float sumSquares = 0f;
+        for (float value : vector) sumSquares += value * value;
+        if (sumSquares <= 0f) return new float[vector.length];
+        float invNorm = (float) (1.0 / Math.sqrt(sumSquares));
+        float[] out = new float[vector.length];
+        for (int i = 0; i < vector.length; i++) out[i] = vector[i] * invNorm;
+        return out;
     }
 }

@@ -589,6 +589,7 @@ private fun AppRoot(container: AppContainer) {
     var overlay by remember { mutableStateOf<Overlay>(Overlay.None) }
     var libraryMenuOpen by remember { mutableStateOf(false) }
     var menuSong by remember { mutableStateOf<Song?>(null) }
+    var menuCloseOverlayOnAlbumNav by remember { mutableStateOf(false) }
     var menuPlaylistContext by remember { mutableStateOf<String?>(null) }  // playlist id for "Remove from playlist"
     // Push #42 Tier 2I: when the long-press came from the Songs tab,
     // expose a "Play in order" entry. From Discover cards / Albums
@@ -1830,12 +1831,15 @@ private fun AppRoot(container: AppContainer) {
                     currentSong = current,
                     library = songs,
                     k = 10,
-                    adventurous = tuning.adventurous,
                     dislikedFilenames = dislikedSet,
                     hardBlockedFilenames = upNextHardBlocked,
                 )
             }.getOrDefault(emptyList())
         }
+        android.util.Log.d(
+            "MainActivity",
+            "similar_row mediaId=$mediaId source=${container.embeddingDb.lastNearestNeighborSource} results=${results.size}",
+        )
         similarToCurrent = results.map { it.song }
         similarSeedMediaId = mediaId
         similarLoading = false
@@ -2868,10 +2872,20 @@ private fun AppRoot(container: AppContainer) {
             ),
             onDismiss = { overlay = Overlay.None },
             onPlaySong = { playFromTap(it) },
+            onSongLongPress = { song ->
+                menuPlaylistContext = null
+                menuSongsTabIndex = null
+                menuCloseOverlayOnAlbumNav = true
+                menuSong = song
+            },
             onOpenAlbum = { albumName ->
                 albumToExpand = albumName
                 albumRevealRequestId += 1
                 coroutineScope.launch { pagerState.animateScrollToPage(Tab.Albums.ordinal) }
+            },
+            onAlbumLongPress = { tracks, name ->
+                albumMenuTracks = tracks
+                albumMenuName = name
             },
             onOpenPlaylist = { id ->
                 overlay = Overlay.PlaylistDetail(id)
@@ -3535,7 +3549,11 @@ private fun AppRoot(container: AppContainer) {
             songStats = menuSongStats,
             tasteSignal = menuSongTasteSignal,
             playlists = playlistsList,
-            onDismiss = { menuSong = null; menuPlaylistContext = null },
+            onDismiss = {
+                menuSong = null
+                menuPlaylistContext = null
+                menuCloseOverlayOnAlbumNav = false
+            },
             onPlayNext = {
                 container.playback.playNext(sheetSong)
                 container.toaster.show("Added to play next")
@@ -3587,6 +3605,9 @@ private fun AppRoot(container: AppContainer) {
             },
             onViewDetails = { /* dialog shown inside SongMenuSheet */ },
             onViewAlbum = {
+                if (menuCloseOverlayOnAlbumNav) {
+                    overlay = Overlay.None
+                }
                 albumToExpand = sheetSong.album.ifBlank { "Unknown album" }
                 albumRevealRequestId += 1
                 coroutineScope.launch { pagerState.animateScrollToPage(Tab.Albums.ordinal) }

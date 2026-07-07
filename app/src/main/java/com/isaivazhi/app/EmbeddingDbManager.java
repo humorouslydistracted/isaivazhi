@@ -830,7 +830,8 @@ public final class EmbeddingDbManager {
             if (excludeHashes != null) {
                 for (String h : excludeHashes) if (h != null && !h.isEmpty()) excludeSet.add(h);
             }
-            List<EmbeddingDb.NnResult> rows = db.nearestNeighbors(queryBytes, k, excludeSet);
+            EmbeddingDb.NnResponse response = db.nearestNeighbors(queryBytes, k, excludeSet);
+            List<EmbeddingDb.NnResult> rows = response.results;
             JSONArray arr = new JSONArray();
             for (EmbeddingDb.NnResult r : rows) {
                 JSONObject row = new JSONObject();
@@ -843,6 +844,7 @@ public final class EmbeddingDbManager {
                 arr.put(row);
             }
             out.put("results", arr);
+            out.put("source", response.source);
             out.put("usedExtension", db.isVecExtensionLoaded());
             out.put("count", rows.size());
             return out;
@@ -960,7 +962,8 @@ public final class EmbeddingDbManager {
             if (excludeHashes != null) {
                 for (String h : excludeHashes) if (h != null && !h.isEmpty()) excludeSet.add(h);
             }
-            List<EmbeddingDb.NnResult> rows = db.nearestNeighbors(queryBytes, k, excludeSet);
+            EmbeddingDb.NnResponse response = db.nearestNeighbors(queryBytes, k, excludeSet);
+            List<EmbeddingDb.NnResult> rows = response.results;
             JSONArray arr = new JSONArray();
             for (EmbeddingDb.NnResult r : rows) {
                 JSONObject row = new JSONObject();
@@ -971,6 +974,7 @@ public final class EmbeddingDbManager {
                 arr.put(row);
             }
             out.put("results", arr);
+            out.put("source", response.source);
             out.put("usedExtension", db.isVecExtensionLoaded());
             out.put("count", rows.size());
             return out;

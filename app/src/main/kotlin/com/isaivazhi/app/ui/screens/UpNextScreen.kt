@@ -505,7 +505,7 @@ private fun LegacyBlendSummary(
         )
         Spacer(Modifier.height(4.dp))
         Text(
-            text = "Bar: amber = current song • green = session mood • blue = long-term taste",
+            text = "Bar: amber = explicit anchor • green = session mood • blue = long-term taste",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -514,7 +514,7 @@ private fun LegacyBlendSummary(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurface,
         )
-        InfluenceLegend(CurrentInfluenceColor, currentCount, "Current-song match")
+        InfluenceLegend(CurrentInfluenceColor, currentCount, "Explicit-anchor match")
         InfluenceLegend(SessionInfluenceColor, sessionCount, "Session mood")
         InfluenceLegend(ProfileInfluenceColor, profileCount, "Long-term taste")
         InfluenceLegend(DiversityInfluenceColor, diverseCount, "Diverse pick")

@@ -41,6 +41,7 @@ fun ArtThumbnail(
     size: Dp = 48.dp,
     cornerRadius: Dp = 6.dp,
     sampleSize: Int = 4,
+    loadFromCacheOnly: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val ctx = LocalContext.current
@@ -53,10 +54,11 @@ fun ArtThumbnail(
         mutableStateOf(AlbumArtRepository.getCachedBitmap(filePath, sampleSize))
     }
 
-    LaunchedEffect(filePath, sampleSize) {
+    LaunchedEffect(filePath, sampleSize, loadFromCacheOnly) {
         if (filePath.isNullOrEmpty()) return@LaunchedEffect
         // Already populated from the LRU? Skip the async load.
         if (bitmap != null) return@LaunchedEffect
+        if (loadFromCacheOnly) return@LaunchedEffect
         bitmap = AlbumArtRepository.load(ctx, filePath, sampleSize)
     }
 

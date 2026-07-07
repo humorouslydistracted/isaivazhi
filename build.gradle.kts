@@ -13,3 +13,11 @@ plugins {
     // tracks the Kotlin version, no separate Compose-compiler-extension pin.
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
 }
+
+// Gradle 8.x occasionally leaves the previous incubating problems report in
+// place, then fails moving the next temp report into the same destination.
+// Clearing the stale file during configuration keeps ordinary builds stable.
+val staleProblemsReport = rootProject.file("build/reports/problems/problems-report.html")
+if (staleProblemsReport.exists()) {
+    staleProblemsReport.delete()
+}

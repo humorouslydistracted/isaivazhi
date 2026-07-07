@@ -15,6 +15,7 @@ class RecentlySurfacedPolicyTest {
         assertTrue(shouldRecordRecommendationCooldown("auto", aiState, "auto_advance"))
         assertTrue(shouldRecordRecommendationCooldown("next", aiState, "next_button"))
         assertTrue(shouldRecordRecommendationCooldown("play-next", aiState, "play_next"))
+        assertTrue(shouldRecordRecommendationCooldown("prev", aiState, "history_prev"))
         assertTrue(
             shouldRecordRecommendationCooldown(
                 "play-next",
@@ -28,16 +29,16 @@ class RecentlySurfacedPolicyTest {
     }
 
     @Test
-    fun immediateManualAndAlbumSelectionsStayOutOfCooldown() {
-        assertFalse(shouldRecordRecommendationCooldown("manual", aiState, "manual_tap"))
-        assertFalse(
+    fun anyActualPlaybackEntryEntersCooldown_exceptRecoveryOnlyTransitions() {
+        assertTrue(shouldRecordRecommendationCooldown("manual", aiState, "manual_tap"))
+        assertTrue(
             shouldRecordRecommendationCooldown(
                 "album",
                 aiState.copy(queueContext = PlaybackEngine.QueueContext.ALBUM),
                 "album",
             )
         )
-        assertFalse(
+        assertTrue(
             shouldRecordRecommendationCooldown(
                 "browse",
                 aiState.copy(queueContext = PlaybackEngine.QueueContext.BROWSE_SECTION),
@@ -46,17 +47,18 @@ class RecentlySurfacedPolicyTest {
         )
         assertTrue(
             shouldRecordRecommendationCooldown(
-                "album-next",
-                aiState.copy(queueContext = PlaybackEngine.QueueContext.ALBUM),
-                "next_button",
+                "queue-jump",
+                aiState,
+                "queue_tap",
             )
         )
-        assertTrue(
+        assertFalse(
             shouldRecordRecommendationCooldown(
-                "browse-auto",
-                aiState.copy(queueContext = PlaybackEngine.QueueContext.BROWSE_SECTION),
-                "auto_advance",
+                "recovery",
+                aiState,
+                "background_recovery",
             )
         )
+        assertFalse(shouldRecordRecommendationCooldown("unknown", aiState, "dismiss"))
     }
 }

@@ -43,6 +43,8 @@ class EmbeddingDbFacade(appContext: Context) {
     // also be served from heap without a DB round-trip.
     private val filenameToHashCache = java.util.concurrent.ConcurrentHashMap<String, String>(4096)
     private val hashToMetaCache = java.util.concurrent.ConcurrentHashMap<String, HeapMeta>(4096)
+    @Volatile var lastNearestNeighborSource: String = "none"
+        private set
 
     data class HeapMeta(val filename: String, val filepath: String)
 
@@ -358,29 +360,34 @@ class EmbeddingDbFacade(appContext: Context) {
         val queryVec = if (queryHash != null) vecHeapCache[queryHash] else null
         if (queryVec != null && vecHeapCache.size >= 100) {
             val excludeSet = excludeHashes.toHashSet()
-            val scored = ArrayList<Pair<String, Float>>(vecHeapCache.size)
-            for ((hash, vec) in vecHeapCache) {
-                if (hash == queryHash) continue
-                if (hash in excludeSet) continue
-                if (vec.size != queryVec.size) continue
-                var dot = 0f; var vn = 0f
-                for (i in vec.indices) { dot += queryVec[i] * vec[i]; vn += vec[i] * vec[i] }
-                val norm = if (vn > 0f) kotlin.math.sqrt(vn) else 1f
-                scored += hash to (dot / norm)
-            }
-            scored.sortByDescending { it.second }
+            val scored = EmbeddingSimilarity.rankAsHeapPath(
+                query = queryVec,
+                candidates = vecHeapCache,
+                excludeKeys = excludeSet + setOfNotNull(queryHash),
+                k = k,
+            )
             val out = ArrayList<NnResult>(k)
-            for ((hash, sim) in scored.take(k)) {
+            for (row in scored) {
+                val hash = row.key
+                val sim = row.similarity
                 val meta = hashToMetaCache[hash] ?: continue
                 out += NnResult(contentHash = hash, filepath = meta.filepath,
                     filename = meta.filename, similarity = sim)
             }
-            if (out.isNotEmpty()) return out
+            if (out.isNotEmpty()) {
+                lastNearestNeighborSource = "heap"
+                android.util.Log.d(
+                    "EmbeddingDbFacade",
+                    "nearestNeighborsForFilename query=$queryFilename source=heap count=${out.size}",
+                )
+                return out
+            }
         }
         // --- DB fallback ---
         val res = awaitJsonObject { cb ->
             manager.nearestNeighborsForFilename(queryFilename, k, excludeHashes, cb)
         } ?: return emptyList()
+        lastNearestNeighborSource = res.optString("source", "db")
         val arr = res.optJSONArray("results") ?: return emptyList()
         val out = ArrayList<NnResult>(arr.length())
         for (i in 0 until arr.length()) {
@@ -392,6 +399,10 @@ class EmbeddingDbFacade(appContext: Context) {
                 similarity = row.optDouble("similarity", 0.0).toFloat(),
             )
         }
+        android.util.Log.d(
+            "EmbeddingDbFacade",
+            "nearestNeighborsForFilename query=$queryFilename source=$lastNearestNeighborSource count=${out.size}",
+        )
         return out
     }
 

@@ -9,9 +9,9 @@ class RecommenderBlendWeightsTest {
     @Test
     fun autoMode_withFiveEvidenceUnits_usesEvidenceSchedule() {
         val w = BlendWeightLogic.compute("refresh", 5, hasCurrent = true, hasSession = true, hasProfile = true)
-        assertEquals(0.30f, w.wCurrent, 0.001f)
-        assertEquals(0.21f, w.wSession, 0.001f)
-        assertEquals(0.49f, w.wProfile, 0.001f)
+        assertEquals(0f, w.wCurrent, 0.001f)
+        assertEquals(0.60f, w.wSession, 0.001f)
+        assertEquals(0.40f, w.wProfile, 0.001f)
     }
 
     @Test
@@ -25,9 +25,26 @@ class RecommenderBlendWeightsTest {
     @Test
     fun playMode_rampsSessionAsListensGrow() {
         val early = BlendWeightLogic.compute("play", 1, hasCurrent = true, hasSession = true, hasProfile = true)
-        val late = BlendWeightLogic.compute("play", 20, hasCurrent = true, hasSession = true, hasProfile = true)
+        val late = BlendWeightLogic.compute("play", 10, hasCurrent = true, hasSession = true, hasProfile = true)
         assertTrue(early.wSession < late.wSession)
         assertTrue(early.wCurrent > late.wCurrent)
+    }
+
+    @Test
+    fun autoMode_earlySessionCurrentWeightIsSoftened() {
+        val w = BlendWeightLogic.compute("play", 0, hasCurrent = true, hasSession = true, hasProfile = true)
+        assertEquals(0.35f, w.wCurrent, 0.001f)
+        assertEquals(0f, w.wSession, 0.001f)
+        assertEquals(0.65f, w.wProfile, 0.001f)
+    }
+
+    @Test
+    fun autoMode_sessionTakesOverByFiveEvidenceUnits() {
+        val early = BlendWeightLogic.compute("play", 1, hasCurrent = true, hasSession = true, hasProfile = true)
+        val takeover = BlendWeightLogic.compute("play", 5, hasCurrent = true, hasSession = true, hasProfile = true)
+        assertTrue(takeover.wSession > early.wSession)
+        assertTrue(takeover.wCurrent < early.wCurrent)
+        assertEquals(1f, takeover.wCurrent + takeover.wSession + takeover.wProfile, 0.001f)
     }
 
     @Test
