@@ -15,7 +15,7 @@ import java.util.Random as JavaRandom
  *
  * `lambda = (1 - adventurous)^1.5` (power-curve mapping):
  *   - adventurous=0.0 → lambda=1.0 → pure relevance, top-K = first K by sim
- *   - adventurous=0.8 (default) → lambda≈0.089 (was 0.20 with linear mapping)
+ *   - adventurous=0.4 (default) → lambda≈0.465
  *   - adventurous=1.0 → lambda=0.0 → pure diversity (sim ignored)
  *
  * The 1.5 exponent keeps the boundary semantics intact while making the
@@ -439,7 +439,7 @@ class Recommender(
         currentSong: Song,
         library: List<Song>,
         k: Int = 50,
-        adventurous: Float = 0.8f,
+        adventurous: Float = 0.4f,
         extraExcludeFilenames: Set<String> = emptySet(),
         // Push #63: songs excluded by taste policy before MMR.
         hardBlockedFilenames: Set<String> = emptySet(),
@@ -770,7 +770,7 @@ class Recommender(
         upcoming: List<Song>,
         library: List<Song>,
         blendedQueryVec: FloatArray,
-        adventurous: Float = 0.8f,
+        adventurous: Float = 0.4f,
         extraExcludeFilenames: Set<String> = emptySet(),
         hardBlockedFilenames: Set<String> = emptySet(),
         dislikedFilenames: Set<String> = emptySet(),
@@ -854,7 +854,7 @@ class Recommender(
         currentSong: Song,
         library: List<Song>,
         k: Int = 50,
-        adventurous: Float = 0.8f,
+        adventurous: Float = 0.4f,
         // Push #63: forwarded into recommendUpcoming.
         extraExcludeFilenames: Set<String> = emptySet(),
         hardBlockedFilenames: Set<String> = emptySet(),

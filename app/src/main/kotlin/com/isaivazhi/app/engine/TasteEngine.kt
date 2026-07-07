@@ -165,7 +165,7 @@ class TasteEngine(private val appContext: Context) {
     )
 
     companion object {
-        const val DEFAULT_ADVENTUROUS = 0.8f
+        const val DEFAULT_ADVENTUROUS = 0.4f
         const val DEFAULT_TASTE_INFLUENCE = 0.30f
         const val DEFAULT_SESSION_BIAS = 0.5f
         const val DEFAULT_NEGATIVE_STRENGTH = 0.5f

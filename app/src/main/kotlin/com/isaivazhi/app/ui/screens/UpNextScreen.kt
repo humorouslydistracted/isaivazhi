@@ -82,7 +82,7 @@ fun UpNextScreen(
     refreshInProgress: Boolean = false,
     explanations: List<RecommendationExplanation> = emptyList(),
     blendInfo: RecommendationBlendInfo? = null,
-    adventurous: Float = 0.8f,
+    adventurous: Float = 0.4f,
     negativeGuard: Float = 0.5f,
     tasteInfluence: Float = 0.3f,
     playNextFilenames: Set<String> = emptySet(),
