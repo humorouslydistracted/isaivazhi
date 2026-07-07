@@ -4,7 +4,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import kotlin.math.abs
+import kotlinx.coroutines.runBlocking
 
 /**
  * Applies durable service-authored playback signal events to the Kotlin engines.
@@ -56,7 +56,11 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
 
             val appliedThisEvent = apply(event, songs)
             processedIds += event.eventId
-            runCatching { container.preferences.saveIngestWatermark(event.playbackInstanceId) }
+            if (event.playbackInstanceId > 0L) {
+                runBlocking {
+                    runCatching { container.preferences.saveIngestWatermark(event.playbackInstanceId) }
+                }
+            }
             if (appliedThisEvent) {
                 applied++
             } else {
@@ -158,15 +162,16 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
             eventId = event.eventId,
         )
 
-        val delta = after.directScore - before.directScore
-        if (abs(delta) > 0.001f) {
-            sideEffects.launch {
-                runCatching {
-                    container.taste.propagateSimilarityBoost(
-                        sourceFilename = mediaId,
-                        scoreDelta = delta,
-                        reason = timelineSource,
-                    )
+        sideEffects.launch {
+            runCatching {
+                container.taste.propagatePlaybackTasteChange(
+                    sourceFilename = mediaId,
+                    before = before,
+                    after = after,
+                    reason = timelineSource,
+                )
+                if (frac >= TasteEngine.SKIP_THRESHOLD) {
+                    container.scheduleBackgroundCacheRefresh("qualified_listen_ledger")
                 }
             }
         }

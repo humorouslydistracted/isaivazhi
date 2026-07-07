@@ -39,18 +39,6 @@ class AppContainer(private val appContext: Context) {
     // supervisor-rooted so a propagation failure can never crash the app.
     private val sideEffectScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /**
-     * Push #67: signal that fires AFTER a favorite/dislike toggle has
-     * completed, so MainActivity can trigger an immediate Up Next /
-     * Discover rebuild. Capacitor parity (`scheduleRecommendationRebuild`
-     * with refreshQueue=true, refreshDiscover=true on toggles).
-     */
-    private val _rebuildSignal = kotlinx.coroutines.flow.MutableSharedFlow<String>(
-        replay = 0,
-        extraBufferCapacity = 4,
-    )
-    val rebuildSignal: kotlinx.coroutines.flow.SharedFlow<String> = _rebuildSignal
-
     val recommendationExplainability: RecommendationExplainabilityEngine by lazy {
         RecommendationExplainabilityEngine()
     }
@@ -94,13 +82,14 @@ class AppContainer(private val appContext: Context) {
     val favorites: FavoritesEngine by lazy {
         FavoritesEngine(appContext).also { fav ->
             fav.onChangeHook = { fn, _ ->
+                val nowFav = fav.isFavorite(fn)
+                if (nowFav && disliked.isDisliked(fn)) disliked.remove(fn)
                 val (before, after) = taste.applyManualPriorChange(
                     filename = fn,
-                    isFavorite = fav.isFavorite(fn),
+                    isFavorite = nowFav,
                     isDisliked = disliked.isDisliked(fn),
                 )
                 val delta = after.directScore - before.directScore
-                val nowFav = fav.isFavorite(fn)
                 activityLog.log(
                     category = "taste",
                     type = if (nowFav) "favorite_added" else "favorite_removed",
@@ -108,7 +97,7 @@ class AppContainer(private val appContext: Context) {
                     data = mapOf("filename" to fn, "delta" to delta),
                 )
                 sideEffectScope.launch {
-                    val propagation = taste.propagateSimilarityBoost(fn, delta, "favorite_toggle")
+                    val propagation = taste.syncManualSimilarityHalo(fn, after)
                     appendManualTasteEvent(
                         filename = fn,
                         kind = if (nowFav) TasteEventKind.FAVORITE else TasteEventKind.UNFAVORITE,
@@ -117,9 +106,8 @@ class AppContainer(private val appContext: Context) {
                         after = after,
                         propagation = propagation,
                     )
-                    _rebuildSignal.emit("favorite_toggle")
+                    invalidateRecommendationInputs("favorite_toggle")
                 }
-                invalidateRecommendationInputs("favorite_toggle")
                 // Push #74: mirror the favorites set to the CapacitorStorage
                 // SharedPreferences the Java service reads in
                 // Media3PlaybackService.isCurrentFavorite (line 1157). Without
@@ -203,13 +191,16 @@ class AppContainer(private val appContext: Context) {
                 favorites.addSilent(fn)
             }
         }
+        val overlap = favorites.favorites.value intersect disliked.disliked.value
+        overlap.forEach { favorites.remove(it) }
         val allManual = favorites.favorites.value + disliked.disliked.value
         for (fn in allManual) {
-            taste.applyManualPriorChange(
+            val (_, after) = taste.applyManualPriorChange(
                 filename = fn,
                 isFavorite = fn in favorites.favorites.value,
                 isDisliked = fn in disliked.disliked.value,
             )
+            taste.syncManualSimilarityHalo(fn, after, "manual_prior_reconcile")
         }
     }
 
@@ -248,13 +239,14 @@ class AppContainer(private val appContext: Context) {
     val disliked: DislikedEngine by lazy {
         DislikedEngine(appContext).also { dis ->
             dis.onChangeHook = { fn, _ ->
+                val nowDis = dis.isDisliked(fn)
+                if (nowDis && favorites.isFavorite(fn)) favorites.remove(fn)
                 val (before, after) = taste.applyManualPriorChange(
                     filename = fn,
                     isFavorite = favorites.isFavorite(fn),
-                    isDisliked = dis.isDisliked(fn),
+                    isDisliked = nowDis,
                 )
                 val delta = after.directScore - before.directScore
-                val nowDis = dis.isDisliked(fn)
                 activityLog.log(
                     category = "taste",
                     type = if (nowDis) "dislike_added" else "dislike_removed",
@@ -262,7 +254,7 @@ class AppContainer(private val appContext: Context) {
                     data = mapOf("filename" to fn, "delta" to delta),
                 )
                 sideEffectScope.launch {
-                    val propagation = taste.propagateSimilarityBoost(fn, delta, "dislike_toggle")
+                    val propagation = taste.syncManualSimilarityHalo(fn, after)
                     appendManualTasteEvent(
                         filename = fn,
                         kind = if (nowDis) TasteEventKind.DISLIKE else TasteEventKind.UNDISLIKE,
@@ -271,9 +263,8 @@ class AppContainer(private val appContext: Context) {
                         after = after,
                         propagation = propagation,
                     )
-                    _rebuildSignal.emit("dislike_toggle")
+                    invalidateRecommendationInputs("dislike_toggle")
                 }
-                invalidateRecommendationInputs("dislike_toggle")
                 if (nowDis) {
                     playback.removeFilenamesFromUpcoming(setOf(fn))
                 }
@@ -337,12 +328,54 @@ class AppContainer(private val appContext: Context) {
             activityLog, favorites, recentlySurfacedTracker, recommendationExplainability,
         ).also { engine ->
             engine.onRecommendationInputsChanged = { reason ->
-                invalidateRecommendationInputs(reason)
+                when (reason) {
+                    "qualified_listen" -> scheduleBackgroundCacheRefresh(reason)
+                    else -> invalidateRecommendationInputs(reason)
+                }
             }
         }
     }
 
-    val recommender: Recommender by lazy { Recommender(embeddingDb) }
+    val recommender: Recommender by lazy {
+        Recommender(embeddingDb).also { engine ->
+            engine.traceSink = { trace ->
+                recommendationExplainability.recordGeneration(trace)
+                val blend = recommendationExplainability.blendIntervals.value.firstOrNull()
+                activityLog.log(
+                    category = "recommendation",
+                    type = "GENERATION_TRACE",
+                    message = "${trace.reason}: selected ${trace.selectedCount} of ${trace.candidateCount}",
+                    data = mapOf(
+                        "reason" to trace.reason,
+                        "blend" to blend?.let {
+                            "${it.currentPercent}/${it.sessionPercent}/${it.profilePercent}"
+                        },
+                        "tasteInfluence" to trace.tasteInfluence,
+                        "negativeGuard" to trace.negativeGuard,
+                        "candidateCount" to trace.candidateCount,
+                        "selectedCount" to trace.selectedCount,
+                        "candidates" to (
+                            trace.candidates.filter { it.finalRank != null } +
+                                trace.candidates.filter { it.finalRank == null }.take(10)
+                            ).distinctBy { it.filename }.joinToString(";") { candidate ->
+                            listOf(
+                                candidate.filename,
+                                "audio=${candidate.audioSimilarity}",
+                                "overall=${candidate.overallScore}",
+                                "tier=${candidate.tier}",
+                                "taste=${candidate.tasteAffinity}",
+                                "guard=${candidate.guardDecision}",
+                                "pre=${candidate.preDiversityRank}",
+                                "diversity=${candidate.diversityScore}",
+                                "final=${candidate.finalRank}",
+                                "rejected=${candidate.rejectionReason}",
+                            ).joinToString("|")
+                        },
+                    ),
+                )
+            }
+        }
+    }
 
     suspend fun publishRecommendationExplanations(
         songs: List<Song>,
@@ -350,11 +383,13 @@ class AppContainer(private val appContext: Context) {
         origin: QueueItemOrigin = QueueItemOrigin.AI,
         negativeFilteredCount: Int = 0,
     ) {
+        val tuning = taste.tuning.value
         val explanations = recommender.explainRecommendations(
             songs = songs,
             details = details,
             tasteRows = taste.decoratedSignals.value.rows,
-            negativeGuard = taste.tuning.value.negativeStrength,
+            negativeGuard = tuning.negativeStrength,
+            tasteInfluence = tuning.tasteInfluence,
             negativeFilteredCount = negativeFilteredCount,
             origin = origin,
         )
@@ -363,10 +398,28 @@ class AppContainer(private val appContext: Context) {
     }
 
     suspend fun hydrateRecommendationExplanations() {
-        val restored = preferences.loadQueueExplanations().map {
+        val saved = preferences.loadQueueExplanations()
+        if (saved.isEmpty()) return
+        val restored = saved.map {
             if (it.origin == QueueItemOrigin.AI) it.copy(origin = QueueItemOrigin.RESTORED) else it
         }
-        recommendationExplainability.setQueueExplanations(restored)
+        val state = playback.state.value
+        val queueFilenames = state.queueFilenames
+        if (queueFilenames.isEmpty()) {
+            recommendationExplainability.setQueueExplanations(restored)
+            return
+        }
+        val byFilename = restored.associateBy { it.filename }
+        val aligned = queueFilenames.mapNotNull { filename -> byFilename[filename] }
+        recommendationExplainability.setQueueExplanations(aligned)
+        if (aligned.isNotEmpty()) {
+            preferences.saveQueueExplanations(aligned)
+        }
+    }
+
+    /** Background-only cache rebuild — does not touch the visible Up Next queue. */
+    fun scheduleBackgroundCacheRefresh(reason: String) {
+        recommendationCache.scheduleBackgroundRefresh(reason)
     }
 
     val embedding: EmbeddingEngine by lazy {
@@ -475,16 +528,28 @@ class AppContainer(private val appContext: Context) {
         )
         invalidateRecommendationInputs("engine_reset")
 
-        // After reseeding manual priors, re-apply a similarity halo around each
-        // favorite so its top-N similar songs regain a positive boost.
+        // Rebuild persistent manual halos after clearing learned state.
         sideEffectScope.launch {
             try {
                 val snapshot = taste.signals.value
                 for (fn in favSet) {
                     val sig = snapshot[fn] ?: continue
-                    val delta = sig.directScore
-                    if (delta != 0f) {
-                        taste.propagateSimilarityBoost(fn, delta, "reset_engine_reseed")
+                    if (sig.favoritePrior != 0f) {
+                        taste.propagateSimilarityBoost(
+                            fn,
+                            sig.favoritePrior,
+                            "reset_favorite_reseed",
+                        )
+                    }
+                }
+                for (fn in disSet) {
+                    val sig = snapshot[fn] ?: continue
+                    if (sig.dislikePrior != 0f) {
+                        taste.propagateSimilarityBoost(
+                            fn,
+                            -sig.dislikePrior,
+                            "reset_dislike_reseed",
+                        )
                     }
                 }
             } catch (t: Throwable) {
@@ -519,6 +584,11 @@ class AppContainer(private val appContext: Context) {
         invalidateRecommendationInputs("tuning_adventurous")
     }
 
+    fun setTasteInfluence(value: Float) {
+        taste.setTasteInfluence(value)
+        invalidateRecommendationInputs("tuning_taste_influence")
+    }
+
     fun setTasteSessionBias(value: Float) {
         taste.setSessionBias(value)
         invalidateRecommendationInputs("tuning_session_bias")
@@ -529,14 +599,30 @@ class AppContainer(private val appContext: Context) {
         invalidateRecommendationInputs("tuning_negative_strength")
     }
 
+    fun setManualTasteBlend(currentWeight: Float, sessionWeight: Float) {
+        taste.setManualBlend(currentWeight, sessionWeight)
+        invalidateRecommendationInputs("tuning_manual_blend")
+    }
+
+    fun resetTasteBlendToAuto() {
+        taste.resetBlendToAuto()
+        invalidateRecommendationInputs("tuning_blend_auto")
+    }
+
     fun resetTasteAdventurous() = setTasteAdventurous(TasteEngine.DEFAULT_ADVENTUROUS)
+
+    fun resetTasteInfluence() = setTasteInfluence(TasteEngine.DEFAULT_TASTE_INFLUENCE)
 
     fun resetTasteSessionBias() = setTasteSessionBias(TasteEngine.DEFAULT_SESSION_BIAS)
 
     fun resetTasteNegativeStrength() = setTasteNegativeStrength(TasteEngine.DEFAULT_NEGATIVE_STRENGTH)
 
     fun resetTasteSignalForSong(filename: String) {
-        taste.resetSignalForSong(filename)
+        taste.resetSignalForSong(
+            filename = filename,
+            isFavorite = favorites.isFavorite(filename),
+            isDisliked = disliked.isDisliked(filename),
+        )
         invalidateRecommendationInputs("taste_signal_reset")
     }
 

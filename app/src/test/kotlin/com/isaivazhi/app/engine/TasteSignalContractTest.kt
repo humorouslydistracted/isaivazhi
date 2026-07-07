@@ -48,9 +48,9 @@ class TasteSignalContractTest {
     }
 
     @Test
-    fun rankingUsesEightyTwentyBlendAndMonotonicNegativeGuard() {
+    fun rankingUsesConfiguredTasteInfluenceAndMonotonicNegativeGuard() {
         assertEquals(
-            0.70f,
+            0.675f,
             UnifiedTasteContract.finalRelevance(
                 audioRelevance = 0.75f,
                 totalScore = 2f,
@@ -63,6 +63,38 @@ class TasteSignalContractTest {
         assertTrue(highGuard < lowGuard)
         assertFalse(UnifiedTasteContract.isLearnedNegativeBlocked(-0.4f, 0.5f))
         assertTrue(UnifiedTasteContract.isLearnedNegativeBlocked(-0.4f, 1f))
+    }
+
+    @Test
+    fun tasteInfluenceSupportsZeroTwentyThirtyAndFiftyPercent() {
+        val audio = 0.8f
+        val overall = 2f
+        val expected = mapOf(
+            0f to 0.8f,
+            0.2f to 0.74f,
+            0.3f to 0.71f,
+            0.5f to 0.65f,
+        )
+        expected.forEach { (influence, relevance) ->
+            assertEquals(
+                relevance,
+                UnifiedTasteContract.finalRelevance(
+                    audioRelevance = audio,
+                    totalScore = overall,
+                    negativeGuard = 0.5f,
+                    tasteInfluence = influence,
+                ),
+                0.001f,
+            )
+        }
+    }
+
+    @Test
+    fun negativeGuardThresholdMatchesTooltipExamples() {
+        assertTrue(UnifiedTasteContract.isLearnedNegativeBlocked(-0.25f, 1f))
+        assertTrue(UnifiedTasteContract.isLearnedNegativeBlocked(-0.50f, 0.5f))
+        assertTrue(UnifiedTasteContract.isLearnedNegativeBlocked(-1.0f, 0.25f))
+        assertFalse(UnifiedTasteContract.isLearnedNegativeBlocked(-10f, 0f))
     }
 
     @Test

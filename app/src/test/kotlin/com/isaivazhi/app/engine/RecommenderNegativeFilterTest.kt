@@ -14,12 +14,6 @@ class RecommenderNegativeFilterTest {
     )
 
     @Test
-    fun softExclude_doesNotRemoveSongsThatShouldBeDownranked() {
-        val excluded = RecommendationPolicy.softExcludedFilenames(scores, 0.5f)
-        assertTrue(excluded.isEmpty())
-    }
-
-    @Test
     fun hardBlock_becomesStricterAsNegativeGuardIncreases() {
         val lowGuard = RecommendationPolicy.hardBlockedFilenames(scores, 0.1f)
         val highGuard = RecommendationPolicy.hardBlockedFilenames(scores, 1f)
@@ -28,15 +22,6 @@ class RecommenderNegativeFilterTest {
         assertTrue("strong" in highGuard)
         assertTrue("mild" !in highGuard)
         assertTrue(lowGuard.all { it in highGuard })
-    }
-
-    @Test
-    fun unionExcludes_includesDislikesAlways() {
-        val hard = setOf("strong")
-        val soft = setOf("mid")
-        val disliked = setOf("disliked_track")
-        val union = RecommendationPolicy.unionExcludes(hard, soft, disliked)
-        assertEquals(setOf("strong", "mid", "disliked_track"), union)
     }
 
     @Test

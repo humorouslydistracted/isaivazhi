@@ -62,8 +62,8 @@ object UnifiedTasteContract {
     const val STRONG_AVOIDANCE_REPAIR = 0.50f
     const val QUEUE_REMOVAL_AVOIDANCE = 0.50f
 
-    const val TASTE_RANKING_SHARE = 0.20f
-    const val AUDIO_RANKING_SHARE = 0.80f
+    const val TASTE_RANKING_SHARE = TasteEngine.DEFAULT_TASTE_INFLUENCE
+    const val AUDIO_RANKING_SHARE = 1f - TASTE_RANKING_SHARE
     const val TASTE_SCORE_NORMALIZER = 4f
     const val NEGATIVE_BLOCK_THRESHOLD = 0.25f
 
@@ -106,18 +106,26 @@ object UnifiedTasteContract {
     fun boundedTasteAffinity(totalScore: Float): Float =
         (totalScore / TASTE_SCORE_NORMALIZER).coerceIn(-1f, 1f)
 
-    fun tasteAdjustment(totalScore: Float, negativeGuard: Float): Float {
+    fun tasteAdjustment(
+        totalScore: Float,
+        negativeGuard: Float,
+        tasteInfluence: Float = TasteEngine.DEFAULT_TASTE_INFLUENCE,
+    ): Float {
         val affinity = boundedTasteAffinity(totalScore)
         val guarded = if (affinity < 0f) affinity * negativeGuard.coerceIn(0f, 1f) else affinity
-        return TASTE_RANKING_SHARE * guarded
+        return tasteInfluence.coerceIn(0f, TasteEngine.MAX_TASTE_INFLUENCE) * guarded
     }
 
     fun finalRelevance(
         audioRelevance: Float,
         totalScore: Float,
         negativeGuard: Float,
-    ): Float = AUDIO_RANKING_SHARE * audioRelevance +
-        tasteAdjustment(totalScore, negativeGuard)
+        tasteInfluence: Float = TasteEngine.DEFAULT_TASTE_INFLUENCE,
+    ): Float {
+        val tasteWeight = tasteInfluence.coerceIn(0f, TasteEngine.MAX_TASTE_INFLUENCE)
+        return (1f - tasteWeight) * audioRelevance +
+            tasteAdjustment(totalScore, negativeGuard, tasteWeight)
+    }
 
     fun isLearnedNegativeBlocked(totalScore: Float, negativeGuard: Float): Boolean {
         if (totalScore >= 0f) return false

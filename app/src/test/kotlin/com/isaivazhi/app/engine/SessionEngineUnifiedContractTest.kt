@@ -1,6 +1,7 @@
 package com.isaivazhi.app.engine
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class SessionEngineUnifiedContractTest {
@@ -27,5 +28,27 @@ class SessionEngineUnifiedContractTest {
         assertEquals(2.5f, counters.evidenceUnits, 0.001f)
         assertEquals(3, engine.listened.value.size)
         assertEquals(0.175f, engine.listened.value.first().contribution, 0.001f)
+    }
+
+    @Test
+    fun twoHoursWithoutPlaybackClearsEvidenceAndExplicitAnchor() {
+        val engine = SessionEngine()
+        engine.markPlaybackActivity(now = 1_000L)
+        engine.markExplicitAnchor("anchor")
+        engine.recordEvent(
+            fraction = 0.8f,
+            isSkip = false,
+            isManual = false,
+            filename = "song",
+            source = "test",
+        )
+
+        engine.ensureActiveSession(
+            now = System.currentTimeMillis() + SessionEngine.INACTIVITY_TIMEOUT_MS,
+        )
+
+        assertEquals(0, engine.current().encounters)
+        assertEquals(emptyList<SessionEngine.ListenedEntry>(), engine.listened.value)
+        assertNull(engine.explicitAnchorFilename.value)
     }
 }

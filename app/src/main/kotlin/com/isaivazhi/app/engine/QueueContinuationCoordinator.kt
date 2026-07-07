@@ -163,7 +163,12 @@ class QueueContinuationCoordinator(
                 profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec,
                 library = songs,
                 mode = "play",
-                sessionBias = tuning.sessionBias,
+                overallScores = container.taste.overallScoresByFilename(),
+                currentAnchorEligible =
+                    container.session.explicitAnchorFilename.value == current.filename,
+                manualBlend = tuning.manualBlend,
+                manualCurrentWeight = tuning.manualCurrentWeight,
+                manualSessionWeight = tuning.manualSessionWeight,
             )
         }.getOrNull()
         blendedDetails?.let {
@@ -180,11 +185,11 @@ class QueueContinuationCoordinator(
                     adventurous = tuning.adventurous,
                     extraExcludeFilenames = excludeFns,
                     hardBlockedFilenames = container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength),
-                    dislikedFilenames = container.disliked.disliked.value,
-                    softExcludedFilenames = container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength),
                     blendedQueryVec = blendedVec,
-                    totalTasteScores = container.taste.directScoresByFilename(),
+                    totalTasteScores = container.taste.overallScoresByFilename(),
                     negativeGuard = tuning.negativeStrength,
+                    tasteInfluence = tuning.tasteInfluence,
+                    traceReason = "queue_continuation",
                 )
             }.getOrDefault(emptyList())
         } else {
@@ -220,8 +225,7 @@ class QueueContinuationCoordinator(
                 songs = tail,
                 details = blendedDetails,
                 negativeFilteredCount = container.taste
-                    .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size +
-                    container.disliked.disliked.value.size,
+                    .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size,
             )
         }
         container.toaster.show(

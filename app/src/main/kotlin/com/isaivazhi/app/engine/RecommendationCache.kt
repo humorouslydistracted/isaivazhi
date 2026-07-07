@@ -102,7 +102,21 @@ class RecommendationCache(
             }
             _tail.value = null
         }
+        val seed = container.playback.state.value.currentMediaId
+        if (!seed.isNullOrBlank()) {
+            requestCompute(seed, reason = "pop_refill")
+        }
         return taken
+    }
+
+    /**
+     * Clears any stale cached tail and kicks off a background precompute.
+     * Does not replace the visible Up Next queue.
+     */
+    fun scheduleBackgroundRefresh(reason: String) {
+        _tail.value = null
+        val seed = container.playback.state.value.currentMediaId ?: return
+        requestCompute(seed, reason = reason)
     }
 
     /** Manual trigger — used at process start. */
@@ -225,9 +239,12 @@ class RecommendationCache(
         val recMode = container.preferences.recMode.first()
         val playbackState = container.playback.state.value
         val playNextSet = playbackState.playNextFilenames
-        val queueSet = playbackState.queueFilenames.toSet()
         val cooldownSet = container.recentlySurfacedTracker.recentlySurfaced()
-        val excludeFns = playNextSet + queueSet + seedFilename + cooldownSet
+        val excludeFns = QueueContinuationPolicy.recommendExcludeFilenames(
+            playNextFilenames = playNextSet,
+            currentFilename = seedFilename,
+            recentlySurfaced = cooldownSet,
+        )
         val embeddingRows = container.embeddingDb.vecCacheSize.takeIf { it > 0 }
             ?: runCatching { container.preferences.cachedEmbedStats().rowCount }.getOrDefault(0)
         if (!recMode || embeddingRows == 0) {
@@ -241,8 +258,6 @@ class RecommendationCache(
         }
         val tuning = container.taste.tuning.value
         val hardBlockedFilenames = container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
-        val softExcludedFilenames = container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength)
-        val dislikedFilenames = container.disliked.disliked.value
 
         val profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec
 
@@ -258,7 +273,12 @@ class RecommendationCache(
                 profileVec = profileVec,
                 library = library,
                 mode = "refresh",
-                sessionBias = tuning.sessionBias,
+                overallScores = container.taste.overallScoresByFilename(),
+                currentAnchorEligible =
+                    container.session.explicitAnchorFilename.value == current.filename,
+                manualBlend = tuning.manualBlend,
+                manualCurrentWeight = tuning.manualCurrentWeight,
+                manualSessionWeight = tuning.manualSessionWeight,
             )
         } catch (ce: CancellationException) {
             throw ce
@@ -275,11 +295,11 @@ class RecommendationCache(
                 adventurous = tuning.adventurous,
                 extraExcludeFilenames = excludeFns,
                 hardBlockedFilenames = hardBlockedFilenames,
-                dislikedFilenames = dislikedFilenames,
-                softExcludedFilenames = softExcludedFilenames,
                 blendedQueryVec = blendedVec,
-                totalTasteScores = container.taste.directScoresByFilename(),
+                totalTasteScores = container.taste.overallScoresByFilename(),
                 negativeGuard = tuning.negativeStrength,
+                tasteInfluence = tuning.tasteInfluence,
+                traceReason = "cache_precompute",
             )
         } catch (ce: CancellationException) {
             throw ce
@@ -293,7 +313,8 @@ class RecommendationCache(
                 details = blendedDetails,
                 tasteRows = container.taste.decoratedSignals.value.rows,
                 negativeGuard = tuning.negativeStrength,
-                negativeFilteredCount = hardBlockedFilenames.size + dislikedFilenames.size,
+                tasteInfluence = tuning.tasteInfluence,
+                negativeFilteredCount = hardBlockedFilenames.size,
             )
         } else emptyList()
         return CachedRecommendationTail(

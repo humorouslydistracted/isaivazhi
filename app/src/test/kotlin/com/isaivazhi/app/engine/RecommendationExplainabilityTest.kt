@@ -77,4 +77,33 @@ class RecommendationExplainabilityTest {
         assertEquals("generation-1", reordered.queueGenerationId)
         assertEquals("item-7", reordered.itemId)
     }
+
+    @Test
+    fun finalRelevanceRespectsTasteInfluenceSlider() {
+        val audio = 0.8f
+        val score = 1f
+        val low = UnifiedTasteContract.finalRelevance(
+            audioRelevance = audio,
+            totalScore = score,
+            negativeGuard = 0.5f,
+            tasteInfluence = 0.30f,
+        )
+        val high = UnifiedTasteContract.finalRelevance(
+            audioRelevance = audio,
+            totalScore = score,
+            negativeGuard = 0.5f,
+            tasteInfluence = 0.50f,
+        )
+        assertTrue(low != high)
+        assertEquals(
+            UnifiedTasteContract.tasteAdjustment(score, 0.5f, 0.30f),
+            low - (1f - 0.30f) * audio,
+            0.001f,
+        )
+        assertEquals(
+            UnifiedTasteContract.tasteAdjustment(score, 0.5f, 0.50f),
+            high - (1f - 0.50f) * audio,
+            0.001f,
+        )
+    }
 }

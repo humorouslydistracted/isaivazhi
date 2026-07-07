@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
@@ -33,7 +35,7 @@ import kotlin.math.pow
  *      exposes `propagateSimilarityBoost` which uses an injected
  *      `neighborLookup` lambda to find the top-10 embedding-nearest
  *      songs and spreads the score delta across them with weights
- *      [0.10, 0.09, …, 0.01], clamped to ±4.
+ *      [0.10, 0.09, …, 0.01], with final similarity clamped to ±0.5.
  *   4. Recency multiplier: `0.5^(daysSince/30)` on listen weights.
  *   5. Hard-block list exposed via `decoratedSignals` for the
  *      Recommender to filter on.
@@ -44,8 +46,12 @@ class TasteEngine(private val appContext: Context) {
 
     data class Tuning(
         val adventurous: Float = DEFAULT_ADVENTUROUS,
+        val tasteInfluence: Float = DEFAULT_TASTE_INFLUENCE,
         val sessionBias: Float = DEFAULT_SESSION_BIAS,
         val negativeStrength: Float = DEFAULT_NEGATIVE_STRENGTH,
+        val manualBlend: Boolean = false,
+        val manualCurrentWeight: Float = DEFAULT_MANUAL_CURRENT_WEIGHT,
+        val manualSessionWeight: Float = DEFAULT_MANUAL_SESSION_WEIGHT,
     )
 
     data class TasteSignal(
@@ -92,6 +98,13 @@ class TasteEngine(private val appContext: Context) {
 
     data class SimilarityContributor(
         val sourceFilename: String,
+        val amount: Float,
+        val reason: String,
+        val updatedAt: Long,
+    )
+
+    data class OutboundSimilarityImpact(
+        val targetFilename: String,
         val amount: Float,
         val reason: String,
         val updatedAt: Long,
@@ -153,8 +166,12 @@ class TasteEngine(private val appContext: Context) {
 
     companion object {
         const val DEFAULT_ADVENTUROUS = 0.8f
+        const val DEFAULT_TASTE_INFLUENCE = 0.30f
         const val DEFAULT_SESSION_BIAS = 0.5f
         const val DEFAULT_NEGATIVE_STRENGTH = 0.5f
+        const val DEFAULT_MANUAL_CURRENT_WEIGHT = 0.30f
+        const val DEFAULT_MANUAL_SESSION_WEIGHT = 0.40f
+        const val MAX_TASTE_INFLUENCE = 0.50f
 
         // Capacitor parity (engine-state.js): songs played < 50% are SKIPS;
         // strong listens at ≥ 70% decay xScore more aggressively.
@@ -195,11 +212,7 @@ class TasteEngine(private val appContext: Context) {
         val SIMILARITY_NEIGHBOR_WEIGHTS = floatArrayOf(
             0.10f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f
         )
-        const val SIMILARITY_BOOST_MAX = 4.0f
-
-        // Hard-block thresholds — see [RecommendationPolicy].
-        const val HARD_EXCLUDE_SHARE = RecommendationPolicy.HARD_EXCLUDE_SHARE
-        const val HARD_EXCLUDE_FLOOR = RecommendationPolicy.HARD_EXCLUDE_FLOOR
+        const val SIMILARITY_BOOST_MAX = 0.5f
 
         /** Pure xScore update for playback events — used by [recordPlaybackEvent] and unit tests. */
         fun nextXScoreAfterPlayback(beforeXScore: Float, fraction: Float, source: String): Float {
@@ -218,8 +231,12 @@ class TasteEngine(private val appContext: Context) {
     }
 
     private val KEY_ADV = floatPreferencesKey("taste_adventurous")
+    private val KEY_TASTE_INFLUENCE = floatPreferencesKey("taste_influence")
     private val KEY_NEG = floatPreferencesKey("taste_negative_strength")
     private val KEY_SES = floatPreferencesKey("taste_session_bias")
+    private val KEY_BLEND_MANUAL = intPreferencesKey("taste_blend_manual")
+    private val KEY_BLEND_CURRENT = floatPreferencesKey("taste_blend_current")
+    private val KEY_BLEND_SESSION = floatPreferencesKey("taste_blend_session")
     private val KEY_FAM_LEGACY = floatPreferencesKey("taste_familiarity")
     private val KEY_SIGNALS = stringPreferencesKey("taste_signals_v1_json")
     private val KEY_PROCESSED_EVENT_IDS = stringPreferencesKey("taste_processed_playback_event_ids_v1_json")
@@ -268,6 +285,7 @@ class TasteEngine(private val appContext: Context) {
     @Volatile var neighborLookup: (suspend (filename: String, k: Int) -> List<String>)? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val propagationMutex = Mutex()
     private val readyDeferred = CompletableDeferred<Unit>()
     private var processedPlaybackEventIds: Set<String> = emptySet()
 
@@ -278,10 +296,21 @@ class TasteEngine(private val appContext: Context) {
                 val legacyFam = data[KEY_FAM_LEGACY]
                 _tuning.value = Tuning(
                     adventurous = data[KEY_ADV] ?: DEFAULT_ADVENTUROUS,
+                    tasteInfluence = (data[KEY_TASTE_INFLUENCE] ?: DEFAULT_TASTE_INFLUENCE)
+                        .coerceIn(0f, MAX_TASTE_INFLUENCE),
                     sessionBias = data[KEY_SES] ?: legacyFam ?: DEFAULT_SESSION_BIAS,
                     negativeStrength = data[KEY_NEG] ?: DEFAULT_NEGATIVE_STRENGTH,
+                    manualBlend = data[KEY_BLEND_MANUAL] == 1,
+                    manualCurrentWeight = (data[KEY_BLEND_CURRENT]
+                        ?: DEFAULT_MANUAL_CURRENT_WEIGHT).coerceIn(0f, 1f),
+                    manualSessionWeight = (data[KEY_BLEND_SESSION]
+                        ?: DEFAULT_MANUAL_SESSION_WEIGHT).coerceIn(0f, 1f),
                 )
-                data[KEY_SIGNALS]?.let { _signals.value = parseSignals(it) }
+                data[KEY_SIGNALS]?.let {
+                    _signals.value = parseSignals(it).mapValues { (_, signal) ->
+                        normalizeLoadedSignal(signal)
+                    }
+                }
                 data[KEY_PROCESSED_EVENT_IDS]?.let { processedPlaybackEventIds = parseEventIds(it) }
                 refreshDecorated()
             } catch (t: Throwable) {
@@ -301,6 +330,13 @@ class TasteEngine(private val appContext: Context) {
         scope.launch { persistTuning() }
     }
 
+    fun setTasteInfluence(value: Float) {
+        _tuning.value = _tuning.value.copy(
+            tasteInfluence = value.coerceIn(0f, MAX_TASTE_INFLUENCE),
+        )
+        scope.launch { persistTuning() }
+    }
+
     fun setSessionBias(value: Float) {
         _tuning.value = _tuning.value.copy(sessionBias = value.coerceIn(0f, 1f))
         scope.launch { persistTuning() }
@@ -311,12 +347,29 @@ class TasteEngine(private val appContext: Context) {
         scope.launch { persistTuning() }
     }
 
+    fun setManualBlend(currentWeight: Float, sessionWeight: Float) {
+        val current = currentWeight.coerceIn(0f, 1f)
+        val session = sessionWeight.coerceIn(0f, 1f - current)
+        _tuning.value = _tuning.value.copy(
+            manualBlend = true,
+            manualCurrentWeight = current,
+            manualSessionWeight = session,
+        )
+        scope.launch { persistTuning() }
+    }
+
+    fun resetBlendToAuto() {
+        _tuning.value = _tuning.value.copy(manualBlend = false)
+        scope.launch { persistTuning() }
+    }
+
     fun resetAdventurous() = setAdventurous(DEFAULT_ADVENTUROUS)
+    fun resetTasteInfluence() = setTasteInfluence(DEFAULT_TASTE_INFLUENCE)
     fun resetSessionBias() = setSessionBias(DEFAULT_SESSION_BIAS)
     fun resetNegativeStrength() = setNegativeStrength(DEFAULT_NEGATIVE_STRENGTH)
 
-    /** Direct scores for policy (Negative guard slider). */
-    fun directScoresByFilename(): Map<String, Float> {
+    /** Canonical overall scores used by recommendation ranking and policy. */
+    fun overallScoresByFilename(): Map<String, Float> {
         val dec = _decorated.value
         if (dec.rows.isNotEmpty()) {
             return dec.rows.mapValues { it.value.breakdown.score }
@@ -331,9 +384,9 @@ class TasteEngine(private val appContext: Context) {
                 xScore = sig.xScore,
                 favoritePrior = sig.favoritePrior,
                 dislikePrior = sig.dislikePrior,
-                similarityBoost = sig.similarityBoost,
+                similarityBoost = effectiveSimilarityBoost(sig, now),
                 xScoreUpdatedAt = sig.xScoreUpdatedAt,
-                similarityBoostUpdatedAt = sig.similarityBoostUpdatedAt,
+                similarityBoostUpdatedAt = now,
                 lastUpdatedAt = sig.lastUpdatedAt,
                 now = now,
             ).score
@@ -341,12 +394,57 @@ class TasteEngine(private val appContext: Context) {
     }
 
     fun hardBlockedFilenamesForPolicy(negativeStrength: Float): Set<String> =
-        RecommendationPolicy.hardBlockedFilenames(directScoresByFilename(), negativeStrength)
-
-    fun softExcludedFilenamesForPolicy(negativeStrength: Float): Set<String> =
-        RecommendationPolicy.softExcludedFilenames(directScoresByFilename(), negativeStrength)
+        RecommendationPolicy.hardBlockedFilenames(overallScoresByFilename(), negativeStrength)
 
     fun signalFor(filename: String): TasteSignal = _signals.value[filename] ?: TasteSignal()
+
+    private fun normalizeLoadedSignal(signal: TasteSignal): TasteSignal {
+        val favorite = if (signal.isFavorite) MANUAL_FAVORITE_PRIOR_BASE else 0f
+        val dislike = if (signal.isDisliked) computeDislikePrior(signal.fullListens) else 0f
+        return signal.copy(
+            favoritePrior = favorite,
+            dislikePrior = dislike,
+            similarityBoost = signal.similarityBoost.coerceIn(
+                -SIMILARITY_BOOST_MAX,
+                SIMILARITY_BOOST_MAX,
+            ),
+        )
+    }
+
+    private fun isPersistentManualContributor(reason: String): Boolean {
+        val normalized = reason.lowercase()
+        return normalized.contains("favorite") ||
+            normalized.contains("dislike") ||
+            normalized.contains("manual_prior") ||
+            normalized == "reset_engine_reseed"
+    }
+
+    private fun effectiveSimilarityBoost(
+        signal: TasteSignal,
+        now: Long = System.currentTimeMillis(),
+    ): Float {
+        if (signal.similarityContributors.isEmpty()) {
+            return decayedLearnedValue(
+                value = signal.similarityBoost,
+                updatedAt = signal.similarityBoostUpdatedAt,
+                fallbackAt = signal.lastUpdatedAt,
+                now = now,
+            ).coerceIn(-SIMILARITY_BOOST_MAX, SIMILARITY_BOOST_MAX)
+        }
+        return signal.similarityContributors.sumOf { contributor ->
+            val amount = if (isPersistentManualContributor(contributor.reason)) {
+                contributor.amount
+            } else {
+                decayedLearnedValue(
+                    value = contributor.amount,
+                    updatedAt = contributor.updatedAt,
+                    fallbackAt = signal.lastUpdatedAt,
+                    now = now,
+                )
+            }
+            amount.toDouble()
+        }.toFloat().coerceIn(-SIMILARITY_BOOST_MAX, SIMILARITY_BOOST_MAX)
+    }
 
     /**
      * One-time v2 rebuild from the durable history ledger. Manual flags and
@@ -441,12 +539,13 @@ class TasteEngine(private val appContext: Context) {
         persistSignals()
         appContext.dataStoreLocal.edit { it[KEY_CONTRACT_VERSION] = 2 }
 
-        // Rebuild one non-recursive halo from each song's direct evidence.
-        scope.launch {
-            for ((filename, signal) in rebuilt) {
-                if (abs(signal.directScore) >= 0.001f) {
-                    propagateSimilarityBoost(filename, signal.directScore, "v2_migration")
-                }
+        // Rebuild halos serially under the propagation mutex. Manual priors
+        // use persistent contributors; learned evidence uses one-shot spread.
+        for ((filename, signal) in rebuilt) {
+            if (signal.favoritePrior > 0f || signal.dislikePrior > 0f) {
+                syncManualSimilarityHalo(filename, signal, "v2_migration")
+            } else if (abs(signal.directScore) >= 0.001f) {
+                propagateSimilarityBoost(filename, signal.directScore, "v2_migration")
             }
         }
     }
@@ -506,7 +605,9 @@ class TasteEngine(private val appContext: Context) {
             outcome == PlaybackOutcome.STRONG
         val isStrong = outcome == PlaybackOutcome.STRONG
         val newPlays = if (isQualifiedListen) before.plays + 1 else before.plays
-        val newSkips = before.skips
+        val isExplicitUserSkip = (source == "next_button" || source == "prev_button") &&
+            frac < SKIP_THRESHOLD
+        val newSkips = if (isExplicitUserSkip) before.skips + 1 else before.skips
         // Push #73: fullListens only increments on >=0.70 non-skip.
         // Used to decay the dislike prior asymmetrically.
         val newFullListens = if (isStrong) before.fullListens + 1 else before.fullListens
@@ -569,9 +670,9 @@ class TasteEngine(private val appContext: Context) {
             xScore = newX,
             favoritePrior = newFavPrior,
             dislikePrior = newDisPrior,
-            similarityBoost = before.similarityBoost,
+            similarityBoost = effectiveSimilarityBoost(before, now),
             xScoreUpdatedAt = newXScoreUpdatedAt,
-            similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
+            similarityBoostUpdatedAt = now,
             lastUpdatedAt = now,
             now = now,
         )
@@ -637,9 +738,9 @@ class TasteEngine(private val appContext: Context) {
             xScore = before.xScore,
             favoritePrior = newFavPrior,
             dislikePrior = newDisPrior,
-            similarityBoost = before.similarityBoost,
+            similarityBoost = effectiveSimilarityBoost(before, now),
             xScoreUpdatedAt = before.xScoreUpdatedAt,
-            similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
+            similarityBoostUpdatedAt = now,
             lastUpdatedAt = now,
             now = now,
         )
@@ -687,9 +788,9 @@ class TasteEngine(private val appContext: Context) {
             xScore = newX,
             favoritePrior = before.favoritePrior,
             dislikePrior = before.dislikePrior,
-            similarityBoost = before.similarityBoost,
+            similarityBoost = effectiveSimilarityBoost(before, now),
             xScoreUpdatedAt = now,
-            similarityBoostUpdatedAt = before.similarityBoostUpdatedAt,
+            similarityBoostUpdatedAt = now,
             lastUpdatedAt = now,
             now = now,
         )
@@ -714,7 +815,8 @@ class TasteEngine(private val appContext: Context) {
      * Push #63: propagate a score delta to the source song's top-N
      * embedding neighbors. Capacitor parity (engine-taste.js:865-903).
      * Spread weights: [0.10, 0.09, …, 0.01] for neighbors 0..9 by rank.
-     * Each neighbor's accumulated similarityBoost is clamped to ±4.
+     * Contributor history is retained in full; the effective total used by
+     * scoring is capped to ±0.5.
      * No-op when [neighborLookup] is not wired or [scoreDelta] is below
      * the noise floor.
      *
@@ -727,8 +829,19 @@ class TasteEngine(private val appContext: Context) {
         sourceFilename: String,
         scoreDelta: Float,
         reason: String,
+    ): PropagationSummary = propagationMutex.withLock {
+        propagateSimilarityBoostUnlocked(sourceFilename, scoreDelta, reason)
+    }
+
+    private suspend fun propagateSimilarityBoostUnlocked(
+        sourceFilename: String,
+        scoreDelta: Float,
+        reason: String,
     ): PropagationSummary {
-        if (sourceFilename.isBlank() || abs(scoreDelta) < 0.001f) return PropagationSummary()
+        val persistent = isPersistentManualContributor(reason)
+        if (sourceFilename.isBlank() || (!persistent && abs(scoreDelta) < 0.001f)) {
+            return PropagationSummary()
+        }
         val lookup = neighborLookup ?: run {
             android.util.Log.w("TasteEngine", "propagate src=$sourceFilename Δ=$scoreDelta reason=$reason: no neighborLookup wired")
             return PropagationSummary()
@@ -749,35 +862,43 @@ class TasteEngine(private val appContext: Context) {
             if (nfn == sourceFilename) continue
             val w = SIMILARITY_NEIGHBOR_WEIGHTS[i]
             val delta = scoreDelta * w
-            if (abs(delta) < 0.001f) continue
+            if (!persistent && abs(delta) < 0.001f) continue
             val cur = next[nfn] ?: TasteSignal()
-            val effectiveBoost = decayedLearnedValue(
-                value = cur.similarityBoost,
-                updatedAt = cur.similarityBoostUpdatedAt,
-                fallbackAt = cur.lastUpdatedAt,
-                now = now,
-            )
-            val newBoost = (effectiveBoost + delta)
-                .coerceIn(-SIMILARITY_BOOST_MAX, SIMILARITY_BOOST_MAX)
-            if (newBoost == effectiveBoost) continue
-            val appliedDelta = newBoost - effectiveBoost
-            val priorContributor = cur.similarityContributors
-                .firstOrNull { it.sourceFilename == sourceFilename }
+            val effectiveBoost = effectiveSimilarityBoost(cur, now)
+            val normalizedContributors = cur.similarityContributors.map { existing ->
+                if (isPersistentManualContributor(existing.reason)) {
+                    existing
+                } else {
+                    existing.copy(
+                        amount = decayedLearnedValue(
+                            value = existing.amount,
+                            updatedAt = existing.updatedAt,
+                            fallbackAt = cur.lastUpdatedAt,
+                            now = now,
+                        ),
+                        updatedAt = now,
+                    )
+                }
+            }
+            val priorContributor = normalizedContributors.firstOrNull {
+                it.sourceFilename == sourceFilename &&
+                    isPersistentManualContributor(it.reason) == persistent
+            }
             val contributor = SimilarityContributor(
                 sourceFilename = sourceFilename,
-                amount = decayedLearnedValue(
-                    value = priorContributor?.amount ?: 0f,
-                    updatedAt = priorContributor?.updatedAt ?: 0L,
-                    fallbackAt = cur.lastUpdatedAt,
-                    now = now,
-                ) + appliedDelta,
+                amount = if (persistent) delta else (priorContributor?.amount ?: 0f) + delta,
                 reason = reason,
                 updatedAt = now,
             )
-            val contributors = (cur.similarityContributors
-                .filterNot { it.sourceFilename == sourceFilename } + contributor)
+            val contributors = (normalizedContributors.filterNot {
+                it.sourceFilename == sourceFilename &&
+                    isPersistentManualContributor(it.reason) == persistent
+            } + contributor)
+                .filter { abs(it.amount) >= 0.001f }
                 .sortedByDescending { abs(it.amount) }
-                .take(5)
+            val rawBoost = contributors.sumOf { it.amount.toDouble() }.toFloat()
+            val newBoost = rawBoost.coerceIn(-SIMILARITY_BOOST_MAX, SIMILARITY_BOOST_MAX)
+            val appliedDelta = newBoost - effectiveBoost
             val nb = computeUnifiedScore(
                 positiveEvidence = cur.positiveEvidence.takeIf { it > 0f }
                     ?: (cur.plays * cur.avgFraction),
@@ -793,7 +914,7 @@ class TasteEngine(private val appContext: Context) {
                 now = now,
             )
             next = next + (nfn to cur.copy(
-                similarityBoost = newBoost,
+                similarityBoost = rawBoost,
                 directScore = nb.directScore,
                 lastUpdatedAt = now,
                 similarityBoostUpdatedAt = now,
@@ -814,6 +935,38 @@ class TasteEngine(private val appContext: Context) {
         return PropagationSummary(changedSongs = changedCount, totalDelta = totalDelta)
     }
 
+    suspend fun syncManualSimilarityHalo(
+        sourceFilename: String,
+        signal: TasteSignal,
+        reason: String = "manual_prior_sync",
+    ): PropagationSummary = propagateSimilarityBoost(
+        sourceFilename = sourceFilename,
+        scoreDelta = signal.favoritePrior - signal.dislikePrior,
+        reason = reason,
+    )
+
+    suspend fun propagatePlaybackTasteChange(
+        sourceFilename: String,
+        before: TasteSignal,
+        after: TasteSignal,
+        reason: String,
+    ): PropagationSummary {
+        val manualBefore = before.favoritePrior - before.dislikePrior
+        val manualAfter = after.favoritePrior - after.dislikePrior
+        val learnedDelta = (after.directScore - before.directScore) -
+            (manualAfter - manualBefore)
+        val learned = propagateSimilarityBoost(sourceFilename, learnedDelta, reason)
+        val manual = if (abs(manualAfter - manualBefore) >= 0.001f) {
+            syncManualSimilarityHalo(sourceFilename, after)
+        } else {
+            PropagationSummary()
+        }
+        return PropagationSummary(
+            changedSongs = maxOf(learned.changedSongs, manual.changedSongs),
+            totalDelta = learned.totalDelta + manual.totalDelta,
+        )
+    }
+
     /**
      * Push #68: stable hash of the current recommendation policy.
      * Capacitor parity (`_buildRecommendationFingerprint`). Incorporates
@@ -824,12 +977,12 @@ class TasteEngine(private val appContext: Context) {
     fun recommendationFingerprint(): String {
         val dec = _decorated.value
         val topPos = dec.rows.values
-            .filter { it.breakdown.directScore > 0f }
+            .filter { it.breakdown.score > 0f }
             .sortedByDescending { it.breakdown.score }
             .take(10)
             .joinToString("|") { "${it.filename}:${"%.2f".format(it.breakdown.score)}" }
         val topNeg = dec.rows.values
-            .filter { it.breakdown.directScore < 0f }
+            .filter { it.breakdown.score < 0f }
             .sortedBy { it.breakdown.score }
             .take(10)
             .joinToString("|") { "${it.filename}:${"%.2f".format(it.breakdown.score)}" }
@@ -842,9 +995,57 @@ class TasteEngine(private val appContext: Context) {
      * isFavorite/isDisliked are held by FavoritesEngine/DislikedEngine
      * (separate stores) and therefore survive automatically.
      */
-    fun resetSignalForSong(filename: String) {
-        if (filename.isBlank() || filename !in _signals.value) return
-        _signals.value = _signals.value - filename
+    fun resetSignalForSong(
+        filename: String,
+        isFavorite: Boolean = false,
+        isDisliked: Boolean = false,
+    ) {
+        if (filename.isBlank()) return
+        val now = System.currentTimeMillis()
+        val cleaned = _signals.value.mapValues { (_, signal) ->
+            val contributors = signal.similarityContributors.filterNot {
+                it.sourceFilename == filename && !isPersistentManualContributor(it.reason)
+            }
+            signal.copy(
+                similarityContributors = contributors,
+                similarityBoost = contributors.sumOf { it.amount.toDouble() }.toFloat(),
+                similarityBoostUpdatedAt = now,
+            )
+        }.toMutableMap()
+        val incomingManual = cleaned[filename]?.similarityContributors
+            ?.filter { isPersistentManualContributor(it.reason) }
+            .orEmpty()
+        val favoritePrior = if (isFavorite) MANUAL_FAVORITE_PRIOR_BASE else 0f
+        val dislikePrior = if (isDisliked) MANUAL_DISLIKE_PRIOR_BASE else 0f
+        val incomingBoost = incomingManual.sumOf { it.amount.toDouble() }.toFloat()
+        val breakdown = computeUnifiedScore(
+            positiveEvidence = 0f,
+            positiveEvidenceUpdatedAt = 0L,
+            xScore = 0f,
+            favoritePrior = favoritePrior,
+            dislikePrior = dislikePrior,
+            similarityBoost = incomingBoost,
+            xScoreUpdatedAt = 0L,
+            similarityBoostUpdatedAt = now,
+            lastUpdatedAt = now,
+            now = now,
+        )
+        if (isFavorite || isDisliked || incomingManual.isNotEmpty()) {
+            cleaned[filename] = TasteSignal(
+                directScore = breakdown.directScore,
+                similarityBoost = incomingBoost,
+                favoritePrior = favoritePrior,
+                dislikePrior = dislikePrior,
+                isFavorite = isFavorite,
+                isDisliked = isDisliked,
+                lastUpdatedAt = now,
+                similarityBoostUpdatedAt = now,
+                similarityContributors = incomingManual,
+            )
+        } else {
+            cleaned.remove(filename)
+        }
+        _signals.value = cleaned
         scope.launch { persistSignals() }
         refreshDecorated()
         android.util.Log.i("TasteEngine", "resetSignalForSong fn=$filename")
@@ -927,10 +1128,8 @@ class TasteEngine(private val appContext: Context) {
         return false to ""
     }
 
-    private fun computeFavoritePrior(plays: Int): Float {
-        val w = FAVORITE_PRIOR_BASE * 0.5f.pow(plays / MANUAL_PRIOR_HALF_LIFE_PLAYS)
-        return if (w >= MANUAL_PRIOR_MIN) w else 0f
-    }
+    private fun computeFavoritePrior(@Suppress("UNUSED_PARAMETER") plays: Int): Float =
+        FAVORITE_PRIOR_BASE
 
     /**
      * Push #73: dislike prior decays on fullListens (frac >= 0.70), not
@@ -970,9 +1169,9 @@ class TasteEngine(private val appContext: Context) {
                     xScore = sig.xScore,
                     favoritePrior = sig.favoritePrior,
                     dislikePrior = sig.dislikePrior,
-                    similarityBoost = sig.similarityBoost,
+                    similarityBoost = effectiveSimilarityBoost(sig, now),
                     xScoreUpdatedAt = sig.xScoreUpdatedAt,
-                    similarityBoostUpdatedAt = sig.similarityBoostUpdatedAt,
+                    similarityBoostUpdatedAt = now,
                     lastUpdatedAt = sig.lastUpdatedAt,
                     now = now,
                 )
@@ -989,10 +1188,11 @@ class TasteEngine(private val appContext: Context) {
             .take(TOP_RANK_LIMIT)
             .map { it.fn }
             .toHashSet()
-        // Step 3: hard-block at full Negative guard strength (display / legacy set).
+        // Step 3: hard-block at the user's Negative guard (matches Up Next policy).
+        val policyGuard = _tuning.value.negativeStrength.coerceIn(0f, 1f)
         val hardBlocked = RecommendationPolicy.hardBlockedFilenames(
-            rows.associate { it.fn to it.bd.directScore },
-            negativeStrength = 1f,
+            rows.associate { it.fn to it.bd.score },
+            negativeStrength = policyGuard,
         )
         // Step 4: build DecoratedRow entries.
         val out = HashMap<String, DecoratedRow>(rows.size)
@@ -1008,8 +1208,11 @@ class TasteEngine(private val appContext: Context) {
                 r.sig.avgFraction < 0.5f &&
                 r.bd.directScore < 0f
             val isMixed = r.bd.positiveWeight > 0f && r.bd.negativeWeight > 0f
-            if (r.bd.directScore > 0f) posCount++
-            else if (r.bd.directScore < 0f) negCount++
+            // Counts must match the Taste screen's "Top Positive"/"Top
+            // Negative" tab filters, which split on overall `score`
+            // (directScore + similarityBoost) — see TasteScreen.kt.
+            if (r.bd.score > 0f) posCount++
+            else if (r.bd.score < 0f) negCount++
             // Push #69: suspicious-pattern detector.
             val (suspicious, reason) = detectSuspicious(r.sig)
             out[r.fn] = DecoratedRow(
@@ -1041,8 +1244,12 @@ class TasteEngine(private val appContext: Context) {
             val t = _tuning.value
             appContext.dataStoreLocal.edit {
                 it[KEY_ADV] = t.adventurous
+                it[KEY_TASTE_INFLUENCE] = t.tasteInfluence
                 it[KEY_SES] = t.sessionBias
                 it[KEY_NEG] = t.negativeStrength
+                it[KEY_BLEND_MANUAL] = if (t.manualBlend) 1 else 0
+                it[KEY_BLEND_CURRENT] = t.manualCurrentWeight
+                it[KEY_BLEND_SESSION] = t.manualSessionWeight
                 it.remove(KEY_FAM_LEGACY)
             }
         } catch (t: Throwable) {
@@ -1195,6 +1402,36 @@ class TasteEngine(private val appContext: Context) {
     }
 }
 
+internal fun buildOutboundSimilarityIndex(
+    signals: Map<String, TasteEngine.TasteSignal>,
+): Map<String, List<TasteEngine.OutboundSimilarityImpact>> {
+    val outbound = LinkedHashMap<String, MutableList<TasteEngine.OutboundSimilarityImpact>>()
+    signals.forEach { (targetFilename, signal) ->
+        signal.similarityContributors.forEach { contributor ->
+            if (contributor.sourceFilename.isBlank() || contributor.amount == 0f) return@forEach
+            outbound.getOrPut(contributor.sourceFilename) { mutableListOf() }
+                .add(
+                    TasteEngine.OutboundSimilarityImpact(
+                        targetFilename = targetFilename,
+                        amount = contributor.amount,
+                        reason = contributor.reason,
+                        updatedAt = contributor.updatedAt,
+                    ),
+                )
+        }
+    }
+    return outbound.mapValues { (_, impacts) ->
+        impacts.sortedWith(
+            compareByDescending<TasteEngine.OutboundSimilarityImpact> { abs(it.amount) }
+                .thenBy { it.targetFilename },
+        )
+    }
+}
+
+/*
+ * Inactive v1 score reconstruction retained outside compilation for migration
+ * history. Active scoring uses computeUnifiedScore exclusively.
+ *
 /**
  * Capacitor parity directScore (engine-taste.js:391-487), extended by
  * Push #73 with recency decay for xScore + similarityBoost and a
@@ -1307,6 +1544,7 @@ fun computeDirectScore(
         recencyMult = recencyMult,
     )
 }
+*/
 
 /**
  * Unified v2 scoring. Playback contribution is accumulated directly instead
@@ -1337,7 +1575,8 @@ fun computeUnifiedScore(
 
     val positive = positiveEvidence.coerceAtLeast(0f) * recency(positiveEvidenceUpdatedAt, 0L)
     val avoidance = xScore.coerceAtLeast(0f) * recency(xScoreUpdatedAt)
-    val similarity = similarityBoost * recency(similarityBoostUpdatedAt)
+    val similarity = (similarityBoost * recency(similarityBoostUpdatedAt))
+        .coerceIn(-TasteEngine.SIMILARITY_BOOST_MAX, TasteEngine.SIMILARITY_BOOST_MAX)
     val positiveWeight = positive + favoritePrior
     val negativeWeight = avoidance + dislikePrior
     val direct = positiveWeight - negativeWeight
@@ -1354,8 +1593,7 @@ fun computeUnifiedScore(
 
 /**
  * Stats-only fallback used by the Taste page for songs that have history
- * data but no TasteSignal entry yet. Equivalent to the positive arm of
- * [computeDirectScore] with priors=0 and recencyMult=1.
+ * data but no TasteSignal entry yet.
  */
 fun signedDirectScore(plays: Int, avgFraction: Float): Float {
     if (plays <= 0) return 0f

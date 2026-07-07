@@ -23,6 +23,10 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 class SessionEngine {
 
+    companion object {
+        const val INACTIVITY_TIMEOUT_MS: Long = 2 * 60 * 60 * 1000L
+    }
+
     data class SessionCounters(
         val encounters: Int = 0,
         val skips: Int = 0,
@@ -65,19 +69,34 @@ class SessionEngine {
     private val _listened = MutableStateFlow<List<ListenedEntry>>(emptyList())
     val listened: StateFlow<List<ListenedEntry>> = _listened.asStateFlow()
 
-    /**
-     * Push #64: rolling tick of qualified non-skip listens since the last
-     * For You refresh. Capacitor parity (`tickForYouListenWindow`): after
-     * 5 qualified listens within a session, the recommender's "For You"
-     * cache is invalidated so the page tracks where the user's session
-     * mood has drifted. The Discover LE keys on this counter; when it
-     * hits 5 it triggers an auto-refresh and immediately calls
-     * [resetForYouTick] to start the next window.
-     */
-    private val _forYouTick = MutableStateFlow(0)
-    val forYouTick: StateFlow<Int> = _forYouTick.asStateFlow()
+    private val _explicitAnchorFilename = MutableStateFlow<String?>(null)
+    val explicitAnchorFilename: StateFlow<String?> = _explicitAnchorFilename.asStateFlow()
+
+    @Volatile private var lastActivityAt: Long = 0L
 
     fun current(): SessionCounters = _counters.value
+
+    @Synchronized
+    fun ensureActiveSession(now: Long = System.currentTimeMillis()) {
+        if (lastActivityAt > 0L && now - lastActivityAt >= INACTIVITY_TIMEOUT_MS) {
+            resetInternal()
+        }
+    }
+
+    @Synchronized
+    fun markPlaybackActivity(now: Long = System.currentTimeMillis()) {
+        ensureActiveSession(now)
+        lastActivityAt = now
+    }
+
+    fun markExplicitAnchor(filename: String) {
+        markPlaybackActivity()
+        _explicitAnchorFilename.value = filename.takeIf { it.isNotBlank() }
+    }
+
+    fun clearExplicitAnchor() {
+        _explicitAnchorFilename.value = null
+    }
 
     /**
      * Record a playback event into the session counters. Returns the
@@ -91,6 +110,8 @@ class SessionEngine {
         filename: String = "",
         source: String = "",
     ): Pair<SessionCounters, SessionCounters> {
+        val now = System.currentTimeMillis()
+        ensureActiveSession(now)
         val before = _counters.value
         val frac = fraction.coerceIn(0f, 1f)
         val outcome = UnifiedTasteContract.outcomeFor(frac)
@@ -120,7 +141,7 @@ class SessionEngine {
                 filename = filename,
                 fraction = frac,
                 source = source,
-                timestamp = System.currentTimeMillis(),
+                timestamp = now,
                 contribution = contribution,
                 evidenceUnits = outcome.evidenceUnits,
                 outcome = outcome,
@@ -128,23 +149,19 @@ class SessionEngine {
             val newList = (_listened.value + entry).takeLast(MAX_RECENT_LISTENS)
             _listened.value = newList
         }
-        // Any positive evidence advances the session refresh window.
-        if (contribution > 0f) {
-            _forYouTick.value = _forYouTick.value + 1
-        }
+        lastActivityAt = now
         return before to after
     }
 
-    /**
-     * Push #64: called by Discover LE after firing an auto-refresh so the
-     * next 5 qualified listens start a fresh window.
-     */
-    fun resetForYouTick() { _forYouTick.value = 0 }
-
     /** Wipe counters — paired with Reset Engine. */
     fun reset() {
+        resetInternal()
+        lastActivityAt = 0L
+    }
+
+    private fun resetInternal() {
         _counters.value = SessionCounters()
-        _forYouTick.value = 0
         _listened.value = emptyList()
+        _explicitAnchorFilename.value = null
     }
 }

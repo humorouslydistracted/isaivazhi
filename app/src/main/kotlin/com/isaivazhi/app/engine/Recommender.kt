@@ -31,6 +31,8 @@ class Recommender(
     private val embeddingDb: EmbeddingDbFacade,
 ) {
 
+    var traceSink: ((RecommendationGenerationTrace) -> Unit)? = null
+
     /**
      * Push #67: blend weight schedule. Capacitor parity (`_blendWeights`
      * in engine.js:653). Mode controls which entry point we're building
@@ -79,6 +81,11 @@ class Recommender(
         profileVec: FloatArray?,
         library: List<Song>,
         mode: String = "play",
+        overallScores: Map<String, Float> = emptyMap(),
+        currentAnchorEligible: Boolean = true,
+        manualBlend: Boolean = false,
+        manualCurrentWeight: Float = TasteEngine.DEFAULT_MANUAL_CURRENT_WEIGHT,
+        manualSessionWeight: Float = TasteEngine.DEFAULT_MANUAL_SESSION_WEIGHT,
         sessionBias: Float = 0.5f,
     ): BlendedQueryDetails {
         val byFilename = library.associateBy { it.filename }
@@ -90,8 +97,12 @@ class Recommender(
         for (entry in sessionListened) {
             val hash = byFilename[entry.filename]?.contentHash ?: continue
             if (entry.contribution <= 0f) continue
+            val tasteBoost = 1f + (
+                (overallScores[entry.filename] ?: 0f).coerceAtLeast(0f) /
+                    UnifiedTasteContract.TASTE_SCORE_NORMALIZER
+                )
             sessionWeightsByHash[hash] =
-                (sessionWeightsByHash[hash] ?: 0f) + entry.contribution
+                (sessionWeightsByHash[hash] ?: 0f) + entry.contribution * tasteBoost
         }
         val currentVec = if (!currentSongHash.isNullOrBlank()) {
             embeddingDb.getVecsByHashes(listOf(currentSongHash))[currentSongHash]
@@ -102,13 +113,24 @@ class Recommender(
         val sessionVec = if (sessionVecs.isNotEmpty())
             weightedAvgVec(sessionVecs, sessionWeightsByHash)
         else null
-        val hasCurrent = currentVec != null
+        val hasCurrent = currentVec != null && currentAnchorEligible
         val hasSession = sessionVec != null
         val hasProfile = profileVec != null && profileVec.isNotEmpty()
         val nListened = sessionListened.sumOf { it.evidenceUnits.toDouble() }.toFloat()
-        var w = blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)
+        var w = if (manualBlend) {
+            val manual = BlendWeightLogic.computeManual(
+                currentWeight = manualCurrentWeight,
+                sessionWeight = manualSessionWeight,
+                hasCurrent = hasCurrent,
+                hasSession = hasSession,
+                hasProfile = hasProfile,
+            )
+            BlendWeights(manual.wCurrent, manual.wSession, manual.wProfile)
+        } else {
+            blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)
+        }
         // Apply sessionBias to bias session vs profile (Capacitor parity).
-        if (w.wSession > 0 && w.wProfile > 0) {
+        if (!manualBlend && w.wSession > 0 && w.wProfile > 0) {
             val sb = sessionBias.coerceIn(0f, 0.95f)
             val rest = w.wSession + w.wProfile
             w = BlendWeights(w.wCurrent, rest * sb, rest * (1f - sb))
@@ -167,6 +189,7 @@ class Recommender(
         details: BlendedQueryDetails,
         tasteRows: Map<String, TasteEngine.DecoratedRow>,
         negativeGuard: Float,
+        tasteInfluence: Float = TasteEngine.DEFAULT_TASTE_INFLUENCE,
         negativeFilteredCount: Int,
         origin: QueueItemOrigin = QueueItemOrigin.AI,
     ): List<RecommendationExplanation> {
@@ -207,7 +230,14 @@ class Recommender(
             val profile = details.weights.wProfile * cosine(details.profileVector, vector)
             val breakdown = tasteRows[song.filename]?.breakdown
             val total = breakdown?.score ?: 0f
-            val adjustment = UnifiedTasteContract.tasteAdjustment(total, negativeGuard)
+            val audioRelevance = details.queryVector?.let { queryVec ->
+                cosine(queryVec, vector)
+            } ?: (current + session + profile)
+            val adjustment = UnifiedTasteContract.tasteAdjustment(
+                total,
+                negativeGuard,
+                tasteInfluence,
+            )
             Pending(
                 song = song,
                 current = current,
@@ -215,8 +245,12 @@ class Recommender(
                 profile = profile,
                 totalScore = total,
                 tasteAdjustment = adjustment,
-                relevance = UnifiedTasteContract.AUDIO_RANKING_SHARE *
-                    (current + session + profile) + adjustment,
+                relevance = UnifiedTasteContract.finalRelevance(
+                    audioRelevance = audioRelevance,
+                    totalScore = total,
+                    negativeGuard = negativeGuard,
+                    tasteInfluence = tasteInfluence,
+                ),
                 finalRank = index + 1,
             )
         }
@@ -244,25 +278,71 @@ class Recommender(
         }
     }
 
-    private fun avgVec(vecs: List<FloatArray>): FloatArray? {
-        if (vecs.isEmpty()) return null
-        val dim = vecs[0].size
-        if (dim == 0) return null
-        val out = FloatArray(dim)
-        var count = 0
-        for (v in vecs) {
-            if (v.size != dim) continue
-            for (i in 0 until dim) out[i] += v[i]
-            count++
+    private fun tasteTier(score: Float): String = when {
+        score >= 1f -> "strong_positive"
+        score > 0.1f -> "positive"
+        score < 0f && UnifiedTasteContract.isLearnedNegativeBlocked(score, 1f) -> "hard_negative"
+        score < 0f -> "negative"
+        else -> "neutral"
+    }
+
+    private fun guardDecisionLabel(
+        filename: String,
+        score: Float,
+        policyExcludes: Set<String>,
+        negativeGuard: Float,
+    ): String = when {
+        filename in policyExcludes -> "blocked"
+        score < 0f && UnifiedTasteContract.isLearnedNegativeBlocked(score, negativeGuard) -> "guard_block"
+        score < 0f -> "guard_pass"
+        else -> "eligible"
+    }
+
+    private fun emitGenerationTrace(
+        reason: String,
+        tasteInfluence: Float,
+        negativeGuard: Float,
+        candidateCount: Int,
+        selected: List<Song>,
+        audioByFilename: Map<String, Float>,
+        preRankByFilename: Map<String, Int>,
+        totalTasteScores: Map<String, Float>,
+        policyExcludes: Set<String>,
+        rejected: List<RecommendationCandidateTrace>,
+    ) {
+        val sink = traceSink ?: return
+        val finalRankByFilename = selected.withIndex().associate { (idx, song) ->
+            song.filename to (idx + 1)
         }
-        if (count == 0) return null
-        for (i in 0 until dim) out[i] /= count
-        // Normalize.
-        var n2 = 0f
-        for (i in 0 until dim) n2 += out[i] * out[i]
-        val inv = if (n2 > 0f) 1f / sqrt(n2) else 0f
-        for (i in 0 until dim) out[i] *= inv
-        return out
+        val selectedTraces = selected.map { song ->
+            val score = totalTasteScores[song.filename] ?: 0f
+            RecommendationCandidateTrace(
+                filename = song.filename,
+                audioSimilarity = audioByFilename[song.filename] ?: 0f,
+                overallScore = score,
+                tier = tasteTier(score),
+                tasteAffinity = UnifiedTasteContract.tasteAdjustment(
+                    score,
+                    negativeGuard,
+                    tasteInfluence,
+                ),
+                guardDecision = guardDecisionLabel(song.filename, score, policyExcludes, negativeGuard),
+                preDiversityRank = preRankByFilename[song.filename] ?: 0,
+                diversityScore = null,
+                finalRank = finalRankByFilename[song.filename],
+                rejectionReason = null,
+            )
+        }
+        sink(
+            RecommendationGenerationTrace(
+                reason = reason,
+                tasteInfluence = tasteInfluence,
+                negativeGuard = negativeGuard,
+                candidateCount = candidateCount,
+                selectedCount = selected.size,
+                candidates = selectedTraces + rejected,
+            ),
+        )
     }
 
     /**
@@ -336,11 +416,7 @@ class Recommender(
         k: Int = 50,
         adventurous: Float = 0.8f,
         extraExcludeFilenames: Set<String> = emptySet(),
-        // Push #63: songs whose taste signal classifies them as strongly
-        // negative (top 18% by directNegativeStrength with floor ≥ 1.5).
-        // Unconditionally excluded from the upcoming pool. Mirrors
-        // Capacitor engine-taste.js:751 — the recommendation policy
-        // pass that prunes hard-blocked rows before MMR.
+        // Push #63: songs excluded by taste policy before MMR.
         hardBlockedFilenames: Set<String> = emptySet(),
         /** Thumbs-down list — always excluded from Up Next (not scaled by Negative guard). */
         dislikedFilenames: Set<String> = emptySet(),
@@ -353,6 +429,8 @@ class Recommender(
         blendedQueryVec: FloatArray? = null,
         totalTasteScores: Map<String, Float> = emptyMap(),
         negativeGuard: Float = TasteEngine.DEFAULT_NEGATIVE_STRENGTH,
+        tasteInfluence: Float = TasteEngine.DEFAULT_TASTE_INFLUENCE,
+        traceReason: String = "up_next",
     ): List<Song> {
         val lambda = (1f - adventurous).coerceIn(0f, 1f).pow(1.5f)
         val policyExcludes = RecommendationPolicy.unionExcludes(
@@ -371,7 +449,7 @@ class Recommender(
                 queryVec = blendedQueryVec,
                 library = library,
                 k = overFetch,
-                excludeFilenames = extraExcludeFilenames + policyExcludes + currentSong.filename,
+                excludeFilenames = extraExcludeFilenames + policyExcludes + setOf(currentSong.filename),
             )
             // Adapt to NnResult shape so the rest of the pipeline is shared.
             scored.map { ss ->
@@ -389,7 +467,22 @@ class Recommender(
                 excludeHashes = excludeHashes,
             )
         }
-        if (rawCandidates.isEmpty()) return emptyList()
+        if (rawCandidates.isEmpty()) {
+            emitGenerationTrace(
+                reason = traceReason,
+                tasteInfluence = tasteInfluence,
+                negativeGuard = negativeGuard,
+                candidateCount = 0,
+                selected = emptyList(),
+                audioByFilename = emptyMap(),
+                preRankByFilename = emptyMap(),
+                totalTasteScores = totalTasteScores,
+                policyExcludes = policyExcludes,
+                rejected = emptyList(),
+            )
+            return emptyList()
+        }
+        val audioByFilename = rawCandidates.associate { it.filename to it.similarity }
         val candidates = rawCandidates
             .map { row ->
                 row.copy(
@@ -397,10 +490,14 @@ class Recommender(
                         audioRelevance = row.similarity,
                         totalScore = totalTasteScores[row.filename] ?: 0f,
                         negativeGuard = negativeGuard,
+                        tasteInfluence = tasteInfluence,
                     )
                 )
             }
             .sortedByDescending { it.similarity }
+        val preRankByFilename = candidates.withIndex().associate { (idx, row) ->
+            row.filename to (idx + 1)
+        }
 
         // Step 2: load candidate vectors in one batch for MMR redundancy
         // scoring. ~150 vectors × 2 KB = 300 KB over the bridge — small.
@@ -409,38 +506,115 @@ class Recommender(
             .filter { it.contentHash != null }
             .associateBy { it.contentHash!! }
 
+        val rejectedTraces = ArrayList<RecommendationCandidateTrace>()
         val viable = candidates.mapNotNull { row ->
-            if (row.filename in extraExcludeFilenames) return@mapNotNull null
-            if (row.filename in policyExcludes) return@mapNotNull null
+            if (row.filename in extraExcludeFilenames) {
+                rejectedTraces += rejectedTrace(
+                    row, audioByFilename, totalTasteScores, policyExcludes,
+                    negativeGuard, tasteInfluence, preRankByFilename, "excluded",
+                )
+                return@mapNotNull null
+            }
+            if (row.filename in policyExcludes) {
+                rejectedTraces += rejectedTrace(
+                    row, audioByFilename, totalTasteScores, policyExcludes,
+                    negativeGuard, tasteInfluence, preRankByFilename, "policy_block",
+                )
+                return@mapNotNull null
+            }
             val song = byFilename[row.filename]
                 ?: row.contentHash.takeIf { it.isNotBlank() }?.let { byHash[it] }
-                ?: return@mapNotNull null
-            if (song.filePath == null) return@mapNotNull null
+                ?: run {
+                    rejectedTraces += rejectedTrace(
+                        row, audioByFilename, totalTasteScores, policyExcludes,
+                        negativeGuard, tasteInfluence, preRankByFilename, "missing_song",
+                    )
+                    return@mapNotNull null
+                }
+            if (song.filePath == null) {
+                rejectedTraces += rejectedTrace(
+                    row, audioByFilename, totalTasteScores, policyExcludes,
+                    negativeGuard, tasteInfluence, preRankByFilename, "no_file",
+                )
+                return@mapNotNull null
+            }
             song to row
         }
-        if (viable.isEmpty()) return emptyList()
+        if (viable.isEmpty()) {
+            emitGenerationTrace(
+                reason = traceReason,
+                tasteInfluence = tasteInfluence,
+                negativeGuard = negativeGuard,
+                candidateCount = candidates.size,
+                selected = emptyList(),
+                audioByFilename = audioByFilename,
+                preRankByFilename = preRankByFilename,
+                totalTasteScores = totalTasteScores,
+                policyExcludes = policyExcludes,
+                rejected = rejectedTraces,
+            )
+            return emptyList()
+        }
 
         // Pure-relevance fast path: lambda >= 0.95 means MMR penalty is
         // effectively zero, skip the batch vector load entirely.
-        if (lambda >= 0.95f) {
-            return viable.asSequence().map { it.first }.take(k).toList()
+        val selected = if (lambda >= 0.95f) {
+            viable.asSequence().map { it.first }.take(k).toList()
+        } else {
+            val candidateHashes = viable.map { it.second.contentHash }.filter { it.isNotBlank() }
+            val vecs = embeddingDb.getVecsByHashes(candidateHashes)
+            if (vecs.isEmpty()) {
+                viable.asSequence().map { it.first }.take(k).toList()
+            } else {
+                val poolEntries = viable.mapNotNull { (song, row) ->
+                    val v = vecs[row.contentHash] ?: return@mapNotNull null
+                    PoolEntry(song = song, similarity = row.similarity, vec = v)
+                }
+                if (poolEntries.isEmpty()) {
+                    viable.asSequence().map { it.first }.take(k).toList()
+                } else {
+                    mmrRerank(poolEntries, k, lambda).map { it.song }
+                }
+            }
         }
+        emitGenerationTrace(
+            reason = traceReason,
+            tasteInfluence = tasteInfluence,
+            negativeGuard = negativeGuard,
+            candidateCount = candidates.size,
+            selected = selected,
+            audioByFilename = audioByFilename,
+            preRankByFilename = preRankByFilename,
+            totalTasteScores = totalTasteScores,
+            policyExcludes = policyExcludes,
+            rejected = rejectedTraces,
+        )
+        return selected
+    }
 
-        val candidateHashes = viable.map { it.second.contentHash }.filter { it.isNotBlank() }
-        val vecs = embeddingDb.getVecsByHashes(candidateHashes)
-        if (vecs.isEmpty()) {
-            // Vector batch fetch failed — fall back to pure relevance.
-            return viable.asSequence().map { it.first }.take(k).toList()
-        }
-
-        // Step 3: MMR rerank.
-        val poolEntries = viable.mapNotNull { (song, row) ->
-            val v = vecs[row.contentHash] ?: return@mapNotNull null
-            PoolEntry(song = song, similarity = row.similarity, vec = v)
-        }
-        if (poolEntries.isEmpty()) return viable.asSequence().map { it.first }.take(k).toList()
-
-        return mmrRerank(poolEntries, k, lambda).map { it.song }
+    private fun rejectedTrace(
+        row: EmbeddingDbFacade.NnResult,
+        audioByFilename: Map<String, Float>,
+        totalTasteScores: Map<String, Float>,
+        policyExcludes: Set<String>,
+        negativeGuard: Float,
+        tasteInfluence: Float,
+        preRankByFilename: Map<String, Int>,
+        rejectionReason: String,
+    ): RecommendationCandidateTrace {
+        val score = totalTasteScores[row.filename] ?: 0f
+        return RecommendationCandidateTrace(
+            filename = row.filename,
+            audioSimilarity = audioByFilename[row.filename] ?: row.similarity,
+            overallScore = score,
+            tier = tasteTier(score),
+            tasteAffinity = UnifiedTasteContract.tasteAdjustment(score, negativeGuard, tasteInfluence),
+            guardDecision = guardDecisionLabel(row.filename, score, policyExcludes, negativeGuard),
+            preDiversityRank = preRankByFilename[row.filename] ?: 0,
+            diversityScore = null,
+            finalRank = null,
+            rejectionReason = rejectionReason,
+        )
     }
 
     /**
@@ -578,6 +752,7 @@ class Recommender(
         softExcludedFilenames: Set<String> = emptySet(),
         totalTasteScores: Map<String, Float> = emptyMap(),
         negativeGuard: Float = TasteEngine.DEFAULT_NEGATIVE_STRENGTH,
+        tasteInfluence: Float = TasteEngine.DEFAULT_TASTE_INFLUENCE,
         frozenZoneSize: Int = 5,
         stableZoneEnd: Int = 15,
     ): List<Song> {
@@ -607,6 +782,7 @@ class Recommender(
                     audioRelevance = sim,
                     totalScore = totalTasteScores[song.filename] ?: 0f,
                     negativeGuard = negativeGuard,
+                    tasteInfluence = tasteInfluence,
                 )
             }.sortedByDescending { it.second }.map { it.first }
         }
@@ -630,6 +806,8 @@ class Recommender(
                 blendedQueryVec = blendedQueryVec,
                 totalTasteScores = totalTasteScores,
                 negativeGuard = negativeGuard,
+                tasteInfluence = tasteInfluence,
+                traceReason = "soft_refresh",
             )
         }.getOrDefault(fluidSrc)
         return RecommendationRefreshFinalizer.finalizeSoftRefresh(
@@ -640,54 +818,6 @@ class Recommender(
             policyExcludes = policyExcludes,
             cooldownFilenames = extraExcludeFilenames,
         ).finalTail
-    }
-
-    suspend fun softRefreshTail(
-        currentSong: Song,
-        oldTail: List<Song>,
-        library: List<Song>,
-        adventurous: Float = 0.8f,
-    ): List<Song> {
-        if (oldTail.size < 5) return oldTail
-        val frozenZone = oldTail.subList(0, minOf(5, oldTail.size))
-        // Stable zone: positions 5..14 re-sorted by similarity to currentSong.
-        // Use sqlite-vec to score the songs in the stable zone, then sort.
-        val stableSrc = if (oldTail.size > 5) oldTail.subList(5, minOf(15, oldTail.size)) else emptyList()
-        val stableSorted: List<Song> = if (stableSrc.isEmpty()) {
-            emptyList()
-        } else {
-            // Query the recommender for top-K similar; intersect with the
-            // current stable zone to derive the new order. Songs that don't
-            // appear in the similarity result fall back to their original
-            // position.
-            val candidates = runCatching {
-                embeddingDb.nearestNeighborsForFilename(
-                    queryFilename = currentSong.filename,
-                    k = 200,
-                    excludeHashes = emptyList(),
-                )
-            }.getOrDefault(emptyList())
-            val orderByFilename: Map<String, Int> = candidates
-                .withIndex()
-                .associate { (i, row) -> row.filename to i }
-            stableSrc.sortedBy { orderByFilename[it.filename] ?: Int.MAX_VALUE }
-        }
-        // Fluid zone: replace 15+ with fresh recommendations excluding
-        // frozen + stable + currentSong.
-        val excludeFns = (frozenZone + stableSorted).map { it.filename }.toMutableSet()
-        excludeFns += currentSong.filename
-        val fluidTarget = (oldTail.size - frozenZone.size - stableSorted.size).coerceAtLeast(0)
-            .coerceAtLeast(20)  // ensure at least 20 fresh songs even if oldTail was short
-        val fluidNew = runCatching {
-            recommendUpcoming(
-                currentSong = currentSong,
-                library = library,
-                k = fluidTarget,
-                adventurous = adventurous,
-                extraExcludeFilenames = excludeFns,
-            )
-        }.getOrDefault(emptyList())
-        return frozenZone + stableSorted + fluidNew
     }
 
     /**
@@ -711,6 +841,7 @@ class Recommender(
         blendedQueryVec: FloatArray? = null,
         totalTasteScores: Map<String, Float> = emptyMap(),
         negativeGuard: Float = TasteEngine.DEFAULT_NEGATIVE_STRENGTH,
+        tasteInfluence: Float = TasteEngine.DEFAULT_TASTE_INFLUENCE,
     ): List<Song> {
         val recs = recommendUpcoming(
             currentSong, library, k, adventurous,
@@ -721,6 +852,8 @@ class Recommender(
             blendedQueryVec = blendedQueryVec,
             totalTasteScores = totalTasteScores,
             negativeGuard = negativeGuard,
+            tasteInfluence = tasteInfluence,
+            traceReason = "play_queue",
         )
         val head = listOf(currentSong)
         val tail = if (recs.isNotEmpty()) {
@@ -729,7 +862,7 @@ class Recommender(
             val policyExcludes = RecommendationPolicy.unionExcludes(
                 hardBlockedFilenames, softExcludedFilenames, dislikedFilenames,
             )
-            val excludes = extraExcludeFilenames + policyExcludes + currentSong.filename
+            val excludes = extraExcludeFilenames + policyExcludes + setOf(currentSong.filename)
             library.asSequence()
                 .filter { it.filePath != null && it.filename !in excludes }
                 .shuffled()

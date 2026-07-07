@@ -531,14 +531,15 @@ class PlaybackEngine(
                     // Push #63: propagate the resulting directScore delta to
                     // the song's top-10 embedding neighbors. Capacitor parity
                     // (engine.js:535).
-                    val delta = after.directScore - before.directScore
-                    if (kotlin.math.abs(delta) > 0.001f) {
-                        scope.launch {
-                            t.propagateSimilarityBoost(
-                                sourceFilename = prevMediaId,
-                                scoreDelta = delta,
-                                reason = if (isSkip) "playback_skip" else "playback_complete",
-                            )
+                    scope.launch {
+                        t.propagatePlaybackTasteChange(
+                            sourceFilename = prevMediaId,
+                            before = before,
+                            after = after,
+                            reason = if (isSkip) "playback_skip" else "playback_complete",
+                        )
+                        if (!isSkip) {
+                            onRecommendationInputsChanged?.invoke("qualified_listen")
                         }
                     }
                     }
@@ -581,6 +582,14 @@ class PlaybackEngine(
                 return
             }
             if (!newMediaId.isNullOrBlank() && prevMediaId != newMediaId) {
+                session?.markPlaybackActivity()
+                when {
+                    newMediaId in prevState.playNextFilenames ->
+                        session?.markExplicitAnchor(newMediaId)
+                    transitionSource == "manual_tap" || transitionSource == "queue_tap" ->
+                        session?.markExplicitAnchor(newMediaId)
+                    else -> session?.clearExplicitAnchor()
+                }
                 val tracker = recentlySurfacedTracker
                 if (tracker != null &&
                     shouldRecordRecommendationCooldown(newMediaId, prevState, transitionSource)
@@ -849,6 +858,9 @@ class PlaybackEngine(
         queueContext: QueueContext = QueueContext.LIBRARY,
     ) {
         pendingTransitionSource = source
+        if (source == "manual_tap" || source == "queue_tap") {
+            songs.getOrNull(startIndex)?.filename?.let { session?.markExplicitAnchor(it) }
+        }
         // Push #69: if the queue is being REPLACED while another song is
         // currently playing, flush evidence for the displaced previous
         // song as a pending snapshot so the listen isn't lost.
@@ -1244,6 +1256,7 @@ class PlaybackEngine(
     /** Jump to a specific index in the current queue. */
     fun playAtIndex(index: Int) {
         pendingTransitionSource = "queue_tap"
+        _state.value.queueFilenames.getOrNull(index)?.let { session?.markExplicitAnchor(it) }
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val count = ctrl.mediaItemCount
@@ -1665,6 +1678,7 @@ class PlaybackEngine(
      */
     fun playNext(song: Song) {
         if (song.filePath.isNullOrEmpty()) return
+        session?.markExplicitAnchor(song.filename)
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val count = ctrl.mediaItemCount

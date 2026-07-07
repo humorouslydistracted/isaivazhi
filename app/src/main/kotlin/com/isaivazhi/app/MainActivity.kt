@@ -130,6 +130,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 private enum class Tab(val title: String) {
     // Phase 4 (2026-06-01): Discover tab removed. AI recommendations
@@ -739,22 +740,35 @@ private fun AppRoot(container: AppContainer) {
     val upNextHardBlocked = remember(tuning.negativeStrength, tasteSignals, decoratedSignals) {
         container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
     }
-    val upNextSoftExcluded = remember(tuning.negativeStrength, tasteSignals, decoratedSignals) {
-        container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength)
-    }
     val upNextPolicyExcludes = remember(
         tuning.negativeStrength,
         tasteSignals,
         decoratedSignals,
-        dislikedSet,
+        cooldownEntries,
     ) {
-        com.isaivazhi.app.engine.RecommendationPolicy.unionExcludes(
-            upNextHardBlocked,
-            upNextSoftExcluded,
-            dislikedSet,
-        )
+        upNextHardBlocked + cooldownEntries.map { it.filename }.toSet()
     }
     var lastBlendInfo by remember { mutableStateOf<com.isaivazhi.app.engine.RecommendationBlendInfo?>(null) }
+    var lastQueueBuildSnapshot by remember {
+        mutableStateOf<com.isaivazhi.app.engine.QueueBuildSnapshot?>(null)
+    }
+    val upNextBlendInfo = remember(lastQueueBuildSnapshot, tuning, lastBlendInfo) {
+        lastQueueBuildSnapshot?.blendInfo ?: if (tuning.manualBlend) {
+            val current = tuning.manualCurrentWeight.coerceIn(0f, 1f)
+            val session = tuning.manualSessionWeight.coerceIn(0f, 1f - current)
+            val profile = (1f - current - session).coerceAtLeast(0f)
+            com.isaivazhi.app.engine.RecommendationBlendInfo(
+                weights = com.isaivazhi.app.engine.Recommender.BlendWeights(
+                    wCurrent = current,
+                    wSession = session,
+                    wProfile = profile,
+                ),
+                label = "manual",
+            )
+        } else {
+            lastBlendInfo
+        }
+    }
     val timelineEvents by container.signalTimeline.events.collectAsState()
     val queueExplanations by container.recommendationExplainability.queueExplanations.collectAsState()
     val sessionBlendIntervals by container.recommendationExplainability.blendIntervals.collectAsState()
@@ -1642,14 +1656,11 @@ private fun AppRoot(container: AppContainer) {
         val hasCachedProfileVec = cachedProfileVec != null
         val rebuilt = kotlinx.coroutines.withContext(Dispatchers.Default) {
             val byFilename = songs.associateBy { it.filename }
+            val overallScores = container.taste.overallScoresByFilename()
             val topPlays = decoratedSignals.rows.entries
                 .asSequence()
-                // Profile anchors use only this song's direct positive evidence
-                // and Favorite prior. Inherited similarity never feeds back.
-                .filter { it.value.breakdown.positiveWeight > 0f }
-                .filter { it.key !in dislikedSet }
-                .filter { it.key !in upNextHardBlocked }
-                .sortedByDescending { it.value.breakdown.positiveWeight }
+                .filter { (filename, _) -> (overallScores[filename] ?: 0f) > 0f }
+                .sortedByDescending { (filename, _) -> overallScores[filename] ?: 0f }
                 .take(30)
                 .toList()
             if (topPlays.isEmpty()) return@withContext null
@@ -1660,8 +1671,8 @@ private fun AppRoot(container: AppContainer) {
             // when existing top-30 songs accumulate significantly more listens,
             // not only when the set of top-30 filenames itself changes.
             val fingerprint = topPlays.take(30)
-                .joinToString("|") { (fn, row) ->
-                    "$fn:${"%.2f".format(row.breakdown.positiveWeight)}"
+                .joinToString("|") { (fn, _) ->
+                    "$fn:${"%.2f".format(overallScores[fn] ?: 0f)}"
                 }
                 .hashCode().toString()
             val current = runCatching { container.preferences.loadProfileVec() }.getOrNull()
@@ -1675,8 +1686,8 @@ private fun AppRoot(container: AppContainer) {
             var totalWeight = 0f
             for (song in anchorSongs) {
                 val v = vecsByHash[song.contentHash ?: continue] ?: continue
-                val row = decoratedSignals.rows[song.filename] ?: continue
-                val w = row.breakdown.positiveWeight
+                val w = (overallScores[song.filename] ?: 0f).coerceIn(0f, 4f)
+                if (w <= 0f) continue
                 for (d in 0 until dim) pv[d] += v[d] * w
                 totalWeight += w
             }
@@ -1692,6 +1703,7 @@ private fun AppRoot(container: AppContainer) {
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             runCatching { container.preferences.saveProfileVec(pv, fingerprint) }
         }
+        container.invalidateRecommendationInputs("profile_vec_rebuild")
         android.util.Log.i("MainActivity", "profileVec rebuilt dim=${pv.size} anchors=$anchorCount fp=$fingerprint")
     }
     // Phase 4 (2026-06-01): the Discover-cache snapshot state, the For You +
@@ -1759,15 +1771,31 @@ private fun AppRoot(container: AppContainer) {
     val refreshInProgress by container.playback.refreshBusy.collectAsState()
     val hardRefreshBlendInfo by container.recommendationRefresh.lastBlendInfo.collectAsState()
     LaunchedEffect(hardRefreshBlendInfo) {
-        if (hardRefreshBlendInfo != null) {
-            lastBlendInfo = hardRefreshBlendInfo
-        }
+        val blend = hardRefreshBlendInfo ?: return@LaunchedEffect
+        lastBlendInfo = blend
+        val buildTuning = container.taste.tuning.value
+        lastQueueBuildSnapshot = com.isaivazhi.app.engine.QueueBuildSnapshot(
+            blendInfo = blend,
+            adventurous = buildTuning.adventurous,
+            tasteInfluence = buildTuning.tasteInfluence,
+            negativeStrength = buildTuning.negativeStrength,
+            negativeFilteredCount = container.taste
+                .hardBlockedFilenamesForPolicy(buildTuning.negativeStrength).size,
+        )
     }
     val continuationBlendInfo by container.queueContinuation.lastBlendInfo.collectAsState()
     LaunchedEffect(continuationBlendInfo) {
-        if (continuationBlendInfo != null) {
-            lastBlendInfo = continuationBlendInfo
-        }
+        val blend = continuationBlendInfo ?: return@LaunchedEffect
+        lastBlendInfo = blend
+        val buildTuning = container.taste.tuning.value
+        lastQueueBuildSnapshot = com.isaivazhi.app.engine.QueueBuildSnapshot(
+            blendInfo = blend,
+            adventurous = buildTuning.adventurous,
+            tasteInfluence = buildTuning.tasteInfluence,
+            negativeStrength = buildTuning.negativeStrength,
+            negativeFilteredCount = container.taste
+                .hardBlockedFilenamesForPolicy(buildTuning.negativeStrength).size,
+        )
     }
     LaunchedEffect(
         playbackState.currentMediaId,
@@ -1805,7 +1833,6 @@ private fun AppRoot(container: AppContainer) {
                     adventurous = tuning.adventurous,
                     dislikedFilenames = dislikedSet,
                     hardBlockedFilenames = upNextHardBlocked,
-                    softExcludedFilenames = upNextSoftExcluded,
                 )
             }.getOrDefault(emptyList())
         }
@@ -1881,7 +1908,6 @@ private fun AppRoot(container: AppContainer) {
         val tuningSnapshot = tuning
         val hardBlockedSnapshot = upNextHardBlocked
         val dislikedSnapshot = dislikedSet
-        val softExcludedSnapshot = upNextSoftExcluded
         coroutineScope.launch(Dispatchers.IO) {
             val tapStart = android.os.SystemClock.elapsedRealtime()
             val hasEmbeddings = embeddingsReadySnapshot
@@ -1895,15 +1921,28 @@ private fun AppRoot(container: AppContainer) {
                         profileVec = profileVecSnapshot,
                         library = songsSnapshot,
                         mode = "play",
-                        sessionBias = tuningSnapshot.sessionBias,
+                        overallScores = container.taste.overallScoresByFilename(),
+                        currentAnchorEligible =
+                            container.session.explicitAnchorFilename.value == song.filename,
+                        manualBlend = tuningSnapshot.manualBlend,
+                        manualCurrentWeight = tuningSnapshot.manualCurrentWeight,
+                        manualSessionWeight = tuningSnapshot.manualSessionWeight,
                     )
                 }.getOrNull()
             } else null
             blendedDetails?.let { details ->
                 kotlinx.coroutines.withContext(Dispatchers.Main) {
-                    lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(
+                    val blendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(
                         details.weights,
                         details.label,
+                    )
+                    lastBlendInfo = blendInfo
+                    lastQueueBuildSnapshot = com.isaivazhi.app.engine.QueueBuildSnapshot(
+                        blendInfo = blendInfo,
+                        adventurous = tuningSnapshot.adventurous,
+                        tasteInfluence = tuningSnapshot.tasteInfluence,
+                        negativeStrength = tuningSnapshot.negativeStrength,
+                        negativeFilteredCount = hardBlockedSnapshot.size,
                     )
                     container.recommendationExplainability.recordBlend(
                         details.weights,
@@ -1931,10 +1970,10 @@ private fun AppRoot(container: AppContainer) {
                         extraExcludeFilenames = recentlySurfacedForTap,
                         hardBlockedFilenames = hardBlockedSnapshot,
                         dislikedFilenames = dislikedSnapshot,
-                        softExcludedFilenames = softExcludedSnapshot,
                         blendedQueryVec = blendedVec,
-                        totalTasteScores = container.taste.directScoresByFilename(),
+                        totalTasteScores = container.taste.overallScoresByFilename(),
                         negativeGuard = tuningSnapshot.negativeStrength,
+                        tasteInfluence = tuningSnapshot.tasteInfluence,
                     )
                     builtAiTail = true
                     queue.drop(1)   // drop the current song; replaceUpcoming dedupes anyway
@@ -1961,7 +2000,7 @@ private fun AppRoot(container: AppContainer) {
                 container.publishRecommendationExplanations(
                     songs = tail,
                     details = blendedDetails,
-                    negativeFilteredCount = hardBlockedSnapshot.size + dislikedSnapshot.size,
+                    negativeFilteredCount = hardBlockedSnapshot.size,
                 )
             }
         }
@@ -2111,44 +2150,71 @@ private fun AppRoot(container: AppContainer) {
         val upcomingFilenames = playbackState.queueFilenames
             .drop(playbackState.queueIndex + 1)
         if (upcomingFilenames.size <= 5) return@LaunchedEffect  // too short to bother
-        val profileVecSnapshot = cachedProfileVec
         val softRefreshResult = kotlinx.coroutines.withContext(Dispatchers.Default) {
+            val livePlayback = container.playback.state.value
+            if (livePlayback.currentMediaId != mediaId) return@withContext null
+            val liveCurrent = songs.firstOrNull { it.filename == mediaId } ?: return@withContext null
+            val liveUpcomingFilenames = livePlayback.queueFilenames
+                .drop(livePlayback.queueIndex + 1)
+            val liveTuning = container.taste.tuning.value
+            val liveHardBlocked = container.taste.hardBlockedFilenamesForPolicy(
+                liveTuning.negativeStrength,
+            )
+            val liveProfileVec = runCatching {
+                container.preferences.loadProfileVec()
+            }.getOrNull()?.vec ?: cachedProfileVec
+            val liveSessionListened = container.session.listened.value
             val byFn = songs.associateBy { it.filename }
-            val upcomingSongs = upcomingFilenames.mapNotNull { byFn[it] }
+            val upcomingSongs = liveUpcomingFilenames.mapNotNull { byFn[it] }
             val recentlySurfacedForSoftRefresh = container.recentlySurfacedTracker.recentlySurfaced()
             val blendedDetails = runCatching {
                 container.recommender.buildBlendedQuery(
-                    currentSongHash = current.contentHash,
-                    sessionListened = sessionListened,
-                    profileVec = profileVecSnapshot,  // Push #68
+                    currentSongHash = liveCurrent.contentHash,
+                    sessionListened = liveSessionListened,
+                    profileVec = liveProfileVec,
                     library = songs,
                     mode = "play",
-                    sessionBias = tuning.sessionBias,
+                    overallScores = container.taste.overallScoresByFilename(),
+                    currentAnchorEligible =
+                        container.session.explicitAnchorFilename.value == liveCurrent.filename,
+                    manualBlend = liveTuning.manualBlend,
+                    manualCurrentWeight = liveTuning.manualCurrentWeight,
+                    manualSessionWeight = liveTuning.manualSessionWeight,
                 )
             }.getOrNull()
             val details = blendedDetails ?: return@withContext null
             val blendedVec = details.queryVector ?: return@withContext null
             val newTail = runCatching {
                 container.recommender.softRefreshUpcomingTail(
-                    currentSong = current,
+                    currentSong = liveCurrent,
                     upcoming = upcomingSongs,
                     library = songs,
                     blendedQueryVec = blendedVec,
-                    adventurous = tuning.adventurous,
-                    extraExcludeFilenames = upcomingFilenames.toSet() + recentlySurfacedForSoftRefresh,
-                    hardBlockedFilenames = upNextHardBlocked,
-                    dislikedFilenames = dislikedSet,
-                    softExcludedFilenames = upNextSoftExcluded,
-                    totalTasteScores = container.taste.directScoresByFilename(),
-                    negativeGuard = tuning.negativeStrength,
+                    adventurous = liveTuning.adventurous,
+                    extraExcludeFilenames = liveUpcomingFilenames.toSet() + recentlySurfacedForSoftRefresh,
+                    hardBlockedFilenames = liveHardBlocked,
+                    totalTasteScores = container.taste.overallScoresByFilename(),
+                    negativeGuard = liveTuning.negativeStrength,
+                    tasteInfluence = liveTuning.tasteInfluence,
                 )
             }.getOrDefault(emptyList())
-            Triple(details, upcomingSongs, newTail)
+            Triple(details, upcomingSongs, newTail to liveTuning)
         } ?: return@LaunchedEffect
-        val (blendedDetails, upcomingSongs, newTail) = softRefreshResult
-        lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(
+        val (blendedDetails, upcomingSongs, tailAndTuning) = softRefreshResult
+        val (newTail, buildTuning) = tailAndTuning
+        val blendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(
             blendedDetails.weights,
             blendedDetails.label,
+        )
+        lastBlendInfo = blendInfo
+        val negativeFilteredCount = container.taste
+            .hardBlockedFilenamesForPolicy(buildTuning.negativeStrength).size
+        lastQueueBuildSnapshot = com.isaivazhi.app.engine.QueueBuildSnapshot(
+            blendInfo = blendInfo,
+            adventurous = buildTuning.adventurous,
+            tasteInfluence = buildTuning.tasteInfluence,
+            negativeStrength = buildTuning.negativeStrength,
+            negativeFilteredCount = negativeFilteredCount,
         )
         container.recommendationExplainability.recordBlend(
             blendedDetails.weights,
@@ -2159,11 +2225,14 @@ private fun AppRoot(container: AppContainer) {
                 newTail,
                 newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
             )
-            container.publishRecommendationExplanations(
-                songs = newTail,
-                details = blendedDetails,
-                negativeFilteredCount = upNextHardBlocked.size + dislikedSet.size,
-            )
+            coroutineScope.launch {
+                container.publishRecommendationExplanations(
+                    songs = newTail,
+                    details = blendedDetails,
+                    negativeFilteredCount = negativeFilteredCount,
+                )
+            }
+            container.scheduleBackgroundCacheRefresh("soft_refresh")
             android.util.Log.i(
                 "MainActivity",
                 "soft-refresh applied to upcoming tail: size=${newTail.size}"
@@ -2550,20 +2619,27 @@ private fun AppRoot(container: AppContainer) {
                                     container.toaster.show("AI is getting ready…")
                                     return@UpNextScreen
                                 }
-                                coroutineScope.launch { container.preferences.setRecMode(aiMode) }
+                                coroutineScope.launch {
+                                    container.preferences.setRecMode(aiMode)
+                                    container.invalidateRecommendationInputs("rec_mode_toggle")
+                                }
                                 val mediaId = playbackState.currentMediaId ?: return@UpNextScreen
                                 val current = songs.firstOrNull { it.filename == mediaId } ?: return@UpNextScreen
                                 coroutineScope.launch {
-                                    // Push #70: AI/Shuffle toggle on UpNext preserves Play Next.
                                     val playNextSet = playbackState.playNextFilenames
                                     val byFn = songs.associateBy { it.filename }
                                     val playNextSongs = playNextSet.mapNotNull { byFn[it] }
                                     val recentlySurfacedForToggle = container.recentlySurfacedTracker.recentlySurfaced()
-                                    val excludeFns = playNextSet + mediaId + recentlySurfacedForToggle
-                                    // Push #72: AI/Shuffle toggle uses the
-                                    // blended query vec (mode=refresh) so
-                                    // recommendations reflect current+session
-                                    // +profile blend, not just current-song.
+                                    val excludeFns = com.isaivazhi.app.engine.QueueContinuationPolicy
+                                        .recommendExcludeFilenames(
+                                            playNextFilenames = playNextSet,
+                                            currentFilename = mediaId,
+                                            recentlySurfaced = recentlySurfacedForToggle,
+                                        )
+                                    val buildTuning = container.taste.tuning.value
+                                    val policyExcludes = container.taste.hardBlockedFilenamesForPolicy(
+                                        buildTuning.negativeStrength,
+                                    )
                                     val blendedDetails = runCatching {
                                         container.recommender.buildBlendedQuery(
                                             currentSongHash = current.contentHash,
@@ -2571,52 +2647,77 @@ private fun AppRoot(container: AppContainer) {
                                             profileVec = cachedProfileVec,
                                             library = songs,
                                             mode = "refresh",
-                                            sessionBias = tuning.sessionBias,
+                                            overallScores = container.taste.overallScoresByFilename(),
+                                            currentAnchorEligible =
+                                                container.session.explicitAnchorFilename.value == current.filename,
+                                            manualBlend = buildTuning.manualBlend,
+                                            manualCurrentWeight = buildTuning.manualCurrentWeight,
+                                            manualSessionWeight = buildTuning.manualSessionWeight,
                                         )
                                     }.getOrNull()
-                                    blendedDetails?.let { details ->
-                                        lastBlendInfo = com.isaivazhi.app.engine.RecommendationBlendInfo(
-                                            details.weights,
-                                            details.label,
+                                    val blendInfo = blendedDetails?.let {
+                                        com.isaivazhi.app.engine.RecommendationBlendInfo(
+                                            it.weights,
+                                            it.label,
                                         )
+                                    }
+                                    blendInfo?.let {
+                                        lastBlendInfo = it
                                         container.recommendationExplainability.recordBlend(
-                                            details.weights,
+                                            it.weights,
                                             "Queue mode changed",
                                         )
                                     }
                                     val blendedVec = blendedDetails?.queryVector
-                                    val newTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
+                                    val candidateTail: List<Song> = if (aiMode && (embeddingsRowCount ?: 0) > 0) {
                                         runCatching {
                                             container.recommender.recommendUpcoming(
                                                 current, songs, k = 50,
-                                                adventurous = tuning.adventurous,
+                                                adventurous = buildTuning.adventurous,
                                                 extraExcludeFilenames = excludeFns,
-                                                hardBlockedFilenames = upNextHardBlocked,
-                                                dislikedFilenames = dislikedSet,
-                                                softExcludedFilenames = upNextSoftExcluded,
+                                                hardBlockedFilenames = policyExcludes,
                                                 blendedQueryVec = blendedVec,
-                                                totalTasteScores = container.taste.directScoresByFilename(),
-                                                negativeGuard = tuning.negativeStrength,
+                                                totalTasteScores = container.taste.overallScoresByFilename(),
+                                                negativeGuard = buildTuning.negativeStrength,
+                                                tasteInfluence = buildTuning.tasteInfluence,
+                                                traceReason = "mode_toggle",
                                             )
                                         }.getOrDefault(emptyList())
                                     } else {
                                         songs.filter { it.filePath != null && it.filename !in excludeFns }
                                             .shuffled().take(50)
                                     }
-                                    val finalUpcoming = playNextSongs + newTail
+                                    val finalResult = com.isaivazhi.app.engine.RecommendationRefreshFinalizer
+                                        .finalizeHardRefresh(
+                                            candidateTail = candidateTail,
+                                            playNextSongs = playNextSongs,
+                                            playNextFilenames = playNextSet,
+                                            currentFilename = mediaId,
+                                            policyExcludes = policyExcludes,
+                                            cooldownFilenames = recentlySurfacedForToggle,
+                                        )
                                     android.util.Log.i(
                                         "QueueOp",
-                                        "UpNext toggle aiMode=$aiMode: blend=${blendedDetails?.label ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${newTail.size} new"
+                                        "UpNext toggle aiMode=$aiMode: blend=${blendInfo?.label ?: "n/a"} preserved ${playNextSongs.size} Play Next + ${finalResult.finalTail.size} new"
                                     )
                                     container.playback.replaceUpcoming(
-                                        newUpcoming = finalUpcoming,
+                                        newUpcoming = finalResult.finalUpcoming,
                                         newContext = com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED,
                                     )
+                                    if (blendInfo != null) {
+                                        lastQueueBuildSnapshot = com.isaivazhi.app.engine.QueueBuildSnapshot(
+                                            blendInfo = blendInfo,
+                                            adventurous = buildTuning.adventurous,
+                                            tasteInfluence = buildTuning.tasteInfluence,
+                                            negativeStrength = buildTuning.negativeStrength,
+                                            negativeFilteredCount = policyExcludes.size,
+                                        )
+                                    }
                                     if (aiMode && blendedDetails != null) {
                                         container.publishRecommendationExplanations(
-                                            songs = newTail,
+                                            songs = finalResult.finalTail,
                                             details = blendedDetails,
-                                            negativeFilteredCount = upNextHardBlocked.size + dislikedSet.size,
+                                            negativeFilteredCount = policyExcludes.size,
                                         )
                                     }
                                 }
@@ -2630,9 +2731,10 @@ private fun AppRoot(container: AppContainer) {
                             refreshInProgress = refreshInProgress ||
                                 (playbackState.currentMediaId != null && !startupRefreshReady),
                             explanations = queueExplanations,
-                            blendInfo = lastBlendInfo,
-                            adventurous = tuning.adventurous,
-                            negativeGuard = tuning.negativeStrength,
+                            blendInfo = upNextBlendInfo,
+                            adventurous = lastQueueBuildSnapshot?.adventurous ?: tuning.adventurous,
+                            negativeGuard = lastQueueBuildSnapshot?.negativeStrength ?: tuning.negativeStrength,
+                            tasteInfluence = lastQueueBuildSnapshot?.tasteInfluence ?: tuning.tasteInfluence,
                             playNextFilenames = playbackState.playNextFilenames,
                             contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
                         )
@@ -2980,7 +3082,6 @@ private fun AppRoot(container: AppContainer) {
             signals = tasteSignals,
             decoratedSignals = decoratedSignals,
             upNextHardBlockedCount = upNextHardBlocked.size,
-            upNextSoftExcludedCount = upNextSoftExcluded.size,
             upNextExcludedFilenames = upNextPolicyExcludes,
             favoritesSet = favoritesSet,
             dislikedSet = dislikedSet,
@@ -2988,7 +3089,7 @@ private fun AppRoot(container: AppContainer) {
             sessionBlendIntervals = sessionBlendIntervals,
             engineSnapshot = buildEngineSnapshot(
                 tuning = tuning,
-                lastBlend = lastBlendInfo,
+                lastBlend = upNextBlendInfo,
                 queueSize = playbackState.queueFilenames.size,
                 aiMode = effectiveRecMode,
                 embeddingsCovered = embeddedFilenames.size,
@@ -3001,9 +3102,19 @@ private fun AppRoot(container: AppContainer) {
                 container.setTasteAdventurous(it)
                 container.toaster.show("Adventurous: ${(it * 100).toInt()}%")
             },
-            onSessionBiasChange = {
-                container.setTasteSessionBias(it)
-                container.toaster.show("Session weight: ${(it * 100).toInt()}%")
+            onTasteInfluenceChange = {
+                container.setTasteInfluence(it)
+                container.toaster.show("Taste influence: ${(it * 100).toInt()}%")
+            },
+            onManualBlendChange = { current, session ->
+                container.setManualTasteBlend(current, session)
+                container.toaster.show("Manual blend applied")
+                refreshUpcomingWithAI()
+            },
+            onBlendAutoReset = {
+                container.resetTasteBlendToAuto()
+                container.toaster.show("Blend returned to Auto")
+                refreshUpcomingWithAI()
             },
             onNegativeStrengthChange = {
                 container.setTasteNegativeStrength(it)
@@ -3013,9 +3124,9 @@ private fun AppRoot(container: AppContainer) {
                 container.resetTasteAdventurous()
                 container.toaster.show("Adventurous reset to ${(TasteEngine.DEFAULT_ADVENTUROUS * 100).toInt()}%")
             },
-            onSessionBiasReset = {
-                container.resetTasteSessionBias()
-                container.toaster.show("Session weight reset to ${(TasteEngine.DEFAULT_SESSION_BIAS * 100).toInt()}%")
+            onTasteInfluenceReset = {
+                container.resetTasteInfluence()
+                container.toaster.show("Taste influence reset to ${(TasteEngine.DEFAULT_TASTE_INFLUENCE * 100).toInt()}%")
             },
             onNegativeStrengthReset = {
                 container.resetTasteNegativeStrength()
@@ -3889,7 +4000,18 @@ private fun ingestPendingEvidence(
     // A transition-buffer action can prove user intent. A bare snapshot
     // cannot, so it remains neutral recovery evidence.
     val source = authoritativeSource.ifBlank { "background_recovery" }
-    val (before, after) = container.taste.recordPlaybackEvent(mediaId, frac, source, playbackInstanceId)
+    val stableEventId = if (playbackInstanceId > 0L) {
+        "ingest_inst_$playbackInstanceId"
+    } else {
+        ""
+    }
+    val (before, after) = container.taste.recordPlaybackEvent(
+        mediaId,
+        frac,
+        source,
+        playbackInstanceId,
+        stableEventId,
+    )
     if (before == after) return
     val isSkip = frac < com.isaivazhi.app.engine.TasteEngine.SKIP_THRESHOLD
     val cls = if (isSkip) com.isaivazhi.app.engine.SignalTimelineEngine.Classification.SKIP
@@ -3939,11 +4061,16 @@ private fun ingestPendingEvidence(
                 } else 0f,
         )
     )
-    val delta = after.directScore - before.directScore
-    if (kotlin.math.abs(delta) > 0.001f) {
-        CoroutineScope(Dispatchers.IO).launch {
-            runCatching {
-                container.taste.propagateSimilarityBoost(mediaId, delta, "${source}_$origin")
+    CoroutineScope(Dispatchers.IO).launch {
+        runCatching {
+            container.taste.propagatePlaybackTasteChange(
+                sourceFilename = mediaId,
+                before = before,
+                after = after,
+                reason = "${source}_$origin",
+            )
+            if (frac >= com.isaivazhi.app.engine.TasteEngine.SKIP_THRESHOLD) {
+                container.scheduleBackgroundCacheRefresh("qualified_listen_ingest")
             }
         }
     }
@@ -3952,7 +4079,7 @@ private fun ingestPendingEvidence(
     // collectively after its loop, but bumping per-ingest ensures
     // snapshot-only ingests (Case C) also advance it.
     if (playbackInstanceId > 0L) {
-        CoroutineScope(Dispatchers.IO).launch {
+        runBlocking {
             runCatching { container.preferences.saveIngestWatermark(playbackInstanceId) }
         }
     }
@@ -3996,13 +4123,16 @@ private fun buildEngineSnapshot(
         }
         lastRefreshLabel = "Last refresh: ${lastBlend.label} (${pct(currentPortion)} / ${pct(sessionPortion)} / ${pct(profilePortion)})"
     } else {
-        currentPortion = (1f - tuning.sessionBias).coerceIn(0f, 1f)
-        sessionPortion = (tuning.sessionBias * 0.7f).coerceIn(0f, 1f)
-        profilePortion = (tuning.sessionBias * 0.3f).coerceIn(0f, 1f)
-        mode = when {
-            tuning.sessionBias < 0.2f -> "Current-song heavy"
-            tuning.sessionBias > 0.7f -> "Strong session blend"
-            else -> "Balanced (no Up Next refresh yet)"
+        if (tuning.manualBlend) {
+            currentPortion = tuning.manualCurrentWeight
+            sessionPortion = tuning.manualSessionWeight
+            profilePortion = (1f - currentPortion - sessionPortion).coerceAtLeast(0f)
+            mode = "Manual (no Up Next refresh yet)"
+        } else {
+            currentPortion = 0f
+            sessionPortion = 0f
+            profilePortion = 1f
+            mode = "Auto (no Up Next refresh yet)"
         }
         lastRefreshLabel = null
     }

@@ -6,37 +6,28 @@ package com.isaivazhi.app.engine
  */
 object RecommendationPolicy {
 
-    const val HARD_EXCLUDE_SHARE = 0.18f
-    const val HARD_EXCLUDE_FLOOR = 1.5f
     /**
      * Learned negatives are blocked when their guarded magnitude reaches the
      * unified threshold. A higher Negative Guard can only add blocks.
      */
     fun hardBlockedFilenames(
-        directScoresByFilename: Map<String, Float>,
+        overallScoresByFilename: Map<String, Float>,
         negativeStrength: Float,
-        share: Float = HARD_EXCLUDE_SHARE,
-        floor: Float = HARD_EXCLUDE_FLOOR,
     ): Set<String> {
-        if (negativeStrength <= 0f || directScoresByFilename.isEmpty()) return emptySet()
-        return directScoresByFilename
+        if (negativeStrength <= 0f || overallScoresByFilename.isEmpty()) return emptySet()
+        return overallScoresByFilename
             .filterValues {
                 UnifiedTasteContract.isLearnedNegativeBlocked(it, negativeStrength)
             }
             .keys
     }
 
-    /** Songs with directScore below -[0.5 × negativeStrength]. */
-    fun softExcludedFilenames(
-        directScoresByFilename: Map<String, Float>,
-        negativeStrength: Float,
-    ): Set<String> = emptySet()
-
+    /** Union of all Up Next exclusion sets passed into [Recommender]. */
     fun unionExcludes(
-        hardBlocked: Set<String>,
-        softExcluded: Set<String>,
-        disliked: Set<String>,
-    ): Set<String> = hardBlocked + softExcluded + disliked
+        hardBlockedFilenames: Set<String>,
+        softExcludedFilenames: Set<String> = emptySet(),
+        dislikedFilenames: Set<String> = emptySet(),
+    ): Set<String> = hardBlockedFilenames + softExcludedFilenames + dislikedFilenames
 
     /** Drop songs excluded by current Up Next policy (cache refresh, soft refresh). */
     fun filterSongsForUpNext(songs: List<Song>, policyExcludes: Set<String>): List<Song> {

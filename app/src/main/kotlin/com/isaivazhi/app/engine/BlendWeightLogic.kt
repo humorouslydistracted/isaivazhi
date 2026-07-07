@@ -19,40 +19,49 @@ internal object BlendWeightLogic {
         hasSession: Boolean,
         hasProfile: Boolean,
     ): Weights {
-        if (mode == "refresh") {
-            if (hasSession && hasProfile && hasCurrent) return Weights(0.30f, 0.40f, 0.30f)
-            if (hasSession && hasProfile) return Weights(0f, 0.60f, 0.40f)
-            if (hasSession && hasCurrent) return Weights(0.30f, 0.70f, 0f)
-            if (hasSession) return Weights(0f, 1.0f, 0f)
-            if (hasProfile && hasCurrent) return Weights(0.40f, 0f, 0.60f)
-            if (hasProfile) return Weights(0f, 0f, 1.0f)
-            return Weights(1.0f, 0f, 0f)
+        @Suppress("UNUSED_VARIABLE")
+        val ignoredMode = mode
+        val progress = (nListened / 10f).coerceIn(0f, 1f)
+        val current = if (hasCurrent) 0.60f * (1f - progress) else 0f
+        val remaining = 1f - current
+        val session = if (hasSession) remaining * 0.60f * progress else 0f
+        val profile = if (hasProfile) (remaining - session).coerceAtLeast(0f) else 0f
+        return normalizeAvailable(current, session, profile, hasCurrent, hasSession, hasProfile)
+    }
+
+    fun computeManual(
+        currentWeight: Float,
+        sessionWeight: Float,
+        hasCurrent: Boolean,
+        hasSession: Boolean,
+        hasProfile: Boolean,
+    ): Weights {
+        val current = currentWeight.coerceIn(0f, 1f)
+        val session = sessionWeight.coerceIn(0f, 1f - current)
+        val profile = (1f - current - session).coerceAtLeast(0f)
+        return normalizeAvailable(current, session, profile, hasCurrent, hasSession, hasProfile)
+    }
+
+    private fun normalizeAvailable(
+        current: Float,
+        session: Float,
+        profile: Float,
+        hasCurrent: Boolean,
+        hasSession: Boolean,
+        hasProfile: Boolean,
+    ): Weights {
+        var c = if (hasCurrent) current else 0f
+        var s = if (hasSession) session else 0f
+        var p = if (hasProfile) profile else 0f
+        var total = c + s + p
+        if (total <= 0f) {
+            c = if (hasCurrent) 1f else 0f
+            s = if (!hasCurrent && hasSession) 1f else 0f
+            p = if (!hasCurrent && !hasSession && hasProfile) 1f else 0f
+            total = c + s + p
         }
-        if (!hasCurrent) {
-            return Weights(
-                0f,
-                if (hasSession) 0.6f else 0f,
-                if (hasProfile) (if (hasSession) 0.4f else 1f) else 0f,
-            )
-        }
-        if (!hasSession && !hasProfile) return Weights(1.0f, 0f, 0f)
-        if (!hasSession) {
-            val t = (nListened / 8f).coerceAtMost(1f)
-            val wCurrent = 0.5f + 0.1f * t
-            return Weights(wCurrent, 0f, 1f - wCurrent)
-        }
-        if (!hasProfile) {
-            val t = (nListened / 10f).coerceAtMost(1f)
-            val wCurrent = 0.6f - 0.2f * t
-            return Weights(wCurrent, 1f - wCurrent, 0f)
-        }
-        val t = (nListened / 10f).coerceAtMost(1f)
-        var wCurrent = 0.50f - 0.12f * t
-        var wSession = 0.52f * t
-        var wProfile = 1f - wCurrent - wSession
-        if (wProfile < 0.08f) wProfile = 0.08f
-        val total = wCurrent + wSession + wProfile
-        return Weights(wCurrent / total, wSession / total, wProfile / total)
+        return if (total > 0f) Weights(c / total, s / total, p / total)
+        else Weights(0f, 0f, 0f)
     }
 
     fun compute(

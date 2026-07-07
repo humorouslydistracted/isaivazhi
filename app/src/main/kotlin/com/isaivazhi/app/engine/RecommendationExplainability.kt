@@ -44,11 +44,14 @@ data class RecommendationExplanation(
             if (relevanceRank > 0 && finalRank > 0 && relevanceRank - finalRank >= 3) {
                 return RecommendationInfluence.DIVERSITY
             }
-            val best = maxOf(currentContribution, sessionContribution, profileContribution)
+            val current = kotlin.math.abs(currentContribution)
+            val session = kotlin.math.abs(sessionContribution)
+            val profile = kotlin.math.abs(profileContribution)
+            val best = maxOf(current, session, profile)
             if (best <= 0f) return RecommendationInfluence.NONE
             return when (best) {
-                currentContribution -> RecommendationInfluence.CURRENT
-                sessionContribution -> RecommendationInfluence.SESSION
+                current -> RecommendationInfluence.CURRENT
+                session -> RecommendationInfluence.SESSION
                 else -> RecommendationInfluence.PROFILE
             }
         }
@@ -57,9 +60,9 @@ data class RecommendationExplanation(
         get() = relevanceRank > 0 && finalRank > 0 && relevanceRank - finalRank >= 3
 
     fun normalizedBlendContributions(): Triple<Int, Int, Int> {
-        val current = currentContribution.coerceAtLeast(0f)
-        val session = sessionContribution.coerceAtLeast(0f)
-        val profile = profileContribution.coerceAtLeast(0f)
+        val current = kotlin.math.abs(currentContribution)
+        val session = kotlin.math.abs(sessionContribution)
+        val profile = kotlin.math.abs(profileContribution)
         val total = current + session + profile
         if (total <= 0f) return Triple(0, 0, 0)
         val c = (current / total * 100f).toInt()
@@ -72,6 +75,29 @@ data class ExplainedRecommendationResult(
     val songs: List<Song>,
     val explanations: List<RecommendationExplanation>,
     val blendInfo: RecommendationBlendInfo?,
+)
+
+data class RecommendationCandidateTrace(
+    val filename: String,
+    val audioSimilarity: Float,
+    val overallScore: Float,
+    val tier: String,
+    val tasteAffinity: Float,
+    val guardDecision: String,
+    val preDiversityRank: Int,
+    val diversityScore: Float?,
+    val finalRank: Int?,
+    val rejectionReason: String?,
+)
+
+data class RecommendationGenerationTrace(
+    val timestamp: Long = System.currentTimeMillis(),
+    val reason: String,
+    val tasteInfluence: Float,
+    val negativeGuard: Float,
+    val candidateCount: Int,
+    val selectedCount: Int,
+    val candidates: List<RecommendationCandidateTrace>,
 )
 
 data class SessionBlendInterval(
@@ -96,6 +122,16 @@ class RecommendationExplainabilityEngine {
         MutableStateFlow<List<RecommendationExplanation>>(emptyList())
     val queueExplanations: StateFlow<List<RecommendationExplanation>> =
         _queueExplanations.asStateFlow()
+
+    private val _generationTraces =
+        MutableStateFlow<List<RecommendationGenerationTrace>>(emptyList())
+    val generationTraces: StateFlow<List<RecommendationGenerationTrace>> =
+        _generationTraces.asStateFlow()
+
+    @Synchronized
+    fun recordGeneration(trace: RecommendationGenerationTrace) {
+        _generationTraces.value = (listOf(trace) + _generationTraces.value).take(10)
+    }
 
     @Synchronized
     fun recordBlend(weights: Recommender.BlendWeights, reason: String, now: Long = System.currentTimeMillis()) {
@@ -139,5 +175,6 @@ class RecommendationExplainabilityEngine {
 
     fun resetSession() {
         _blendIntervals.value = emptyList()
+        _generationTraces.value = emptyList()
     }
 }

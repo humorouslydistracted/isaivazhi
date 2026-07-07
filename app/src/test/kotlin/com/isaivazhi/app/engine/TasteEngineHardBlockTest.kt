@@ -34,4 +34,13 @@ class TasteEngineHardBlockTest {
         val half = RecommendationPolicy.hardBlockedFilenames(scores, 0.5f)
         assertTrue(half.size <= full.size)
     }
+
+    /** Disliked-neighbor halos move overall score, not directScore — policy must use score. */
+    @Test
+    fun overallScore_negativeFromSimilarity_only_canBlockAtFullGuard() {
+        val overall = mapOf("halo" to -0.30f)
+        val directOnly = mapOf("halo" to 0f)
+        assertTrue("halo" in RecommendationPolicy.hardBlockedFilenames(overall, 1f))
+        assertTrue("halo" !in RecommendationPolicy.hardBlockedFilenames(directOnly, 1f))
+    }
 }

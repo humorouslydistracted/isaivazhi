@@ -37,10 +37,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -87,6 +84,7 @@ fun UpNextScreen(
     blendInfo: RecommendationBlendInfo? = null,
     adventurous: Float = 0.8f,
     negativeGuard: Float = 0.5f,
+    tasteInfluence: Float = 0.3f,
     playNextFilenames: Set<String> = emptySet(),
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
@@ -101,6 +99,16 @@ fun UpNextScreen(
     val upcoming = if (safeIndex + 1 < queue.size) queue.subList(safeIndex + 1, queue.size) else emptyList()
     val visiblePrev = previously.takeLast(10)
     val hiddenPrevCount = (previously.size - visiblePrev.size).coerceAtLeast(0)
+    val queueExplanations = remember(queue, explanations) {
+        alignQueueExplanations(queue, explanations)
+    }
+    val upcomingExplanations = remember(queueExplanations, safeIndex) {
+        if (safeIndex + 1 >= queueExplanations.size) {
+            emptyList()
+        } else {
+            queueExplanations.subList(safeIndex + 1, queueExplanations.size)
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         // Single control row: AI/Shuffle chips + count + Refresh.
@@ -153,10 +161,9 @@ fun UpNextScreen(
                 blendInfo = blendInfo,
                 adventurous = adventurous,
                 negativeGuard = negativeGuard,
+                tasteInfluence = tasteInfluence,
                 filteredCount = explanations.maxOfOrNull { it.negativeFilteredCount } ?: 0,
-                queueExplanations = queue.mapNotNull { song ->
-                    explanations.firstOrNull { it.filename == song.filename }
-                },
+                queueExplanations = upcomingExplanations.filterNotNull(),
             )
         }
 
@@ -240,7 +247,7 @@ fun UpNextScreen(
                         onTap = { onJumpTo(realIndex) },
                         onLongPress = { onLongPress(song) },
                         onRemove = null,
-                        explanation = explanations.firstOrNull { it.filename == song.filename },
+                        explanation = queueExplanations.getOrNull(realIndex),
                     )
                 }
             }
@@ -255,7 +262,7 @@ fun UpNextScreen(
                         onTap = { onJumpTo(safeIndex) },
                         onLongPress = { onLongPress(current) },
                         onRemove = null,
-                        explanation = explanations.firstOrNull { it.filename == current.filename },
+                        explanation = queueExplanations.getOrNull(safeIndex),
                     )
                 }
             }
@@ -301,7 +308,7 @@ fun UpNextScreen(
                             onTap = { onJumpTo(realIndex) },
                             onLongPress = { onLongPress(song) },
                             onRemove = { onRemove(realIndex) },
-                            explanation = explanations.firstOrNull { it.filename == song.filename },
+                            explanation = queueExplanations.getOrNull(realIndex),
                             fallbackLabel = if (song.filename in playNextFilenames) "Play Next" else null,
                             isDragging = isDragging,
                             dragHandle = {
@@ -384,6 +391,7 @@ private fun BlendSummary(
     blendInfo: RecommendationBlendInfo,
     adventurous: Float,
     negativeGuard: Float,
+    tasteInfluence: Float,
     filteredCount: Int,
     queueExplanations: List<RecommendationExplanation>,
 ) {
@@ -421,8 +429,8 @@ private fun BlendSummary(
             }
         }
         Text(
-            text = "Diversity ${(adventurous * 100).toInt()}% • Guard ${(negativeGuard * 100).toInt()}%" +
-                if (filteredCount > 0) " • $filteredCount filtered" else "",
+            text = "Taste ${(tasteInfluence * 100).toInt()}% • Diversity ${(adventurous * 100).toInt()}% • Guard ${(negativeGuard * 100).toInt()}%" +
+                if (filteredCount > 0) " • $filteredCount taste-blocked" else "",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -491,7 +499,7 @@ private fun LegacyBlendSummary(
         )
         Text(
             text = "Diversity ${(adventurous * 100).toInt()}%  •  Negative guard ${(negativeGuard * 100).toInt()}%" +
-                if (filteredCount > 0) "  •  $filteredCount filtered" else "",
+                if (filteredCount > 0) "  •  $filteredCount taste-blocked" else "",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -552,10 +560,6 @@ private fun QueueRow(
     fallbackLabel: String? = null,
     modifier: Modifier = Modifier,
 ) {
-    var showWhy by remember(explanation?.itemId) { mutableStateOf(false) }
-    if (showWhy && explanation != null) {
-        WhySongDialog(explanation = explanation, onDismiss = { showWhy = false })
-    }
     val isCurrent = role == QueueRole.Current
     val rowBg = when {
         isDragging -> MaterialTheme.colorScheme.surfaceVariant
@@ -609,24 +613,6 @@ private fun QueueRow(
                 )
             }
         }
-        if (explanation != null) {
-            val influenceColor = when (explanation.dominantInfluence) {
-                RecommendationInfluence.CURRENT -> CurrentInfluenceColor
-                RecommendationInfluence.SESSION -> SessionInfluenceColor
-                RecommendationInfluence.PROFILE -> ProfileInfluenceColor
-                RecommendationInfluence.DIVERSITY -> DiversityInfluenceColor
-                RecommendationInfluence.NONE -> MaterialTheme.colorScheme.outline
-            }
-            Box(
-                modifier = Modifier
-                    .size(22.dp)
-                    .clip(CircleShape)
-                    .clickable { showWhy = true },
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(Modifier.size(9.dp).clip(CircleShape).background(influenceColor))
-            }
-        }
         if (onRemove != null) {
             IconButton(onClick = onRemove) {
                 Icon(Icons.Filled.Close, contentDescription = "Remove from queue",
@@ -653,7 +639,7 @@ private fun WhySongDialog(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Current $current%  •  Session $session%  •  Long-term $profile%")
                 Text(
-                    "Own ${signed(explanation.directScore)}  •  Similar ${signed(explanation.similarityScore)}  •  Total ${signed(explanation.totalScore)}"
+                    "Own ${signed(explanation.directScore)}  •  Halo ${signed(explanation.similarityScore)}  •  Total ${signed(explanation.totalScore)}"
                 )
                 Text("Taste adjustment ${signed(explanation.tasteAdjustment)}")
                 if (explanation.isDiversePick) {
@@ -671,3 +657,23 @@ private fun WhySongDialog(
 
 private fun signed(value: Float): String =
     (if (value >= 0f) "+" else "") + "%.2f".format(value)
+
+private fun alignQueueExplanations(
+    queue: List<Song>,
+    explanations: List<RecommendationExplanation>,
+): List<RecommendationExplanation?> {
+    if (queue.isEmpty()) return emptyList()
+    if (explanations.isEmpty()) return List(queue.size) { null }
+    val aligned = ArrayList<RecommendationExplanation?>(queue.size)
+    var explanationIndex = 0
+    for (song in queue) {
+        val next = explanations.getOrNull(explanationIndex)
+        if (next != null && next.filename == song.filename) {
+            aligned += next
+            explanationIndex++
+        } else {
+            aligned += null
+        }
+    }
+    return aligned
+}

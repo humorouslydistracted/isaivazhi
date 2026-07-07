@@ -15,10 +15,10 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 /**
- * Disliked songs — symmetric to FavoritesEngine. Disliked tracks are hidden
- * from "For You" / "Because You Played" / "Unexplored" sections and bias the
- * recommender away from their embedding. Toggling Dislike also clears
- * Favorite (mutually exclusive).
+ * Explicit Dislike storage. The flag contributes the current Dislike prior
+ * to overall score and remains visible after the score recovers. Recommendation
+ * eligibility is decided from overall score; Favorite and Dislike are mutually
+ * exclusive.
  */
 class DislikedEngine(private val appContext: Context) {
 

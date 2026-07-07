@@ -104,10 +104,29 @@ class RecommendationRefreshCoordinator(
                 newUpcoming = finalResult.finalUpcoming,
                 newContext = PlaybackEngine.QueueContext.AI_RECOMMENDED,
             )
-            if (cachedTail.explanations.isNotEmpty()) {
-                container.recommendationExplainability
-                    .setQueueExplanations(cachedTail.explanations)
-                container.preferences.saveQueueExplanations(cachedTail.explanations)
+            val tuning = container.taste.tuning.value
+            val blendedDetails = runCatching {
+                container.recommender.buildBlendedQuery(
+                    currentSongHash = current.contentHash,
+                    sessionListened = container.session.listened.value,
+                    profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec,
+                    library = songs,
+                    mode = "refresh",
+                    overallScores = container.taste.overallScoresByFilename(),
+                    currentAnchorEligible =
+                        container.session.explicitAnchorFilename.value == current.filename,
+                    manualBlend = tuning.manualBlend,
+                    manualCurrentWeight = tuning.manualCurrentWeight,
+                    manualSessionWeight = tuning.manualSessionWeight,
+                )
+            }.getOrNull()
+            if (blendedDetails != null) {
+                container.publishRecommendationExplanations(
+                    songs = finalResult.finalTail,
+                    details = blendedDetails,
+                    negativeFilteredCount = container.taste
+                        .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size,
+                )
             }
             return
         }
@@ -146,7 +165,12 @@ class RecommendationRefreshCoordinator(
                 profileVec = runCatching { container.preferences.loadProfileVec() }.getOrNull()?.vec,
                 library = songs,
                 mode = "refresh",
-                sessionBias = tuning.sessionBias,
+                overallScores = container.taste.overallScoresByFilename(),
+                currentAnchorEligible =
+                    container.session.explicitAnchorFilename.value == current.filename,
+                manualBlend = tuning.manualBlend,
+                manualCurrentWeight = tuning.manualCurrentWeight,
+                manualSessionWeight = tuning.manualSessionWeight,
             )
         }.getOrNull()
         val blendInfo = blendedDetails?.let { RecommendationBlendInfo(it.weights, it.label) }
@@ -156,7 +180,11 @@ class RecommendationRefreshCoordinator(
         }
         val blendedVec = blendedDetails?.queryVector
         val recentlySurfaced = container.recentlySurfacedTracker.recentlySurfaced()
-        val excludeFnsWithRecency = excludeFns + recentlySurfaced
+        val excludeFnsWithRecency = QueueContinuationPolicy.recommendExcludeFilenames(
+            playNextFilenames = playNextSet,
+            currentFilename = mediaId,
+            recentlySurfaced = recentlySurfaced,
+        )
         val newTail = if (recMode && embeddingRows > 0) {
             runCatching {
                 container.recommender.recommendUpcoming(
@@ -166,11 +194,11 @@ class RecommendationRefreshCoordinator(
                     adventurous = tuning.adventurous,
                     extraExcludeFilenames = excludeFnsWithRecency,
                     hardBlockedFilenames = container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength),
-                    dislikedFilenames = container.disliked.disliked.value,
-                    softExcludedFilenames = container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength),
                     blendedQueryVec = blendedVec,
-                    totalTasteScores = container.taste.directScoresByFilename(),
+                    totalTasteScores = container.taste.overallScoresByFilename(),
                     negativeGuard = tuning.negativeStrength,
+                    tasteInfluence = tuning.tasteInfluence,
+                    traceReason = "refresh",
                 )
             }.getOrDefault(emptyList())
         } else {
@@ -207,8 +235,7 @@ class RecommendationRefreshCoordinator(
                 songs = finalResult.finalTail,
                 details = blendedDetails,
                 negativeFilteredCount = container.taste
-                    .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size +
-                    container.disliked.disliked.value.size,
+                    .hardBlockedFilenamesForPolicy(tuning.negativeStrength).size,
             )
         }
         container.activityLog.log(
@@ -234,11 +261,8 @@ class RecommendationRefreshCoordinator(
         val playNextSet = playbackState.playNextFilenames
         val playNextSongs = playNextSet.mapNotNull { byFn[it] }
         val tuning = container.taste.tuning.value
-        val policyExcludes = RecommendationPolicy.unionExcludes(
-            container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength),
-            container.taste.softExcludedFilenamesForPolicy(tuning.negativeStrength),
-            container.disliked.disliked.value,
-        )
+        val policyExcludes =
+            container.taste.hardBlockedFilenamesForPolicy(tuning.negativeStrength)
         val cooldownFilenames = container.recentlySurfacedTracker.recentlySurfaced()
         return RecommendationRefreshFinalizer.finalizeHardRefresh(
             candidateTail = candidateTail,

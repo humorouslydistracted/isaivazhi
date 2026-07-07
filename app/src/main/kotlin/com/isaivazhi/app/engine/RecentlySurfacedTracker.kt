@@ -13,8 +13,8 @@ import org.json.JSONObject
  * paused time does not count.
  *
  * Recorded when a song becomes the current track (play, skip, auto-advance).
- * Manual picks (Songs / Albums / Browse), Play Next, and unplayed Up Next
- * rows are excluded — see [shouldRecordRecommendationCooldown].
+ * Manual picks (Songs / Albums / Browse) and unplayed Up Next rows are
+ * excluded. Play Next is recorded once it becomes current.
  *
  * Storage: SharedPreferences ("algo_surfacing_cache"), survives process death.
  */
@@ -193,19 +193,16 @@ fun shouldRecordRecommendationCooldown(
     transitionSource: String,
 ): Boolean {
     if (enteringFilename.isBlank()) return false
-    if (enteringFilename in prevState.playNextFilenames) return false
-    if (prevState.queueContext == PlaybackEngine.QueueContext.ALBUM ||
-        prevState.queueContext == PlaybackEngine.QueueContext.BROWSE_SECTION
-    ) {
-        return false
-    }
+    if (enteringFilename in prevState.playNextFilenames) return true
     if (transitionSource == "manual_tap" ||
         transitionSource == "album" ||
         transitionSource == "browse_section"
     ) {
         return false
     }
-    return prevState.queueContext == PlaybackEngine.QueueContext.LIBRARY ||
-        prevState.queueContext == PlaybackEngine.QueueContext.DISCOVER_SECTION ||
-        prevState.queueContext == PlaybackEngine.QueueContext.AI_RECOMMENDED
+    return when (PlaybackEndReason.fromSource(transitionSource)) {
+        PlaybackEndReason.NEXT,
+        PlaybackEndReason.AUTO_ADVANCE -> true
+        else -> false
+    }
 }
