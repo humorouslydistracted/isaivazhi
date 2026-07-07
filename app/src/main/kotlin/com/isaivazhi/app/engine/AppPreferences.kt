@@ -46,7 +46,7 @@ class AppPreferences(private val appContext: Context) {
         // vs "this listen was lost when the app went away".
         val PENDING_EVIDENCE_INSTANCE_ID = longPreferencesKey("pending_evidence_instance_id")
         // Push #68: profileVec disk cache. Saved after compute, loaded on
-        // cold start so the first Discover render uses a real centroid
+        // cold start so the first recommendation build uses a real centroid
         // instead of waiting for the LE to recompute.
         val PROFILE_VEC_JSON = stringPreferencesKey("profile_vec_v1_json")
         val PROFILE_VEC_FINGERPRINT = stringPreferencesKey("profile_vec_fingerprint_v1")
@@ -67,9 +67,9 @@ class AppPreferences(private val appContext: Context) {
         val MIGRATION_V76_WATERMARK_RESET = booleanPreferencesKey("migration_v76_watermark_reset")
         // 2026-06-01 startup-perf fix: cache the last-known embedding row count
         // so the UI can publish a non-zero embeddingsRowCount immediately on
-        // cold start (unblocking AI Discover) while the actual DB stats() call
-        // still runs in background to reconcile. Without this, the UI gates
-        // AI Discover behind the first DB worker call which pays the full
+        // cold start while the actual DB stats() call still runs in background
+        // to reconcile. Without this, the recommendation flows wait behind the
+        // first DB worker call which pays the full
         // sqlite-vec/Room init cost (~18s on the user's device).
         val CACHED_EMBED_ROW_COUNT = longPreferencesKey("cached_embed_row_count_v1")
         val CACHED_EMBED_DIM = longPreferencesKey("cached_embed_dim_v1")

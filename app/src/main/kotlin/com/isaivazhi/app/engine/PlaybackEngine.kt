@@ -41,8 +41,8 @@ import kotlin.coroutines.resumeWithException
  * Capacitor bridge, no executor queue.
  *
  * Holds the current queue as Kotlin state alongside the MediaController so
- * the Discover screen can render upcoming items without round-tripping to
- * Media3 for every read.
+ * the active recommendation flows can render upcoming items without
+ * round-tripping to Media3 for every read.
  */
 class PlaybackEngine(
     private val appContext: Context,
@@ -90,12 +90,10 @@ class PlaybackEngine(
      *                       self-contained. LOOP=OFF stops; LOOP=ALL loops.
      *   BROWSE_SECTION    — View-All section (Most Played, Last Added,
      *                       Recently Played, etc.). Same as ALBUM: no AI.
-     *   DISCOVER_SECTION  — Most Similar / For You / Because You Played /
-     *                       Unexplored. AI tail appends on queue exhaust.
      *   AI_RECOMMENDED    — Set after an AI tail append so the next
      *                       exhaust knows the queue was already extended.
      */
-    enum class QueueContext { LIBRARY, ALBUM, BROWSE_SECTION, DISCOVER_SECTION, AI_RECOMMENDED }
+    enum class QueueContext { LIBRARY, ALBUM, BROWSE_SECTION, AI_RECOMMENDED }
 
     data class PlaybackState(
         val currentSongId: Int? = null,
@@ -1592,7 +1590,7 @@ class PlaybackEngine(
             // by the recommender. Keeps the ALBUM/BROWSE skip-AI rule
             // intact for sections that haven't been AI-extended.
             val newCtx = when (cur.queueContext) {
-                QueueContext.LIBRARY, QueueContext.DISCOVER_SECTION -> QueueContext.AI_RECOMMENDED
+                QueueContext.LIBRARY -> QueueContext.AI_RECOMMENDED
                 else -> cur.queueContext  // ALBUM / BROWSE_SECTION / AI_RECOMMENDED keep their context
             }
             _state.value = cur.copy(queueFilenames = nextFilenames, queueContext = newCtx)
@@ -1630,7 +1628,6 @@ class PlaybackEngine(
             val nextFilenames = cur.queueFilenames + toAdd.map { it.filename }
             val newCtx = when (cur.queueContext) {
                 QueueContext.LIBRARY,
-                QueueContext.DISCOVER_SECTION,
                 QueueContext.AI_RECOMMENDED -> QueueContext.AI_RECOMMENDED
                 else -> cur.queueContext
             }

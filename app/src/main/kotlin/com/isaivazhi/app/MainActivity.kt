@@ -93,10 +93,10 @@ import com.isaivazhi.app.ui.screens.BrowseCategory
 import com.isaivazhi.app.ui.screens.BrowseScreen
 import com.isaivazhi.app.ui.screens.LogsScreen
 import com.isaivazhi.app.ui.screens.LogsTab
-// Phase 4 (2026-06-01): DiscoverScreen / DiscoverSectionRef / EmbeddingStatusBanner
-// imports removed alongside the deleted Discover tab. The Similar-to-current
-// row in NowPlayingScreen now covers the only valued surface from Discover.
-// EmbeddingStatusBanner is still used by AiManagementScreen.
+// Phase 4 (2026-06-01): DiscoverScreen / DiscoverSectionRef imports removed
+// alongside the deleted Discover tab. The Similar-to-current row in
+// NowPlayingScreen now covers the only retained recommendation surface.
+// EmbeddingStatusBanner remains in use by AiManagementScreen.
 import com.isaivazhi.app.ui.screens.EngineSnapshot
 import com.isaivazhi.app.ui.screens.FavoritesScreen
 import com.isaivazhi.app.ui.screens.HistoryScreen
@@ -1621,14 +1621,10 @@ private fun AppRoot(container: AppContainer) {
     // it calls Recommender.recommendScored on each song change. The
     // discoverQueue was only consumed by the deleted Discover page.
 
-    // For You / Because You Played / Unexplored populate from the first
-    // available data. We re-trigger on `qualifyingEventCount` (number of
-    // Phase 4 (2026-06-01): the For You / BYP / Unexplored / Discover-cache
-    // section state and their auto-refresh plumbing (forYouTick, rebuildPulse,
-    // qualifyingEventCount, unexploredManualRefreshCounter, discoverCache
-    // hydrate, pull-to-refresh) have all been removed alongside the Discover
-    // tab. The Recommender still drives Up Next via `refreshUpcomingWithAI`
-    // and the Similar-to-current row in NowPlayingScreen.
+    // Phase 4 (2026-06-01): the deleted Discover tab's section state and
+    // auto-refresh plumbing are gone. The Recommender now only drives
+    // Up Next via `refreshUpcomingWithAI` and the Similar-to-current row in
+    // NowPlayingScreen.
 
     // Push #68: profileVec cache. Loaded from disk on cold start for
     // instant blended-query availability; recomputed and persisted when
@@ -1707,13 +1703,9 @@ private fun AppRoot(container: AppContainer) {
         container.invalidateRecommendationInputs("profile_vec_rebuild")
         android.util.Log.i("MainActivity", "profileVec rebuilt dim=${pv.size} anchors=$anchorCount fp=$fingerprint")
     }
-    // Phase 4 (2026-06-01): the Discover-cache snapshot state, the For You +
-    // BYP LE, the Unexplored LE, and the cache hydrate LE that lived here
-    // have all been removed. The remaining Recommender helpers used by
-    // refreshUpcomingWithAI run on demand only.
-
-    // Phase 4 (2026-06-01): For You + BYP, Unexplored Clusters, and
-    // Discover cache hydration LEs deleted with the Discover tab.
+    // Phase 4 (2026-06-01): the deleted Discover tab's snapshot state and
+    // hydration effects are gone. The remaining Recommender helpers used by
+    // `refreshUpcomingWithAI` run on demand only.
 
     val currentSongFilePath: String? = playbackState.currentMediaId?.let { mediaId ->
         songs.firstOrNull { it.filename == mediaId }?.filePath
@@ -2021,9 +2013,6 @@ private fun AppRoot(container: AppContainer) {
      * Push #70: section-tap handler. The `queueContext` parameter drives
      * the queue-exhaust LE's "should I append AI?" decision.
      *
-     *   QueueContext.DISCOVER_SECTION  — Most Similar / For You / BYP /
-     *                                    Unexplored. AI tail appends on
-     *                                    queue exhaust if LOOP=OFF.
      *   QueueContext.ALBUM             — Album-track tap. No AI ever.
      *                                    LOOP=OFF stops at end.
      *   QueueContext.BROWSE_SECTION    — View-All / Favorites / Playlist /
@@ -2051,7 +2040,6 @@ private fun AppRoot(container: AppContainer) {
         val source = when (queueContext) {
             com.isaivazhi.app.engine.PlaybackEngine.QueueContext.ALBUM -> "album"
             com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION -> "browse_section"
-            com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION -> "discover_section"
             else -> "manual_tap"
         }
         android.util.Log.i(
@@ -2063,8 +2051,7 @@ private fun AppRoot(container: AppContainer) {
         // queue context, so the queue-exhaust LE can append fresh AI tail.
         // Album / Browse contexts keep whatever loop mode the user chose
         // — those are finite by design.
-        if (queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.DISCOVER_SECTION ||
-            queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.LIBRARY ||
+        if (queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.LIBRARY ||
             queueContext == com.isaivazhi.app.engine.PlaybackEngine.QueueContext.AI_RECOMMENDED
         ) {
             container.playback.setRepeatMode(androidx.media3.common.Player.REPEAT_MODE_OFF)

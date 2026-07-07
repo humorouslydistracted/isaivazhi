@@ -18,12 +18,6 @@ class QueueContinuationPolicyTest {
         )
         assertTrue(
             QueueContinuationPolicy.shouldAppendAiTail(
-                PlaybackEngine.QueueContext.DISCOVER_SECTION,
-                Player.REPEAT_MODE_OFF,
-            )
-        )
-        assertTrue(
-            QueueContinuationPolicy.shouldAppendAiTail(
                 PlaybackEngine.QueueContext.AI_RECOMMENDED,
                 Player.REPEAT_MODE_OFF,
             )
