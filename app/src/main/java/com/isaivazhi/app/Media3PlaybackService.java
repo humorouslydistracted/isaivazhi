@@ -1,5 +1,6 @@
 package com.isaivazhi.app;
 
+import android.app.Notification;
 import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Intent;
@@ -20,6 +21,7 @@ import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.session.CommandButton;
 import androidx.media3.session.DefaultMediaNotificationProvider;
+import androidx.media3.session.MediaNotification;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.session.MediaController;
 import androidx.media3.session.MediaSession;
@@ -33,6 +35,7 @@ import org.json.JSONObject;
 
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.collect.ImmutableList;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -202,6 +205,11 @@ public class Media3PlaybackService extends MediaSessionService {
     @Override
     public MediaSession onGetSession(MediaSession.ControllerInfo controllerInfo) {
         return mediaSession;
+    }
+
+    @Override
+    public void onUpdateNotification(MediaSession session, boolean startInForegroundRequired) {
+        super.onUpdateNotification(session, startInForegroundRequired || isPlaybackActive());
     }
 
     @Override
@@ -415,6 +423,7 @@ public class Media3PlaybackService extends MediaSessionService {
                     closeAudioEffectSession();
                 }
             }
+            triggerNotificationUpdate();
             // 2026-05-11 #19: Media3's isPlaying flips to false during BUFFERING
             // and back to true on READY. Emitting that directly causes the JS
             // play icon to flicker and triggers state-save churn. Emit the
@@ -1341,6 +1350,11 @@ public class Media3PlaybackService extends MediaSessionService {
     }
 
     private void handleNotificationDismiss() {
+        if (shouldIgnoreNotificationDismiss(isPlaybackActive())) {
+            Log.i(TAG, "handleNotificationDismiss: ignored because playback is active");
+            triggerNotificationUpdate();
+            return;
+        }
         rememberStopTransition("user_dismiss");
         clearSavedPlaybackState();
         emitMediaAction("dismiss", buildCurrentMediaPayload());
@@ -1397,6 +1411,41 @@ public class Media3PlaybackService extends MediaSessionService {
         }
     }
 
+    private boolean isPlaybackActive() {
+        return player != null && player.isPlaying();
+    }
+
+    public static boolean shouldIgnoreNotificationDismiss(boolean isPlaying) {
+        return isPlaying;
+    }
+
+    public static Notification applyPlaybackPersistencePolicy(
+            @Nullable android.content.Context context,
+            Notification notification,
+            boolean isPlaying
+    ) {
+        if (notification == null) return null;
+        Notification adjusted = notification;
+        try {
+            if (context == null) throw new IllegalStateException("context unavailable");
+            adjusted = Notification.Builder.recoverBuilder(context, notification)
+                    .setOngoing(isPlaying)
+                    .setDeleteIntent(isPlaying ? null : notification.deleteIntent)
+                    .build();
+        } catch (Throwable t) {
+            adjusted = notification;
+        }
+        if (isPlaying) {
+            adjusted.flags |= Notification.FLAG_ONGOING_EVENT;
+            adjusted.flags |= Notification.FLAG_NO_CLEAR;
+            adjusted.deleteIntent = null;
+        } else {
+            adjusted.flags &= ~Notification.FLAG_ONGOING_EVENT;
+            adjusted.flags &= ~Notification.FLAG_NO_CLEAR;
+        }
+        return adjusted;
+    }
+
     private ArrayList<CommandButton> buildNotificationButtons() {
         ArrayList<CommandButton> buttons = new ArrayList<>();
         boolean hasCurrentMedia = currentItem() != null || !currentItemPath().isEmpty();
@@ -1413,8 +1462,9 @@ public class Media3PlaybackService extends MediaSessionService {
         // the first two, hiding Refresh — the AI-recommendation entry
         // point users actually need on the lockscreen.
         //
-        // Fix: drop Close entirely (swipe-to-dismiss still works) and put
-        // Refresh in slot #2 so both [Favorite, Refresh] stay visible.
+        // Fix: drop Close entirely and put Refresh in slot #2 so both
+        // [Favorite, Refresh] stay visible. Active playback is now pinned;
+        // swipe dismissal remains available only after playback stops/pauses.
         buttons.add(new CommandButton.Builder(
                 isFavorite ? CommandButton.ICON_HEART_FILLED : CommandButton.ICON_HEART_UNFILLED)
                 .setSessionCommand(PlaybackCommandContract.command(PlaybackCommandContract.CMD_NOTIFICATION_TOGGLE_FAVORITE))
@@ -1899,19 +1949,49 @@ public class Media3PlaybackService extends MediaSessionService {
         return Futures.immediateFuture(result);
     }
 
-    private final class PlaybackNotificationProvider extends DefaultMediaNotificationProvider {
-        PlaybackNotificationProvider() {
-            super(Media3PlaybackService.this);
+    private final class PlaybackNotificationProvider implements MediaNotification.Provider {
+        private final DefaultMediaNotificationProvider delegate =
+                new DefaultMediaNotificationProvider(Media3PlaybackService.this) {
+                    @Override
+                    protected CharSequence getNotificationContentTitle(MediaMetadata mediaMetadata) {
+                        return notificationTitle();
+                    }
+
+                    @Override
+                    protected CharSequence getNotificationContentText(MediaMetadata mediaMetadata) {
+                        return notificationText();
+                    }
+                };
+
+        @Override
+        public MediaNotification createNotification(
+                MediaSession session,
+                ImmutableList<CommandButton> mediaButtons,
+                MediaNotification.ActionFactory actionFactory,
+                MediaNotification.Provider.Callback callback
+        ) {
+            MediaNotification mediaNotification = delegate.createNotification(
+                    session,
+                    mediaButtons,
+                    actionFactory,
+                    callback
+            );
+            Notification notification = applyPlaybackPersistencePolicy(
+                    Media3PlaybackService.this,
+                    mediaNotification.notification,
+                    isPlaybackActive()
+            );
+            return new MediaNotification(mediaNotification.notificationId, notification);
         }
 
         @Override
-        protected CharSequence getNotificationContentTitle(MediaMetadata mediaMetadata) {
-            return notificationTitle();
+        public boolean handleCustomCommand(MediaSession session, String action, Bundle extras) {
+            return delegate.handleCustomCommand(session, action, extras);
         }
 
         @Override
-        protected CharSequence getNotificationContentText(MediaMetadata mediaMetadata) {
-            return notificationText();
+        public MediaNotification.Provider.NotificationChannelInfo getNotificationChannelInfo() {
+            return delegate.getNotificationChannelInfo();
         }
     }
 
