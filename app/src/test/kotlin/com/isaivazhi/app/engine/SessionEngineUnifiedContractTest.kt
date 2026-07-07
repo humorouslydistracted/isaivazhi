@@ -51,4 +51,36 @@ class SessionEngineUnifiedContractTest {
         assertEquals(emptyList<SessionEngine.ListenedEntry>(), engine.listened.value)
         assertNull(engine.explicitAnchorFilename.value)
     }
+
+    @Test
+    fun sessionSkips_onlyIncrementForNonManualSkipGestures() {
+        val engine = SessionEngine()
+
+        engine.recordEvent(
+            fraction = 0.1f,
+            isSkip = true,
+            isManual = false,
+            filename = "next-song",
+            source = "next_button",
+        )
+        assertEquals(1, engine.current().skips)
+
+        engine.recordEvent(
+            fraction = 0.1f,
+            isSkip = true,
+            isManual = true,
+            filename = "queue-song",
+            source = "queue_tap",
+        )
+        assertEquals(1, engine.current().skips)
+
+        engine.recordEvent(
+            fraction = 0.8f,
+            isSkip = false,
+            isManual = false,
+            filename = "listen-song",
+            source = "auto_advance",
+        )
+        assertEquals(1, engine.current().skips)
+    }
 }

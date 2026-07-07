@@ -178,6 +178,14 @@ class TasteEngine(private val appContext: Context) {
         const val SKIP_THRESHOLD = 0.50f
         const val FULL_LISTEN_THRESHOLD = 0.70f
 
+        internal fun isExplicitUserSkip(source: String, fraction: Float): Boolean =
+            (source == "next_button" || source == "prev_button") &&
+                fraction.coerceIn(0f, 1f) < SKIP_THRESHOLD
+
+        internal fun isEarlyUserRejection(source: String, fraction: Float): Boolean =
+            isExplicitUserSkip(source, fraction) &&
+                fraction.coerceIn(0f, 1f) < UnifiedTasteContract.EARLY_REJECTION_THRESHOLD
+
         // Push #63 (Capacitor parity): xScore deltas.
         // engine-state.js: USER_SKIP_NEGATIVE_STEP=0.1, NEG_LISTEN_DECAY=0.5,
         // NEG_X_DELTA=0.5 (queue-remove), NEG_SCORE_MAX=10.
@@ -596,8 +604,7 @@ class TasteEngine(private val appContext: Context) {
             outcome == PlaybackOutcome.STRONG
         val isStrong = outcome == PlaybackOutcome.STRONG
         val newPlays = if (isQualifiedListen) before.plays + 1 else before.plays
-        val isExplicitUserSkip = (source == "next_button" || source == "prev_button") &&
-            frac < SKIP_THRESHOLD
+        val isExplicitUserSkip = isExplicitUserSkip(source, frac)
         val newSkips = if (isExplicitUserSkip) before.skips + 1 else before.skips
         // Push #73: fullListens only increments on >=0.70 non-skip.
         // Used to decay the dislike prior asymmetrically.
@@ -622,9 +629,7 @@ class TasteEngine(private val appContext: Context) {
         val newEvidence = decayedEvidence + contribution
         val newEvidenceAt = if (contribution > 0f || oldEvidence > 0f) now
             else before.positiveEvidenceUpdatedAt
-        val endReason = PlaybackEndReason.fromSource(source)
-        val isEarlyUserRejection = frac < UnifiedTasteContract.EARLY_REJECTION_THRESHOLD &&
-            UnifiedTasteContract.isUserInitiated(endReason)
+        val isEarlyUserRejection = isEarlyUserRejection(source, frac)
         val newEarlySkipCount = before.earlySkipCount + if (isEarlyUserRejection) 1 else 0
         val newEarlySkipPenalty = if (isEarlyUserRejection) {
             UnifiedTasteContract.earlyRejectionPenalty(newEarlySkipCount)

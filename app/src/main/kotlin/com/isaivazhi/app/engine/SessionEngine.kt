@@ -118,8 +118,9 @@ class SessionEngine {
         val contribution = UnifiedTasteContract.positiveContribution(frac)
         val newEncounters = before.encounters + 1
         // Transport/recovery reasons no longer imply preference. Preserve the
-        // legacy field for compatibility but do not add new "skip" evidence.
-        val newSkips = before.skips
+        // legacy field for compatibility, but explicit skip gestures should
+        // still surface in session diagnostics.
+        val newSkips = if (isSkip && !isManual) before.skips + 1 else before.skips
         val newPositives = if (contribution > 0f) before.positives + 1 else before.positives
         val newWeight = if (newEncounters == 0) 0f
             else ((before.weightFraction * before.encounters) + frac) / newEncounters
