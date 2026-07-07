@@ -5,6 +5,8 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import com.isaivazhi.app.engine.dataStoreLocal
+import com.isaivazhi.app.engine.decayedLearnedValue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -47,7 +49,6 @@ class TasteEngine(private val appContext: Context) {
     data class Tuning(
         val adventurous: Float = DEFAULT_ADVENTUROUS,
         val tasteInfluence: Float = DEFAULT_TASTE_INFLUENCE,
-        val sessionBias: Float = DEFAULT_SESSION_BIAS,
         val negativeStrength: Float = DEFAULT_NEGATIVE_STRENGTH,
         val manualBlend: Boolean = false,
         val manualCurrentWeight: Float = DEFAULT_MANUAL_CURRENT_WEIGHT,
@@ -167,7 +168,6 @@ class TasteEngine(private val appContext: Context) {
     companion object {
         const val DEFAULT_ADVENTUROUS = 0.4f
         const val DEFAULT_TASTE_INFLUENCE = 0.30f
-        const val DEFAULT_SESSION_BIAS = 0.5f
         const val DEFAULT_NEGATIVE_STRENGTH = 0.5f
         const val DEFAULT_MANUAL_CURRENT_WEIGHT = 0.30f
         const val DEFAULT_MANUAL_SESSION_WEIGHT = 0.40f
@@ -233,7 +233,6 @@ class TasteEngine(private val appContext: Context) {
     private val KEY_ADV = floatPreferencesKey("taste_adventurous")
     private val KEY_TASTE_INFLUENCE = floatPreferencesKey("taste_influence")
     private val KEY_NEG = floatPreferencesKey("taste_negative_strength")
-    private val KEY_SES = floatPreferencesKey("taste_session_bias")
     private val KEY_BLEND_MANUAL = intPreferencesKey("taste_blend_manual")
     private val KEY_BLEND_CURRENT = floatPreferencesKey("taste_blend_current")
     private val KEY_BLEND_SESSION = floatPreferencesKey("taste_blend_session")
@@ -293,12 +292,10 @@ class TasteEngine(private val appContext: Context) {
         scope.launch {
             try {
                 val data = appContext.dataStoreLocal.data.first()
-                val legacyFam = data[KEY_FAM_LEGACY]
                 _tuning.value = Tuning(
                     adventurous = data[KEY_ADV] ?: DEFAULT_ADVENTUROUS,
                     tasteInfluence = (data[KEY_TASTE_INFLUENCE] ?: DEFAULT_TASTE_INFLUENCE)
                         .coerceIn(0f, MAX_TASTE_INFLUENCE),
-                    sessionBias = data[KEY_SES] ?: legacyFam ?: DEFAULT_SESSION_BIAS,
                     negativeStrength = data[KEY_NEG] ?: DEFAULT_NEGATIVE_STRENGTH,
                     manualBlend = data[KEY_BLEND_MANUAL] == 1,
                     manualCurrentWeight = (data[KEY_BLEND_CURRENT]
@@ -337,11 +334,6 @@ class TasteEngine(private val appContext: Context) {
         scope.launch { persistTuning() }
     }
 
-    fun setSessionBias(value: Float) {
-        _tuning.value = _tuning.value.copy(sessionBias = value.coerceIn(0f, 1f))
-        scope.launch { persistTuning() }
-    }
-
     fun setNegativeStrength(value: Float) {
         _tuning.value = _tuning.value.copy(negativeStrength = value.coerceIn(0f, 1f))
         scope.launch { persistTuning() }
@@ -365,7 +357,6 @@ class TasteEngine(private val appContext: Context) {
 
     fun resetAdventurous() = setAdventurous(DEFAULT_ADVENTUROUS)
     fun resetTasteInfluence() = setTasteInfluence(DEFAULT_TASTE_INFLUENCE)
-    fun resetSessionBias() = setSessionBias(DEFAULT_SESSION_BIAS)
     fun resetNegativeStrength() = setNegativeStrength(DEFAULT_NEGATIVE_STRENGTH)
 
     /** Canonical overall scores used by recommendation ranking and policy. */
@@ -1245,7 +1236,6 @@ class TasteEngine(private val appContext: Context) {
             appContext.dataStoreLocal.edit {
                 it[KEY_ADV] = t.adventurous
                 it[KEY_TASTE_INFLUENCE] = t.tasteInfluence
-                it[KEY_SES] = t.sessionBias
                 it[KEY_NEG] = t.negativeStrength
                 it[KEY_BLEND_MANUAL] = if (t.manualBlend) 1 else 0
                 it[KEY_BLEND_CURRENT] = t.manualCurrentWeight

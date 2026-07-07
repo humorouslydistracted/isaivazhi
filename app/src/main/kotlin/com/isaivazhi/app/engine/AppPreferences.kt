@@ -333,6 +333,13 @@ class AppPreferences(private val appContext: Context) {
         } catch (_: Throwable) { null }
     }
 
+    suspend fun clearProfileVec() {
+        appContext.dataStore.edit { prefs ->
+            prefs.remove(Keys.PROFILE_VEC_JSON)
+            prefs.remove(Keys.PROFILE_VEC_FINGERPRINT)
+        }
+    }
+
     suspend fun saveQueueExplanations(items: List<RecommendationExplanation>) {
         val array = org.json.JSONArray()
         items.forEach { item ->

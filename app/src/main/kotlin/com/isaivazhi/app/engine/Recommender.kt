@@ -110,7 +110,6 @@ class Recommender(
         manualBlend: Boolean = false,
         manualCurrentWeight: Float = TasteEngine.DEFAULT_MANUAL_CURRENT_WEIGHT,
         manualSessionWeight: Float = TasteEngine.DEFAULT_MANUAL_SESSION_WEIGHT,
-        sessionBias: Float = 0.5f,
     ): BlendedQueryDetails {
         val byFilename = library.associateBy { it.filename }
         // Build session vec weighted by listen depth (fraction). Songs heard
@@ -153,12 +152,6 @@ class Recommender(
         } else {
             blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)
         }
-        // Apply sessionBias to bias session vs profile (Capacitor parity).
-        w = BlendWeightLogic.applySessionBias(
-            weights = BlendWeightLogic.Weights(w.wCurrent, w.wSession, w.wProfile),
-            sessionBias = sessionBias,
-            manualBlend = manualBlend,
-        ).let { BlendWeights(it.wCurrent, it.wSession, it.wProfile) }
         if (!hasCurrent && !hasSession && !hasProfile) {
             return BlendedQueryDetails(null, w, "empty", currentVec, sessionVec, profileVec)
         }
@@ -195,7 +188,6 @@ class Recommender(
         profileVec: FloatArray?,
         library: List<Song>,
         mode: String = "play",
-        sessionBias: Float = 0.5f,
     ): Triple<FloatArray?, BlendWeights, String> {
         val details = buildBlendedQuery(
             currentSongHash = currentSongHash,
@@ -203,7 +195,6 @@ class Recommender(
             profileVec = profileVec,
             library = library,
             mode = mode,
-            sessionBias = sessionBias,
         )
         return Triple(details.queryVector, details.weights, details.label)
     }

@@ -469,7 +469,6 @@ class PlaybackEngine(
                         val cls = if (isSkip) SignalTimelineEngine.Classification.SKIP
                             else SignalTimelineEngine.Classification.LISTEN
                         val avgLib = avgLibraryFraction()
-                        val sessionPull = (t.tuning.value.sessionBias).coerceIn(0f, 1f)
                         val sBefore = sessionPair?.first
                         val sAfter = sessionPair?.second
                         tl.append(
@@ -485,8 +484,6 @@ class PlaybackEngine(
                                 tasteAfter = snapshotOf(after),
                                 xScoreBefore = before.xScore,
                                 xScoreAfter = after.xScore,
-                                sessionPullBefore = sessionPull,
-                                sessionPullAfter = sessionPull,
                                 libraryAvgBefore = avgLib,
                                 libraryAvgAfter = avgLib,
                                 sessionEncountersBefore = sBefore?.encounters ?: 0,
@@ -1513,8 +1510,6 @@ class PlaybackEngine(
                         tasteAfter = snapshotOf(after),
                         xScoreBefore = before.xScore,
                         xScoreAfter = after.xScore,
-                        sessionPullBefore = t.tuning.value.sessionBias.coerceIn(0f, 1f),
-                        sessionPullAfter = t.tuning.value.sessionBias.coerceIn(0f, 1f),
                         libraryAvgBefore = avgLibraryFraction(),
                         libraryAvgAfter = avgLibraryFraction(),
                         kind = TasteEventKind.QUEUE_REMOVE,

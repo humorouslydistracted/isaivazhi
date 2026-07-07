@@ -118,7 +118,6 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
             source = source,
         )
         container.recommendationExplainability.recordPlaybackResult()
-        val sessionPull = container.taste.tuning.value.sessionBias.coerceIn(0f, 1f)
         val avgLib = avgLibraryFraction()
 
         container.signalTimeline.append(
@@ -135,8 +134,6 @@ class PlaybackSignalProcessor(private val container: AppContainer) {
                 tasteAfter = snapshotOf(after),
                 xScoreBefore = before.xScore,
                 xScoreAfter = after.xScore,
-                sessionPullBefore = sessionPull,
-                sessionPullAfter = sessionPull,
                 libraryAvgBefore = avgLib,
                 libraryAvgAfter = avgLib,
                 sessionEncountersBefore = sessionPair.first.encounters,

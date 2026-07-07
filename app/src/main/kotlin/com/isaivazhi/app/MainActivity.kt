@@ -3139,6 +3139,7 @@ private fun AppRoot(container: AppContainer) {
             },
             onResetEngineConfirmed = {
                 container.resetEngine()
+                cachedProfileVec = null
                 overlay = Overlay.None
             },
             onCopyTimelineText = { container.toaster.show("Copied last 30 signals") },
@@ -4032,7 +4033,6 @@ private fun ingestPendingEvidence(
         source = source,
     )
     container.recommendationExplainability.recordPlaybackResult()
-    val sessionPull = container.taste.tuning.value.sessionBias.coerceIn(0f, 1f)
     val avgLib = run {
         val sigs = container.taste.signals.value
         if (sigs.isEmpty()) 0f else sigs.values.map { it.avgFraction }.average().toFloat()
@@ -4050,8 +4050,6 @@ private fun ingestPendingEvidence(
             tasteAfter = com.isaivazhi.app.engine.timelineSnapshotOf(after),
             xScoreBefore = before.xScore,
             xScoreAfter = after.xScore,
-            sessionPullBefore = sessionPull,
-            sessionPullAfter = sessionPull,
             libraryAvgBefore = avgLib,
             libraryAvgAfter = avgLib,
             sessionEncountersBefore = sessionPair.first.encounters,

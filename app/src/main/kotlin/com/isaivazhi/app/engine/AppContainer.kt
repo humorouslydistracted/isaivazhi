@@ -67,8 +67,6 @@ class AppContainer(private val appContext: Context) {
                 tasteAfter = snapshot(after),
                 xScoreBefore = before.xScore,
                 xScoreAfter = after.xScore,
-                sessionPullBefore = taste.tuning.value.sessionBias,
-                sessionPullAfter = taste.tuning.value.sessionBias,
                 libraryAvgBefore = 0f,
                 libraryAvgAfter = 0f,
                 kind = kind,
@@ -522,6 +520,11 @@ class AppContainer(private val appContext: Context) {
         val favSet = (favFromEngine + favFromTaste).toSet()
         val disSet = (disFromEngine + disFromTaste).toSet()
         taste.resetAllSignalsPreservingManual(favSet, disSet)
+        runBlocking {
+            runCatching { preferences.clearProfileVec() }.onFailure {
+                android.util.Log.w("AppContainer", "clearProfileVec failed: ${it.message}")
+            }
+        }
         android.util.Log.i(
             "AppContainer",
             "Engine reset: preserved ${favSet.size} favorites + ${disSet.size} dislikes; re-applied priors for ${(favSet + disSet).size} songs"
@@ -589,11 +592,6 @@ class AppContainer(private val appContext: Context) {
         invalidateRecommendationInputs("tuning_taste_influence")
     }
 
-    fun setTasteSessionBias(value: Float) {
-        taste.setSessionBias(value)
-        invalidateRecommendationInputs("tuning_session_bias")
-    }
-
     fun setTasteNegativeStrength(value: Float) {
         taste.setNegativeStrength(value)
         invalidateRecommendationInputs("tuning_negative_strength")
@@ -612,8 +610,6 @@ class AppContainer(private val appContext: Context) {
     fun resetTasteAdventurous() = setTasteAdventurous(TasteEngine.DEFAULT_ADVENTUROUS)
 
     fun resetTasteInfluence() = setTasteInfluence(TasteEngine.DEFAULT_TASTE_INFLUENCE)
-
-    fun resetTasteSessionBias() = setTasteSessionBias(TasteEngine.DEFAULT_SESSION_BIAS)
 
     fun resetTasteNegativeStrength() = setTasteNegativeStrength(TasteEngine.DEFAULT_NEGATIVE_STRENGTH)
 

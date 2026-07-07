@@ -88,8 +88,6 @@ class TasteSignalPresentationTest {
         tasteAfter = after,
         xScoreBefore = 0f,
         xScoreAfter = avoidanceDelta,
-        sessionPullBefore = 0.5f,
-        sessionPullAfter = 0.5f,
         libraryAvgBefore = 0f,
         libraryAvgAfter = 0f,
         outcome = PlaybackOutcome.EARLY,

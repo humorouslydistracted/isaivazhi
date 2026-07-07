@@ -1435,7 +1435,6 @@ private fun LegacyTimelineEventRow(ev: SignalTimelineEngine.Event) {
         LineKV("Direct play", "${fmt(ev.tasteBefore.direct)} → ${fmt(ev.tasteAfter.direct)} (Δ ${fmt(ev.tasteAfter.direct - ev.tasteBefore.direct)})")
         LineKV("Similarity Δ", fmt(ev.tasteAfter.similarity))
         LineKV("Total score", "${fmt(ev.tasteBefore.score)} → ${fmt(ev.tasteAfter.score)}")
-        LineKV("Session pull", "${(ev.sessionPullBefore * 100).toInt()}% → ${(ev.sessionPullAfter * 100).toInt()}%")
         // Push #63: session-level rolling counters from SessionEngine.
         LineKV(
             "Session counts",
@@ -1584,7 +1583,6 @@ private fun buildLegacyTimelineCopyText(events: List<SignalTimelineEngine.Event>
             appendLine("Direct play effect: ${fmt(e.tasteBefore.direct)} -> ${fmt(e.tasteAfter.direct)} (Δ ${fmt(e.tasteAfter.direct - e.tasteBefore.direct)})")
             appendLine("Similarity delta effect: ${fmt(e.tasteAfter.similarity)}")
             appendLine("Total score: ${fmt(e.tasteBefore.score)} -> ${fmt(e.tasteAfter.score)}")
-            appendLine("Session pull: ${(e.sessionPullBefore * 100).toInt()}% -> ${(e.sessionPullAfter * 100).toInt()}%")
             appendLine("Session counts: enc ${e.sessionEncountersBefore} -> ${e.sessionEncountersAfter} | skips ${e.sessionSkipsBefore} -> ${e.sessionSkipsAfter} | pos ${e.sessionPositivesBefore} -> ${e.sessionPositivesAfter}")
             appendLine("Library counts: starts ${e.tasteBefore.plays} -> ${e.tasteAfter.plays} | skips ${e.tasteBefore.skips} -> ${e.tasteAfter.skips}")
             appendLine("Library avg: ${(e.libraryAvgBefore * 100).toInt()}% -> ${(e.libraryAvgAfter * 100).toInt()}%")

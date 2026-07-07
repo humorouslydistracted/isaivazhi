@@ -44,21 +44,6 @@ internal object BlendWeightLogic {
         return normalizeAvailable(current, session, profile, hasCurrent, hasSession, hasProfile)
     }
 
-    fun applySessionBias(
-        weights: Weights,
-        sessionBias: Float,
-        manualBlend: Boolean,
-    ): Weights {
-        if (manualBlend || weights.wSession <= 0f || weights.wProfile <= 0f) return weights
-        val sb = sessionBias.coerceIn(0f, 0.95f)
-        val rest = weights.wSession + weights.wProfile
-        return Weights(
-            wCurrent = weights.wCurrent,
-            wSession = rest * sb,
-            wProfile = rest * (1f - sb),
-        )
-    }
-
     private fun normalizeAvailable(
         current: Float,
         session: Float,

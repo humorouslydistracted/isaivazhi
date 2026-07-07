@@ -77,19 +77,4 @@ class RecommenderBlendWeightsTest {
         assertEquals(1f, w.wCurrent + w.wSession + w.wProfile, 0.001f)
     }
 
-    @Test
-    fun sessionBiasRedistributesSessionAndProfileSmoothly() {
-        val base = BlendWeightLogic.Weights(
-            wCurrent = 0.35f,
-            wSession = 0.39f,
-            wProfile = 0.26f,
-        )
-        val lower = BlendWeightLogic.applySessionBias(base, sessionBias = 0.39f, manualBlend = false)
-        val higher = BlendWeightLogic.applySessionBias(base, sessionBias = 0.41f, manualBlend = false)
-
-        assertTrue(lower.wSession < higher.wSession)
-        assertTrue(lower.wProfile > higher.wProfile)
-        assertEquals(1f, lower.wCurrent + lower.wSession + lower.wProfile, 0.001f)
-        assertEquals(1f, higher.wCurrent + higher.wSession + higher.wProfile, 0.001f)
-    }
 }

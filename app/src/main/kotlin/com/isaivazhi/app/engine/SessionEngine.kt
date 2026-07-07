@@ -19,7 +19,7 @@ import kotlinx.coroutines.flow.asStateFlow
  *     (fraction < 0.50 AND non-manual source)
  *   - `positives` increments on any non-skip listen
  *   - `weightFraction` is the running average of all recorded fractions
- *     across the session; drives the "Session pull X% → Y%" timeline line.
+ *     across the session and remains available for diagnostics.
  */
 class SessionEngine {
 

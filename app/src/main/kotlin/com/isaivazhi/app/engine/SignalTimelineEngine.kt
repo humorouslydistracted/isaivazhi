@@ -64,8 +64,8 @@ class SignalTimelineEngine(private val appContext: Context) {
         val tasteAfter: Snapshot,
         val xScoreBefore: Float,
         val xScoreAfter: Float,
-        val sessionPullBefore: Float,
-        val sessionPullAfter: Float,
+        val sessionPullBefore: Float = 0f,
+        val sessionPullAfter: Float = 0f,
         val libraryAvgBefore: Float,
         val libraryAvgAfter: Float,
         // Push #63: per-session running counts.
@@ -231,7 +231,6 @@ class SignalTimelineEngine(private val appContext: Context) {
             appendLine("Direct play effect: ${fmtSigned(e.tasteBefore.direct)} -> ${fmtSigned(e.tasteAfter.direct)} (Δ ${fmtSigned(e.tasteAfter.direct - e.tasteBefore.direct)})")
             appendLine("Similarity delta effect: ${fmtSigned(e.tasteAfter.similarity)}")
             appendLine("Total score: ${fmtSigned(e.tasteBefore.score)} -> ${fmtSigned(e.tasteAfter.score)}")
-            appendLine("Session pull: ${(e.sessionPullBefore * 100).toInt()}% -> ${(e.sessionPullAfter * 100).toInt()}%")
             appendLine("Session counts: encounters ${e.sessionEncountersBefore} -> ${e.sessionEncountersAfter} | skips ${e.sessionSkipsBefore} -> ${e.sessionSkipsAfter} | positive ${e.sessionPositivesBefore} -> ${e.sessionPositivesAfter}")
             appendLine("Library counts: starts ${e.tasteBefore.plays} -> ${e.tasteAfter.plays} | skips ${e.tasteBefore.skips} -> ${e.tasteAfter.skips}")
             appendLine("Library avg: ${(e.libraryAvgBefore * 100).toInt()}% -> ${(e.libraryAvgAfter * 100).toInt()}%")
@@ -257,8 +256,6 @@ class SignalTimelineEngine(private val appContext: Context) {
                 o.put("tasteAfter", snapshotJson(e.tasteAfter))
                 o.put("xScoreBefore", e.xScoreBefore.toDouble())
                 o.put("xScoreAfter", e.xScoreAfter.toDouble())
-                o.put("sessionPullBefore", e.sessionPullBefore.toDouble())
-                o.put("sessionPullAfter", e.sessionPullAfter.toDouble())
                 o.put("libraryAvgBefore", e.libraryAvgBefore.toDouble())
                 o.put("libraryAvgAfter", e.libraryAvgAfter.toDouble())
                 o.put("sessionEncountersBefore", e.sessionEncountersBefore)
