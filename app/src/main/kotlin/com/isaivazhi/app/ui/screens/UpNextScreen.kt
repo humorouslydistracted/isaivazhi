@@ -92,6 +92,18 @@ fun UpNextScreen(
     tuning: TasteEngine.Tuning = TasteEngine.Tuning(),
     effectiveBlendCurrent: Float = 0f,
     effectiveBlendSession: Float = 0f,
+    /**
+     * Bugfix 2026-07-08: whether each blend source actually has data to
+     * blend from right now. When a source is unavailable, the recommender
+     * silently redistributes its slider share to the sources that do exist
+     * (see [com.isaivazhi.app.engine.BlendWeightLogic.normalizeAvailable]),
+     * so the slider can visually sit at e.g. 30/30/40 while the applied
+     * blend is actually 100/0/0. Surfacing these flags lets the UI warn the
+     * user instead of just looking unresponsive.
+     */
+    blendCurrentAvailable: Boolean = true,
+    blendSessionAvailable: Boolean = true,
+    blendProfileAvailable: Boolean = true,
     onManualBlendChange: (current: Float, session: Float) -> Unit = { _, _ -> },
     onBlendAutoReset: () -> Unit = {},
     onDiversityChange: (Float) -> Unit = {},
@@ -165,6 +177,9 @@ fun UpNextScreen(
                 tuning = tuning,
                 effectiveCurrent = effectiveBlendCurrent,
                 effectiveSession = effectiveBlendSession,
+                currentAvailable = blendCurrentAvailable,
+                sessionAvailable = blendSessionAvailable,
+                profileAvailable = blendProfileAvailable,
                 onManualBlendChange = onManualBlendChange,
                 onBlendAutoReset = onBlendAutoReset,
                 onDiversityChange = onDiversityChange,
@@ -554,6 +569,9 @@ private fun QueueTuningHeader(
     tuning: TasteEngine.Tuning,
     effectiveCurrent: Float,
     effectiveSession: Float,
+    currentAvailable: Boolean,
+    sessionAvailable: Boolean,
+    profileAvailable: Boolean,
     onManualBlendChange: (Float, Float) -> Unit,
     onBlendAutoReset: () -> Unit,
     onDiversityChange: (Float) -> Unit,
@@ -575,6 +593,9 @@ private fun QueueTuningHeader(
             tuning = tuning,
             effectiveCurrent = effectiveCurrent,
             effectiveSession = effectiveSession,
+            currentAvailable = currentAvailable,
+            sessionAvailable = sessionAvailable,
+            profileAvailable = profileAvailable,
             onManualChange = onManualBlendChange,
             onAutoReset = onBlendAutoReset,
         )
@@ -587,6 +608,9 @@ private fun BlendTuningRow(
     tuning: TasteEngine.Tuning,
     effectiveCurrent: Float,
     effectiveSession: Float,
+    currentAvailable: Boolean,
+    sessionAvailable: Boolean,
+    profileAvailable: Boolean,
     onManualChange: (Float, Float) -> Unit,
     onAutoReset: () -> Unit,
 ) {
@@ -604,6 +628,17 @@ private fun BlendTuningRow(
     val currentPct = (current * 100).toInt()
     val sessionPct = (session * 100).toInt()
     val profilePct = (profile * 100).toInt()
+    // Bugfix 2026-07-08: a source with no data is silently zeroed out and
+    // its slider share redistributed to the other sources by the recommender
+    // (BlendWeightLogic.normalizeAvailable), so a slider showing e.g.
+    // 30/30/40 can actually apply as 100/0/0 without any visible feedback.
+    // Warn inline so the "slider does nothing" symptom is explained instead
+    // of looking broken.
+    val unavailableParts = buildList {
+        if (!currentAvailable && current > 0f) add("Current")
+        if (!sessionAvailable && session > 0f) add("Session")
+        if (!profileAvailable && profile > 0f) add("Profile")
+    }
     var showInfo by remember { mutableStateOf(false) }
     if (showInfo) {
         AlertDialog(
@@ -612,10 +647,14 @@ private fun BlendTuningRow(
             text = {
                 Text(
                     "Current $currentPct%, Session $sessionPct%, Long-term $profilePct%.\n\n" +
-                        "Current = songs similar to the song you explicitly started.\n" +
+                        "Current = songs similar to whatever song is playing right now.\n" +
                         "Session = songs similar to the positively-heard songs from this app run.\n" +
                         "Long-term = songs similar to your saved taste profile built from your strongest long-term positives.\n\n" +
-                        "Auto moves these weights as session evidence grows. Dragging either divider switches to Manual."
+                        "Auto moves these weights as session evidence grows. Dragging either divider switches to Manual.\n\n" +
+                        "Manual uses these as target weights. If Session or Long-term has no data yet (e.g. no " +
+                        "qualifying listens this session, or no saved profile), its share is silently redistributed " +
+                        "to the sources that do have data — so the slider can look like it's doing nothing when " +
+                        "really there's nothing yet to blend from."
                 )
             },
             confirmButton = {
@@ -636,6 +675,18 @@ private fun BlendTuningRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        if (unavailableParts.isNotEmpty()) {
+            Text(
+                text = "${unavailableParts.joinToString(" & ")} " +
+                    (if (unavailableParts.size > 1) "have" else "has") +
+                    " no data yet — folded into the rest",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(start = 96.dp, bottom = 2.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,

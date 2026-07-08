@@ -89,12 +89,20 @@ class SessionEngine {
         lastActivityAt = now
     }
 
-    fun markExplicitAnchor(filename: String) {
+    fun markExplicitAnchor(filename: String, reason: String = "unknown") {
         markPlaybackActivity()
         _explicitAnchorFilename.value = filename.takeIf { it.isNotBlank() }
+        android.util.Log.d(
+            "BlendDebug",
+            "markExplicitAnchor filename=$filename reason=$reason",
+        )
     }
 
-    fun clearExplicitAnchor() {
+    fun clearExplicitAnchor(reason: String = "unknown") {
+        android.util.Log.d(
+            "BlendDebug",
+            "clearExplicitAnchor prev=${_explicitAnchorFilename.value} reason=$reason",
+        )
         _explicitAnchorFilename.value = null
     }
 

@@ -17,6 +17,20 @@ class RecommendationRefreshCoordinator(
     private val started = AtomicBoolean(false)
     private val requestGuard = Any()
 
+    /**
+     * Bugfix 2026-07-08: a refresh request that arrived while another was
+     * already running used to be silently dropped (`if (refreshBusy) return`).
+     * That's harmless for a single Diversity tap, but the Blend control is a
+     * two-thumb RangeSlider users tend to drag several times in quick
+     * succession while comparing splits — each of those intermediate
+     * requests could land in the busy window and vanish, even though the UI
+     * had already shown a "Blend applied" toast. Instead of dropping, we now
+     * remember the latest pending reason and the in-flight run picks it up
+     * immediately after finishing, mirroring the coalescing pattern already
+     * used by [RecommendationCache].
+     */
+    @Volatile private var pendingReason: String? = null
+
     private val _lastBlendInfo = MutableStateFlow<RecommendationBlendInfo?>(null)
     val lastBlendInfo: StateFlow<RecommendationBlendInfo?> = _lastBlendInfo.asStateFlow()
 
@@ -48,13 +62,83 @@ class RecommendationRefreshCoordinator(
             return
         }
         synchronized(requestGuard) {
-            if (container.playback.refreshBusy.value) return
+            if (container.playback.refreshBusy.value) {
+                pendingReason = reason
+                android.util.Log.d(
+                    "BlendDebug",
+                    "requestRefresh reason=$reason coalesced (busy) pendingReason=$pendingReason",
+                )
+                return
+            }
             container.playback.setRefreshBusy(true)
         }
+        android.util.Log.d("BlendDebug", "requestRefresh reason=$reason launching runRefreshLoop")
         appScope.launch(Dispatchers.Default) {
-            try {
-                refreshUpcomingWithAI(reason)
-            } finally {
+            runRefreshLoop(reason)
+        }
+    }
+
+    /**
+     * Runs [refreshUpcomingWithAI] for [initialReason], then keeps going for
+     * any reason that got coalesced in via [pendingReason] while that run
+     * was in flight. `refreshBusy` only clears once there's no more pending
+     * work, so the UI's busy indicator stays accurate across the whole
+     * coalesced chain instead of flickering between runs.
+     */
+    private suspend fun runRefreshLoop(initialReason: String) {
+        var reason = initialReason
+        // Only true once we've cleared refreshBusy ourselves via the normal
+        // synchronized release below. Used by the `finally` guard so it
+        // never force-clears a *different*, legitimately-busy request that
+        // another thread may have started in the tiny window right after
+        // our own normal release (see comment on `finally` below).
+        var releasedNormally = false
+        try {
+            while (true) {
+                android.util.Log.d("BlendDebug", "runRefreshLoop iteration start reason=$reason")
+                try {
+                    refreshUpcomingWithAI(reason)
+                    android.util.Log.d("BlendDebug", "runRefreshLoop iteration done reason=$reason")
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    // Must not be swallowed: rethrowing preserves structured
+                    // concurrency. The outer finally below still guarantees
+                    // refreshBusy is released even on cancellation.
+                    throw ce
+                } catch (t: Throwable) {
+                    android.util.Log.w("RecommendationRefreshCoordinator", "refresh failed: ${t.message}", t)
+                }
+                val next = synchronized(requestGuard) {
+                    val p = pendingReason
+                    pendingReason = null
+                    if (p == null) container.playback.setRefreshBusy(false)
+                    p
+                }
+                android.util.Log.d(
+                    "BlendDebug",
+                    "runRefreshLoop coalesce-check pendingReason=$next -> " +
+                        if (next != null) "continuing" else "releasing refreshBusy",
+                )
+                if (next == null) {
+                    releasedNormally = true
+                    return
+                }
+                reason = next
+            }
+        } finally {
+            // Belt-and-suspenders: if this coroutine is cancelled (or an
+            // unexpected exception escapes) before the normal release point
+            // above ran, don't leave refreshBusy permanently stuck true —
+            // that would silently swallow every future requestRefresh()
+            // call forever (they'd just keep overwriting pendingReason with
+            // nobody left to read it), which looks exactly like "the slider
+            // stopped refreshing". Gated on `!releasedNormally` so this
+            // never clobbers a different, legitimately-busy request that
+            // started immediately after our own normal release.
+            if (!releasedNormally && container.playback.refreshBusy.value) {
+                android.util.Log.w(
+                    "BlendDebug",
+                    "runRefreshLoop exiting abnormally with refreshBusy still true — force-clearing to avoid a stuck queue",
+                )
                 container.playback.setRefreshBusy(false)
             }
         }
@@ -69,9 +153,27 @@ class RecommendationRefreshCoordinator(
         ) {
             container.playback.setRepeatMode(androidx.media3.common.Player.REPEAT_MODE_OFF)
         }
-        val mediaId = playbackState.currentMediaId ?: return
+        val mediaId = playbackState.currentMediaId
+        if (mediaId == null) {
+            android.util.Log.w("BlendDebug", "refreshUpcomingWithAI reason=$reason aborted: currentMediaId is null")
+            return
+        }
         val songs = container.library.value
-        val current = songs.firstOrNull { it.filename == mediaId } ?: return
+        val current = songs.firstOrNull { it.filename == mediaId }
+        if (current == null) {
+            android.util.Log.w(
+                "BlendDebug",
+                "refreshUpcomingWithAI reason=$reason aborted: mediaId=$mediaId not found in library " +
+                    "(librarySize=${songs.size})",
+            )
+            return
+        }
+        val tuningAtStart = container.taste.tuning.value
+        android.util.Log.d(
+            "BlendDebug",
+            "refreshUpcomingWithAI reason=$reason mediaId=$mediaId adventurous=${tuningAtStart.adventurous} " +
+                "manualBlend=${tuningAtStart.manualBlend} revision=${container.recommendationInputRevisions.currentRevision()}",
+        )
 
         val cachedTail = container.recommendationCache.popTail()
         if (cachedTail != null) {
@@ -113,8 +215,6 @@ class RecommendationRefreshCoordinator(
                     library = songs,
                     mode = "refresh",
                     overallScores = container.taste.overallScoresByFilename(),
-                    currentAnchorEligible =
-                        container.session.explicitAnchorFilename.value == current.filename,
                     manualBlend = tuning.manualBlend,
                     manualCurrentWeight = tuning.manualCurrentWeight,
                     manualSessionWeight = tuning.manualSessionWeight,
@@ -166,8 +266,6 @@ class RecommendationRefreshCoordinator(
                 library = songs,
                 mode = "refresh",
                 overallScores = container.taste.overallScoresByFilename(),
-                currentAnchorEligible =
-                    container.session.explicitAnchorFilename.value == current.filename,
                 manualBlend = tuning.manualBlend,
                 manualCurrentWeight = tuning.manualCurrentWeight,
                 manualSessionWeight = tuning.manualSessionWeight,

@@ -106,7 +106,6 @@ class Recommender(
         library: List<Song>,
         mode: String = "play",
         overallScores: Map<String, Float> = emptyMap(),
-        currentAnchorEligible: Boolean = true,
         manualBlend: Boolean = false,
         manualCurrentWeight: Float = TasteEngine.DEFAULT_MANUAL_CURRENT_WEIGHT,
         manualSessionWeight: Float = TasteEngine.DEFAULT_MANUAL_SESSION_WEIGHT,
@@ -136,7 +135,17 @@ class Recommender(
         val sessionVec = if (sessionVecs.isNotEmpty())
             weightedAvgVec(sessionVecs, sessionWeightsByHash)
         else null
-        val hasCurrent = currentVec != null && currentAnchorEligible
+        // 2026-07-08 design change: "Current" now always means whatever
+        // song is playing right now, regardless of how it got there (an
+        // explicit tap, an auto-advance, a skip). Previously this required
+        // an explicit tap (`currentAnchorEligible`), so a manual Blend drag
+        // to 100% Current on an auto-advanced song was silently ignored —
+        // confusing since the slider gave no feedback that it had no
+        // effect. The anti-feedback-loop concern that motivated the old
+        // gating (Auto mode reinforcing its own picks) is mitigated by the
+        // existing Auto blend schedule, which already fades Current's
+        // share out as session evidence accumulates.
+        val hasCurrent = currentVec != null
         val hasSession = sessionVec != null
         val hasProfile = profileVec != null && profileVec.isNotEmpty()
         val nListened = sessionListened.sumOf { it.evidenceUnits.toDouble() }.toFloat()
@@ -152,6 +161,19 @@ class Recommender(
         } else {
             blendWeights(mode, nListened, hasCurrent, hasSession, hasProfile)
         }
+        // Bugfix 2026-07-08 diagnostics: the "blend slider looks like it does
+        // nothing" reports traced back to hasCurrent/hasSession/hasProfile
+        // availability collapsing the manual split. Logged on every call so
+        // it can be correlated against explicit-anchor mark/clear events.
+        android.util.Log.d(
+            "BlendDebug",
+            "buildBlendedQuery mode=$mode manualBlend=$manualBlend " +
+                "currentVecPresent=${currentVec != null} " +
+                "hasCurrent=$hasCurrent hasSession=$hasSession hasProfile=$hasProfile " +
+                "manualCurrentWeight=$manualCurrentWeight manualSessionWeight=$manualSessionWeight " +
+                "appliedWeights=(current=${w.wCurrent}, session=${w.wSession}, profile=${w.wProfile}) " +
+                "sessionListenedSize=${sessionListened.size} sessionWeightedHashes=${sessionWeightsByHash.size}",
+        )
         if (!hasCurrent && !hasSession && !hasProfile) {
             return BlendedQueryDetails(null, w, "empty", currentVec, sessionVec, profileVec)
         }

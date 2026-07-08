@@ -164,8 +164,6 @@ class QueueContinuationCoordinator(
                 library = songs,
                 mode = "play",
                 overallScores = container.taste.overallScoresByFilename(),
-                currentAnchorEligible =
-                    container.session.explicitAnchorFilename.value == current.filename,
                 manualBlend = tuning.manualBlend,
                 manualCurrentWeight = tuning.manualCurrentWeight,
                 manualSessionWeight = tuning.manualSessionWeight,

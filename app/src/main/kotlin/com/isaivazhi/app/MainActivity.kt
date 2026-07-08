@@ -1928,8 +1928,6 @@ private fun AppRoot(container: AppContainer) {
                         library = songsSnapshot,
                         mode = "play",
                         overallScores = container.taste.overallScoresByFilename(),
-                        currentAnchorEligible =
-                            container.session.explicitAnchorFilename.value == song.filename,
                         manualBlend = tuningSnapshot.manualBlend,
                         manualCurrentWeight = tuningSnapshot.manualCurrentWeight,
                         manualSessionWeight = tuningSnapshot.manualSessionWeight,
@@ -2176,8 +2174,6 @@ private fun AppRoot(container: AppContainer) {
                     library = songs,
                     mode = "play",
                     overallScores = container.taste.overallScoresByFilename(),
-                    currentAnchorEligible =
-                        container.session.explicitAnchorFilename.value == liveCurrent.filename,
                     manualBlend = liveTuning.manualBlend,
                     manualCurrentWeight = liveTuning.manualCurrentWeight,
                     manualSessionWeight = liveTuning.manualSessionWeight,
@@ -2649,8 +2645,6 @@ private fun AppRoot(container: AppContainer) {
                                             library = songs,
                                             mode = "refresh",
                                             overallScores = container.taste.overallScoresByFilename(),
-                                            currentAnchorEligible =
-                                                container.session.explicitAnchorFilename.value == current.filename,
                                             manualBlend = buildTuning.manualBlend,
                                             manualCurrentWeight = buildTuning.manualCurrentWeight,
                                             manualSessionWeight = buildTuning.manualSessionWeight,
@@ -2735,6 +2729,15 @@ private fun AppRoot(container: AppContainer) {
                             tuning = tuning,
                             effectiveBlendCurrent = (sessionBlendIntervals.firstOrNull()?.currentPercent ?: 0) / 100f,
                             effectiveBlendSession = (sessionBlendIntervals.firstOrNull()?.sessionPercent ?: 0) / 100f,
+                            // Bugfix 2026-07-08: surfaced so the Blend slider can warn the
+                            // user instead of silently no-op'ing when a source has no data
+                            // (see BlendWeightLogic.normalizeAvailable). Design change
+                            // 2026-07-08: "Current" now means whatever song is playing
+                            // right now, regardless of how it got there (tap, auto-advance,
+                            // skip) — so it's available whenever a song is loaded.
+                            blendCurrentAvailable = playbackState.currentMediaId != null,
+                            blendSessionAvailable = sessionListened.any { it.contribution > 0f },
+                            blendProfileAvailable = (cachedProfileVec?.size ?: 0) > 0,
                             onManualBlendChange = { current, session ->
                                 container.setManualTasteBlend(current, session)
                                 container.toaster.show("Blend applied")

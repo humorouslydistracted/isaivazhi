@@ -580,10 +580,10 @@ class PlaybackEngine(
                 session?.markPlaybackActivity()
                 when {
                     newMediaId in prevState.playNextFilenames ->
-                        session?.markExplicitAnchor(newMediaId)
+                        session?.markExplicitAnchor(newMediaId, reason = "transition_play_next")
                     transitionSource == "manual_tap" || transitionSource == "queue_tap" ->
-                        session?.markExplicitAnchor(newMediaId)
-                    else -> session?.clearExplicitAnchor()
+                        session?.markExplicitAnchor(newMediaId, reason = "transition_$transitionSource")
+                    else -> session?.clearExplicitAnchor(reason = "transition_$transitionSource")
                 }
                 val tracker = recentlySurfacedTracker
                 if (tracker != null &&
@@ -854,7 +854,9 @@ class PlaybackEngine(
     ) {
         pendingTransitionSource = source
         if (source == "manual_tap" || source == "queue_tap") {
-            songs.getOrNull(startIndex)?.filename?.let { session?.markExplicitAnchor(it) }
+            songs.getOrNull(startIndex)?.filename?.let {
+                session?.markExplicitAnchor(it, reason = "playQueue_$source")
+            }
         }
         // Push #69: if the queue is being REPLACED while another song is
         // currently playing, flush evidence for the displaced previous
@@ -1251,7 +1253,9 @@ class PlaybackEngine(
     /** Jump to a specific index in the current queue. */
     fun playAtIndex(index: Int) {
         pendingTransitionSource = "queue_tap"
-        _state.value.queueFilenames.getOrNull(index)?.let { session?.markExplicitAnchor(it) }
+        _state.value.queueFilenames.getOrNull(index)?.let {
+            session?.markExplicitAnchor(it, reason = "playAtIndex")
+        }
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val count = ctrl.mediaItemCount
@@ -1670,7 +1674,7 @@ class PlaybackEngine(
      */
     fun playNext(song: Song) {
         if (song.filePath.isNullOrEmpty()) return
-        session?.markExplicitAnchor(song.filename)
+        session?.markExplicitAnchor(song.filename, reason = "playNext")
         scope.launch {
             val ctrl = runCatching { ensureController() }.getOrNull() ?: return@launch
             val count = ctrl.mediaItemCount

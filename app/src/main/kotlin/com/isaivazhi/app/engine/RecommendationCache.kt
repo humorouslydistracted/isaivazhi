@@ -62,6 +62,15 @@ class RecommendationCache(
     @Volatile private var pendingSeed: String? = null
     @Volatile private var pendingReason: String = ""
     @Volatile private var lastSeed: String? = null
+    // Bugfix 2026-07-08: the coalescing continuation below used to compare
+    // only `lastSeed`, so a tuning change (Diversity/Blend) that arrived
+    // while the same song was already precomputing got silently swallowed —
+    // `nextSeed == lastSeed` (same song) short-circuited the loop even
+    // though the revision (and therefore the correct output) had changed.
+    // Tracking the last successfully-cached revision lets the coalescing
+    // check distinguish "duplicate request, nothing to do" from "same song,
+    // but tuning moved — must recompute".
+    @Volatile private var lastRevision: Long = -1L
 
     /** Start observing song-change + taste-change signals. Idempotent. */
     fun start() {
@@ -97,11 +106,20 @@ class RecommendationCache(
             val currentSeed = container.playback.state.value.currentMediaId
             val currentRevision = container.recommendationInputRevisions.currentRevision()
             if (!taken.isUsableFor(currentSeed, currentRevision)) {
+                android.util.Log.d(
+                    "BlendDebug",
+                    "popTail: cached tail STALE (cachedSeed=${taken.seedFilename} cachedRevision=${taken.revision} " +
+                        "currentSeed=$currentSeed currentRevision=$currentRevision) -> falling back to live compute",
+                )
                 _tail.value = null
                 return null
             }
             _tail.value = null
         }
+        android.util.Log.d(
+            "BlendDebug",
+            "popTail: ${if (taken != null) "HIT (revision=${taken.revision})" else "EMPTY"}",
+        )
         val seed = container.playback.state.value.currentMediaId
         if (!seed.isNullOrBlank()) {
             requestCompute(seed, reason = "pop_refill")
@@ -180,6 +198,7 @@ class RecommendationCache(
                         ) {
                             _tail.value = cachedTail
                             lastSeed = seed
+                            lastRevision = revisionAtStart
                         } else {
                             status = "stale"
                         }
@@ -217,10 +236,19 @@ class RecommendationCache(
 
             val nextSeed = pendingSeed
             val nextReason = pendingReason
-            if (nextSeed != null && nextSeed != lastSeed) {
+            val revisionNow = container.recommendationInputRevisions.currentRevision()
+            val staleAgainstLastCache = nextSeed != null &&
+                (nextSeed != lastSeed || revisionNow != lastRevision)
+            android.util.Log.d(
+                "BlendDebug",
+                "RecommendationCache coalesce-check nextSeed=$nextSeed lastSeed=$lastSeed " +
+                    "revisionNow=$revisionNow lastRevision=$lastRevision " +
+                    "willRecompute=$staleAgainstLastCache reason=$nextReason",
+            )
+            if (staleAgainstLastCache) {
                 pendingSeed = null
                 pendingReason = ""
-                seed = nextSeed
+                seed = nextSeed!!
                 reason = "$nextReason+coalesced"
                 continue
             }
@@ -274,8 +302,6 @@ class RecommendationCache(
                 library = library,
                 mode = "refresh",
                 overallScores = container.taste.overallScoresByFilename(),
-                currentAnchorEligible =
-                    container.session.explicitAnchorFilename.value == current.filename,
                 manualBlend = tuning.manualBlend,
                 manualCurrentWeight = tuning.manualCurrentWeight,
                 manualSessionWeight = tuning.manualSessionWeight,
