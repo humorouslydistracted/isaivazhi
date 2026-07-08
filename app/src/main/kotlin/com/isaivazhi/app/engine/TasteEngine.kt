@@ -1586,6 +1586,25 @@ fun computeUnifiedScore(
     )
 }
 
+private const val PROFILE_ANCHOR_FAVORITE_SHARE = 0.40f
+private const val PROFILE_ANCHOR_BEHAVIOR_SHARE = 0.60f
+
+fun profileAnchorScore(
+    signal: TasteEngine.TasteSignal,
+    breakdown: TasteEngine.DirectScoreBreakdown,
+): Float {
+    if (breakdown.directScore <= 0f || breakdown.score <= 0f) return 0f
+
+    val favoriteComponent = if (signal.isFavorite || signal.favoritePrior > 0f) 1f else 0f
+    val ownPositive = (breakdown.positiveWeight - signal.favoritePrior).coerceAtLeast(0f)
+    val positiveSimilarity = (breakdown.effectivePositive - breakdown.positiveWeight).coerceAtLeast(0f)
+    val behaviorComponent = ((ownPositive + positiveSimilarity) /
+        UnifiedTasteContract.TASTE_SCORE_NORMALIZER).coerceIn(0f, 1f)
+
+    return (PROFILE_ANCHOR_FAVORITE_SHARE * favoriteComponent) +
+        (PROFILE_ANCHOR_BEHAVIOR_SHARE * behaviorComponent)
+}
+
 /**
  * Stats-only fallback used by the Taste page for songs that have history
  * data but no TasteSignal entry yet.

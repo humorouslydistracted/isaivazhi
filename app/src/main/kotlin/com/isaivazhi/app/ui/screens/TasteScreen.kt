@@ -84,12 +84,8 @@ fun TasteScreen(
     sessionBlendIntervals: List<SessionBlendInterval> = emptyList(),
     engineSnapshot: EngineSnapshot,
     onBack: () -> Unit,
-    onAdventurousChange: (Float) -> Unit,
     onTasteInfluenceChange: (Float) -> Unit,
-    onManualBlendChange: (current: Float, session: Float) -> Unit,
-    onBlendAutoReset: () -> Unit,
     onNegativeStrengthChange: (Float) -> Unit,
-    onAdventurousReset: () -> Unit,
     onTasteInfluenceReset: () -> Unit,
     onNegativeStrengthReset: () -> Unit,
     onResetSongStats: (filename: String) -> Unit,
@@ -347,17 +343,19 @@ fun TasteScreen(
                 )
             }
             item {
-                TuningRow(
-                    label = "Adventurous",
+                if (false) {
+                    TuningRow(
+                    label = "Diversity",
                     value = tuning.adventurous,
                     // Push #78: tooltip text copied verbatim from the
                     // Capacitor build (`app-taste-ui.js:390`) so the user
                     // gets the same explanation they saw in the working
                     // baseline. Surfaced via the info ⓘ icon in TuningRow.
                     description = "Higher = more diverse Up Next picks (spread across your library). Lower = stick closer to what you just played. Internally drives MMR's diversity weight (engine maps adventurous → 1−lambda so the label matches the math).",
-                    onChange = onAdventurousChange,
-                    onReset = onAdventurousReset,
-                )
+                    onChange = {},
+                        onReset = {},
+                    )
+                }
             }
             item {
                 TuningRow(
@@ -374,13 +372,15 @@ fun TasteScreen(
                 val latest = sessionBlendIntervals.firstOrNull()
                 val autoCurrent = (latest?.currentPercent ?: 0) / 100f
                 val autoSession = (latest?.sessionPercent ?: 0) / 100f
-                BlendTuningRow(
-                    tuning = tuning,
-                    effectiveCurrent = autoCurrent,
-                    effectiveSession = autoSession,
-                    onManualChange = onManualBlendChange,
-                    onAutoReset = onBlendAutoReset,
-                )
+                if (false) {
+                    BlendTuningRow(
+                        tuning = tuning,
+                        effectiveCurrent = autoCurrent,
+                        effectiveSession = autoSession,
+                        onManualChange = { _, _ -> },
+                        onAutoReset = {},
+                    )
+                }
             }
             item {
                 val guard = tuning.negativeStrength.coerceIn(0f, 1f)

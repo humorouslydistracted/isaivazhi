@@ -83,6 +83,7 @@ import com.isaivazhi.app.engine.LibraryCache
 import com.isaivazhi.app.engine.QueueContinuationPolicy
 import com.isaivazhi.app.engine.Song
 import com.isaivazhi.app.engine.TasteEngine
+import com.isaivazhi.app.engine.profileAnchorScore
 import com.isaivazhi.app.engine.signedDirectScore
 import com.isaivazhi.app.ui.rememberAudioPermissionGate
 import com.isaivazhi.app.ui.rememberDeleteSongHelper
@@ -1643,7 +1644,7 @@ private fun AppRoot(container: AppContainer) {
     // below prevent unnecessary DB work on every single play event.
     val profileEvidenceRevision = remember(tasteSignals) {
         tasteSignals.values.fold(0L) { acc, signal ->
-            acc xor signal.lastUpdatedAt xor signal.positiveEvidenceUpdatedAt
+            acc xor signal.lastUpdatedAt xor signal.positiveEvidenceUpdatedAt xor signal.similarityBoostUpdatedAt
         }
     }
     LaunchedEffect(profileEvidenceRevision, embeddingsRowCount) {
@@ -1653,47 +1654,56 @@ private fun AppRoot(container: AppContainer) {
         val hasCachedProfileVec = cachedProfileVec != null
         val rebuilt = kotlinx.coroutines.withContext(Dispatchers.Default) {
             val byFilename = songs.associateBy { it.filename }
-            val overallScores = container.taste.overallScoresByFilename()
-            val topPlays = decoratedSignals.rows.entries
+            val profileAnchorLimit = 100
+            val profileAnchors = decoratedSignals.rows.values
                 .asSequence()
-                .filter { (filename, _) -> (overallScores[filename] ?: 0f) > 0f }
-                .sortedByDescending { (filename, _) -> overallScores[filename] ?: 0f }
-                .take(30)
+                .mapNotNull { row ->
+                    val song = byFilename[row.filename] ?: return@mapNotNull null
+                    if (song.contentHash.isNullOrBlank() || song.filePath !in embeddedFilepaths) {
+                        return@mapNotNull null
+                    }
+                    val score = profileAnchorScore(row.signal, row.breakdown)
+                    if (score <= 0f) return@mapNotNull null
+                    Triple(row.filename, song, score)
+                }
+                .sortedWith(
+                    compareByDescending<Triple<String, Song, Float>> { it.third }
+                        .thenBy { it.first }
+                )
+                .take(profileAnchorLimit)
                 .toList()
-            if (topPlays.isEmpty()) return@withContext null
-            val anchorSongs = topPlays.mapNotNull { byFilename[it.key] }
-                .filter { !it.contentHash.isNullOrBlank() && it.filePath in embeddedFilepaths }
-            if (anchorSongs.isEmpty()) return@withContext null
-            // Include rounded play/fraction weights so the centroid rebuilds
-            // when existing top-30 songs accumulate significantly more listens,
-            // not only when the set of top-30 filenames itself changes.
-            val fingerprint = topPlays.take(30)
-                .joinToString("|") { (fn, _) ->
-                    "$fn:${"%.2f".format(overallScores[fn] ?: 0f)}"
+            if (profileAnchors.isEmpty()) return@withContext null
+            // Include rounded profile weights so the centroid rebuilds when
+            // top-100 membership or favorite/listen/similarity balance changes.
+            val fingerprint = profileAnchors
+                .joinToString("|") { (fn, _, score) ->
+                    "$fn:${"%.2f".format(score)}"
                 }
                 .hashCode().toString()
             val current = runCatching { container.preferences.loadProfileVec() }.getOrNull()
             if (current?.fingerprint == fingerprint && hasCachedProfileVec) return@withContext null
             // Build centroid.
-            val hashes = anchorSongs.mapNotNull { it.contentHash }.distinct()
+            val hashes = profileAnchors.mapNotNull { (_, song, _) -> song.contentHash }.distinct()
             val vecsByHash = runCatching { container.embeddingDb.getVecsByHashes(hashes) }.getOrDefault(emptyMap())
             if (vecsByHash.isEmpty()) return@withContext null
             val dim = vecsByHash.values.first().size
             val pv = FloatArray(dim)
             var totalWeight = 0f
-            for (song in anchorSongs) {
+            var anchorCount = 0
+            for ((_, song, score) in profileAnchors) {
                 val v = vecsByHash[song.contentHash ?: continue] ?: continue
-                val w = (overallScores[song.filename] ?: 0f).coerceIn(0f, 4f)
+                val w = score.coerceIn(0f, 1f)
                 if (w <= 0f) continue
                 for (d in 0 until dim) pv[d] += v[d] * w
                 totalWeight += w
+                anchorCount++
             }
             if (totalWeight <= 0f) return@withContext null
             var n2 = 0f
             for (d in 0 until dim) { pv[d] /= totalWeight; n2 += pv[d] * pv[d] }
             val inv = if (n2 > 0f) 1f / kotlin.math.sqrt(n2) else 0f
             for (d in 0 until dim) pv[d] *= inv
-            Triple(pv, fingerprint, anchorSongs.size)
+            Triple(pv, fingerprint, anchorCount)
         } ?: return@LaunchedEffect
         val (pv, fingerprint, anchorCount) = rebuilt
         cachedProfileVec = pv
@@ -2722,10 +2732,29 @@ private fun AppRoot(container: AppContainer) {
                             refreshInProgress = refreshInProgress ||
                                 (playbackState.currentMediaId != null && !startupRefreshReady),
                             explanations = queueExplanations,
-                            blendInfo = upNextBlendInfo,
-                            adventurous = lastQueueBuildSnapshot?.adventurous ?: tuning.adventurous,
-                            negativeGuard = lastQueueBuildSnapshot?.negativeStrength ?: tuning.negativeStrength,
-                            tasteInfluence = lastQueueBuildSnapshot?.tasteInfluence ?: tuning.tasteInfluence,
+                            tuning = tuning,
+                            effectiveBlendCurrent = (sessionBlendIntervals.firstOrNull()?.currentPercent ?: 0) / 100f,
+                            effectiveBlendSession = (sessionBlendIntervals.firstOrNull()?.sessionPercent ?: 0) / 100f,
+                            onManualBlendChange = { current, session ->
+                                container.setManualTasteBlend(current, session)
+                                container.toaster.show("Blend applied")
+                                refreshUpcomingWithAI()
+                            },
+                            onBlendAutoReset = {
+                                container.resetTasteBlendToAuto()
+                                container.toaster.show("Blend returned to Auto")
+                                refreshUpcomingWithAI()
+                            },
+                            onDiversityChange = {
+                                container.setTasteAdventurous(it)
+                                container.toaster.show("Diversity: ${(it * 100).toInt()}%")
+                                refreshUpcomingWithAI()
+                            },
+                            onDiversityReset = {
+                                container.resetTasteAdventurous()
+                                container.toaster.show("Diversity reset to ${(TasteEngine.DEFAULT_ADVENTUROUS * 100).toInt()}%")
+                                refreshUpcomingWithAI()
+                            },
                             playNextFilenames = playbackState.playNextFilenames,
                             contentPadding = PaddingValues(top = 8.dp, bottom = 8.dp),
                         )
@@ -3099,31 +3128,13 @@ private fun AppRoot(container: AppContainer) {
                 nowPlayingArtist = playbackState.artist,
             ),
             onBack = { overlay = Overlay.None },
-            onAdventurousChange = {
-                container.setTasteAdventurous(it)
-                container.toaster.show("Adventurous: ${(it * 100).toInt()}%")
-            },
             onTasteInfluenceChange = {
                 container.setTasteInfluence(it)
                 container.toaster.show("Taste influence: ${(it * 100).toInt()}%")
             },
-            onManualBlendChange = { current, session ->
-                container.setManualTasteBlend(current, session)
-                container.toaster.show("Manual blend applied")
-                refreshUpcomingWithAI()
-            },
-            onBlendAutoReset = {
-                container.resetTasteBlendToAuto()
-                container.toaster.show("Blend returned to Auto")
-                refreshUpcomingWithAI()
-            },
             onNegativeStrengthChange = {
                 container.setTasteNegativeStrength(it)
                 container.toaster.show("Negative guard: ${(it * 100).toInt()}%")
-            },
-            onAdventurousReset = {
-                container.resetTasteAdventurous()
-                container.toaster.show("Adventurous reset to ${(TasteEngine.DEFAULT_ADVENTUROUS * 100).toInt()}%")
             },
             onTasteInfluenceReset = {
                 container.resetTasteInfluence()

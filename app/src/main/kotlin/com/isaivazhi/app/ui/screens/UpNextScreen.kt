@@ -30,26 +30,34 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DragIndicator
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.RangeSlider
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.isaivazhi.app.engine.Song
 import com.isaivazhi.app.engine.RecommendationBlendInfo
+import com.isaivazhi.app.engine.Song
 import com.isaivazhi.app.engine.RecommendationExplanation
 import com.isaivazhi.app.engine.RecommendationInfluence
+import com.isaivazhi.app.engine.TasteEngine
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 
@@ -81,10 +89,13 @@ fun UpNextScreen(
     refreshEnabled: Boolean = true,
     refreshInProgress: Boolean = false,
     explanations: List<RecommendationExplanation> = emptyList(),
-    blendInfo: RecommendationBlendInfo? = null,
-    adventurous: Float = 0.4f,
-    negativeGuard: Float = 0.5f,
-    tasteInfluence: Float = 0.3f,
+    tuning: TasteEngine.Tuning = TasteEngine.Tuning(),
+    effectiveBlendCurrent: Float = 0f,
+    effectiveBlendSession: Float = 0f,
+    onManualBlendChange: (current: Float, session: Float) -> Unit = { _, _ -> },
+    onBlendAutoReset: () -> Unit = {},
+    onDiversityChange: (Float) -> Unit = {},
+    onDiversityReset: () -> Unit = {},
     playNextFilenames: Set<String> = emptySet(),
     contentPadding: PaddingValues = PaddingValues(0.dp),
 ) {
@@ -101,13 +112,6 @@ fun UpNextScreen(
     val hiddenPrevCount = (previously.size - visiblePrev.size).coerceAtLeast(0)
     val queueExplanations = remember(queue, explanations) {
         alignQueueExplanations(queue, explanations)
-    }
-    val upcomingExplanations = remember(queueExplanations, safeIndex) {
-        if (safeIndex + 1 >= queueExplanations.size) {
-            emptyList()
-        } else {
-            queueExplanations.subList(safeIndex + 1, queueExplanations.size)
-        }
     }
 
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
@@ -156,14 +160,15 @@ fun UpNextScreen(
                 }
             }
         }
-        if (aiMode && blendInfo != null) {
-            BlendSummary(
-                blendInfo = blendInfo,
-                adventurous = adventurous,
-                negativeGuard = negativeGuard,
-                tasteInfluence = tasteInfluence,
-                filteredCount = explanations.maxOfOrNull { it.negativeFilteredCount } ?: 0,
-                queueExplanations = upcomingExplanations.filterNotNull(),
+        if (aiMode) {
+            QueueTuningHeader(
+                tuning = tuning,
+                effectiveCurrent = effectiveBlendCurrent,
+                effectiveSession = effectiveBlendSession,
+                onManualBlendChange = onManualBlendChange,
+                onBlendAutoReset = onBlendAutoReset,
+                onDiversityChange = onDiversityChange,
+                onDiversityReset = onDiversityReset,
             )
         }
 
@@ -541,6 +546,258 @@ private fun InfluenceLegend(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+@Composable
+private fun QueueTuningHeader(
+    tuning: TasteEngine.Tuning,
+    effectiveCurrent: Float,
+    effectiveSession: Float,
+    onManualBlendChange: (Float, Float) -> Unit,
+    onBlendAutoReset: () -> Unit,
+    onDiversityChange: (Float) -> Unit,
+    onDiversityReset: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 2.dp),
+    ) {
+        TuningRow(
+            label = "Diversity",
+            value = tuning.adventurous,
+            description = "Higher = more varied Up Next picks across your library. Lower = stay closer to the current blend.",
+            onChange = onDiversityChange,
+            onReset = onDiversityReset,
+        )
+        BlendTuningRow(
+            tuning = tuning,
+            effectiveCurrent = effectiveCurrent,
+            effectiveSession = effectiveSession,
+            onManualChange = onManualBlendChange,
+            onAutoReset = onBlendAutoReset,
+        )
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+private fun BlendTuningRow(
+    tuning: TasteEngine.Tuning,
+    effectiveCurrent: Float,
+    effectiveSession: Float,
+    onManualChange: (Float, Float) -> Unit,
+    onAutoReset: () -> Unit,
+) {
+    val sourceCurrent = if (tuning.manualBlend) tuning.manualCurrentWeight else effectiveCurrent
+    val sourceSession = if (tuning.manualBlend) tuning.manualSessionWeight else effectiveSession
+    val baseRange = sourceCurrent.coerceIn(0f, 1f)..
+        (sourceCurrent + sourceSession).coerceIn(sourceCurrent, 1f)
+    var drag by remember(baseRange.start, baseRange.endInclusive) {
+        mutableStateOf<ClosedFloatingPointRange<Float>?>(null)
+    }
+    val displayed = drag ?: baseRange
+    val current = displayed.start
+    val session = (displayed.endInclusive - displayed.start).coerceAtLeast(0f)
+    val profile = (1f - displayed.endInclusive).coerceAtLeast(0f)
+    val currentPct = (current * 100).toInt()
+    val sessionPct = (session * 100).toInt()
+    val profilePct = (profile * 100).toInt()
+    var showInfo by remember { mutableStateOf(false) }
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            title = { Text(if (tuning.manualBlend) "Blend (Manual)" else "Blend (Auto)") },
+            text = {
+                Text(
+                    "Current $currentPct%, Session $sessionPct%, Long-term $profilePct%.\n\n" +
+                        "Current = songs similar to the song you explicitly started.\n" +
+                        "Session = songs similar to the positively-heard songs from this app run.\n" +
+                        "Long-term = songs similar to your saved taste profile built from your strongest long-term positives.\n\n" +
+                        "Auto moves these weights as session evidence grows. Dragging either divider switches to Manual."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showInfo = false }) { Text("Got it") }
+            },
+        )
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+    ) {
+        Text(
+            text = "Current $currentPct% · Session $sessionPct% · Profile $profilePct%",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 96.dp, bottom = 2.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Blend",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.width(72.dp),
+                maxLines = 1,
+            )
+            IconButton(
+                onClick = { showInfo = true },
+                modifier = Modifier.size(24.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Info,
+                    contentDescription = "About Blend",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            RangeSlider(
+                value = displayed,
+                onValueChange = { drag = it },
+                onValueChangeFinished = {
+                    drag?.let { range ->
+                        onManualChange(
+                            range.start,
+                            (range.endInclusive - range.start).coerceAtLeast(0f),
+                        )
+                    }
+                    drag = null
+                },
+                valueRange = 0f..1f,
+                steps = 19,
+                colors = androidx.compose.material3.SliderDefaults.colors(
+                    activeTrackColor = MaterialTheme.colorScheme.primary,
+                    inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    activeTickColor = MaterialTheme.colorScheme.primary,
+                    inactiveTickColor = MaterialTheme.colorScheme.surfaceVariant,
+                    thumbColor = MaterialTheme.colorScheme.primary,
+                ),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(16.dp),
+            )
+            IconButton(
+                onClick = onAutoReset,
+                enabled = tuning.manualBlend,
+                modifier = Modifier.size(36.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Refresh,
+                    contentDescription = "Reset Blend to Auto",
+                    tint = if (tuning.manualBlend) MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+private fun TuningRow(
+    label: String,
+    value: Float,
+    description: String,
+    onChange: (Float) -> Unit,
+    onReset: () -> Unit,
+) {
+    var drag by remember(value) { mutableStateOf<Float?>(null) }
+    val displayed = drag ?: value
+    val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    var showInfo by remember { mutableStateOf(false) }
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            title = { Text(label) },
+            text = { Text(description) },
+            confirmButton = {
+                TextButton(onClick = { showInfo = false }) { Text("Got it") }
+            },
+        )
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier.width(72.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        IconButton(
+            onClick = { showInfo = true },
+            modifier = Modifier.size(24.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Info,
+                contentDescription = "About $label",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Slider(
+            value = displayed,
+            onValueChange = { drag = it },
+            onValueChangeFinished = {
+                drag?.let { onChange(it) }
+                drag = null
+            },
+            valueRange = 0f..1f,
+            steps = 9,
+            interactionSource = interactionSource,
+            modifier = Modifier
+                .weight(1f)
+                .height(16.dp),
+            thumb = {
+                androidx.compose.material3.SliderDefaults.Thumb(
+                    interactionSource = interactionSource,
+                    thumbSize = androidx.compose.ui.unit.DpSize(4.dp, 14.dp),
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = MaterialTheme.colorScheme.primary,
+                    ),
+                )
+            },
+            track = { state ->
+                androidx.compose.material3.SliderDefaults.Track(
+                    sliderState = state,
+                    modifier = Modifier.height(2.dp),
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        activeTrackColor = MaterialTheme.colorScheme.primary,
+                        inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                )
+            },
+        )
+        Text(
+            text = "${(displayed * 100).toInt()}%",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.width(40.dp).padding(start = 6.dp),
+        )
+        IconButton(
+            onClick = onReset,
+            modifier = Modifier.size(36.dp),
+        ) {
+            Icon(
+                Icons.Filled.Refresh,
+                contentDescription = "Reset $label",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
+            )
+        }
     }
 }
 

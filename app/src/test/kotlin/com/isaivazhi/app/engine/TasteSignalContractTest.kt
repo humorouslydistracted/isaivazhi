@@ -113,6 +113,83 @@ class TasteSignalContractTest {
         )
     }
 
+    @Test
+    fun profileAnchorScore_blendsFavoriteAndBehaviorWithoutLettingFavoriteDominate() {
+        val now = 100L * TasteEngine.PROFILE_DAY_MS
+        val favoriteOnly = profileScore(
+            signal = TasteEngine.TasteSignal(
+                isFavorite = true,
+                favoritePrior = TasteEngine.MANUAL_FAVORITE_PRIOR_BASE,
+            ),
+            now = now,
+        )
+        val strongListened = profileScore(
+            signal = TasteEngine.TasteSignal(
+                positiveEvidence = UnifiedTasteContract.TASTE_SCORE_NORMALIZER,
+                positiveEvidenceUpdatedAt = now,
+                lastUpdatedAt = now,
+            ),
+            now = now,
+        )
+        val favoriteAndListened = profileScore(
+            signal = TasteEngine.TasteSignal(
+                isFavorite = true,
+                favoritePrior = TasteEngine.MANUAL_FAVORITE_PRIOR_BASE,
+                positiveEvidence = UnifiedTasteContract.TASTE_SCORE_NORMALIZER,
+                positiveEvidenceUpdatedAt = now,
+                lastUpdatedAt = now,
+            ),
+            now = now,
+        )
+
+        assertEquals(0.40f, favoriteOnly, 0.001f)
+        assertEquals(0.60f, strongListened, 0.001f)
+        assertEquals(1.00f, favoriteAndListened, 0.001f)
+        assertTrue(strongListened > favoriteOnly)
+        assertTrue(favoriteAndListened > strongListened)
+    }
+
+    @Test
+    fun profileAnchorScore_usesOnlyPositiveSimilarityAndRejectsNegativeTaste() {
+        val now = 100L * TasteEngine.PROFILE_DAY_MS
+        val positiveSimilarity = profileScore(
+            signal = TasteEngine.TasteSignal(
+                positiveEvidence = 2f,
+                positiveEvidenceUpdatedAt = now,
+                similarityBoost = 0.5f,
+                similarityBoostUpdatedAt = now,
+                lastUpdatedAt = now,
+            ),
+            now = now,
+        )
+        val negativeSimilarity = profileScore(
+            signal = TasteEngine.TasteSignal(
+                positiveEvidence = 2f,
+                positiveEvidenceUpdatedAt = now,
+                similarityBoost = -0.5f,
+                similarityBoostUpdatedAt = now,
+                lastUpdatedAt = now,
+            ),
+            now = now,
+        )
+        val avoidedDespitePositiveSimilarity = profileScore(
+            signal = TasteEngine.TasteSignal(
+                positiveEvidence = 1f,
+                positiveEvidenceUpdatedAt = now,
+                xScore = 1.2f,
+                xScoreUpdatedAt = now,
+                similarityBoost = 0.5f,
+                similarityBoostUpdatedAt = now,
+                lastUpdatedAt = now,
+            ),
+            now = now,
+        )
+
+        assertEquals(0.375f, positiveSimilarity, 0.001f)
+        assertEquals(0.30f, negativeSimilarity, 0.001f)
+        assertEquals(0f, avoidedDespitePositiveSimilarity, 0.001f)
+    }
+
     private fun assertOutcome(
         fraction: Float,
         expectedOutcome: PlaybackOutcome,
@@ -124,5 +201,21 @@ class TasteSignalContractTest {
             UnifiedTasteContract.positiveContribution(fraction),
             0.001f,
         )
+    }
+
+    private fun profileScore(signal: TasteEngine.TasteSignal, now: Long): Float {
+        val breakdown = computeUnifiedScore(
+            positiveEvidence = signal.positiveEvidence,
+            positiveEvidenceUpdatedAt = signal.positiveEvidenceUpdatedAt,
+            xScore = signal.xScore,
+            favoritePrior = signal.favoritePrior,
+            dislikePrior = signal.dislikePrior,
+            similarityBoost = signal.similarityBoost,
+            xScoreUpdatedAt = signal.xScoreUpdatedAt,
+            similarityBoostUpdatedAt = signal.similarityBoostUpdatedAt,
+            lastUpdatedAt = signal.lastUpdatedAt,
+            now = now,
+        )
+        return profileAnchorScore(signal, breakdown)
     }
 }
