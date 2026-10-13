@@ -128,6 +128,7 @@ class EmbeddingEngine(
     ) { what, data -> onEvent(what, data) }
 
     private var batchStartedAtMs: Long = 0L
+    @Volatile private var lastServiceEventAtMs: Long = 0L
 
     /**
      * Songs are saved to SQLite one at a time as the service finishes them.
@@ -246,14 +247,30 @@ class EmbeddingEngine(
                 "start",
                 "batch of ${paths.size} songs queued (${EmbeddingSplitCount.positionsLabel(batchSplitCount)})",
             )
+            val startedAt = batchStartedAtMs
             startForegroundService(paths, batchSplitCount)
+            kotlinx.coroutines.delay(SERVICE_START_TIMEOUT_MS)
+            if (batchStartedAtMs == startedAt && lastServiceEventAtMs < startedAt && _status.value.inProgress) {
+                val msg = "Embedding service did not start — tap Embed again to retry"
+                logBuffer.append("error", "no reply from embedding service ${SERVICE_START_TIMEOUT_MS / 1000}s after queueing ${paths.size} songs")
+                _status.value = _status.value.copy(inProgress = false, etaSeconds = null, error = msg)
+                toaster?.show(msg)
+            }
         }
     }
 
     private fun startForegroundService(paths: List<String>, splitCount: Int) {
+        val requestFile = try {
+            EmbeddingForegroundService.writeStartRequest(appContext, paths)
+        } catch (t: Throwable) {
+            android.util.Log.w("EmbeddingEngine", "writeStartRequest failed: ${t.message}")
+            logBuffer.append("error", "could not hand ${paths.size} songs to the embedding service: ${t.message}")
+            _status.value = _status.value.copy(inProgress = false, error = "Could not start embedding: ${t.message}")
+            return
+        }
         val intent = Intent(appContext, EmbeddingForegroundService::class.java).apply {
             action = EmbeddingForegroundService.ACTION_START
-            putStringArrayListExtra(EmbeddingForegroundService.EXTRA_PATHS, ArrayList(paths))
+            putExtra(EmbeddingForegroundService.EXTRA_REQUEST_FILE, requestFile)
             putExtra(EmbeddingForegroundService.EXTRA_SPLIT_COUNT, splitCount)
             // playback-active hint: assume false here; PlaybackEngine could
             // set this via EmbeddingControllerClient.setPlaybackActive when
@@ -408,6 +425,7 @@ class EmbeddingEngine(
             EmbeddingCommandContract.MSG_NEAREST_RESULT -> "MSG_NEAREST_RESULT"
             else -> "MSG_$what"
         }
+        lastServiceEventAtMs = android.os.SystemClock.elapsedRealtime()
         android.util.Log.i("EmbeddingEngine", "recv $name")
         logBuffer.append("recv", name)
         when (what) {
@@ -582,5 +600,9 @@ class EmbeddingEngine(
         }
         val scaled = (perSongMs * EmbeddingSplitCount.timeMultiplier(splitCount)).toLong()
         return (remainingSongs.toLong() * scaled) / 1000L
+    }
+
+    private companion object {
+        const val SERVICE_START_TIMEOUT_MS = 20_000L
     }
 }

@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
@@ -58,6 +59,12 @@ public class EmbeddingForegroundService extends Service {
     // the persisted-batch resumption path.
     public static final String ACTION_RESUME = "com.isaivazhi.app.EMBEDDING_RESUME";
     public static final String EXTRA_PATHS = "paths";
+    // Name of a file (in the embedding data dir) holding the song paths for
+    // ACTION_START. Large libraries must use this instead of EXTRA_PATHS:
+    // thousands of paths exceed the Binder transaction limit, and Android
+    // then silently never delivers the start command to this service.
+    public static final String EXTRA_REQUEST_FILE = "requestFile";
+    private static final String START_REQUEST_PREFIX = "embed_start_request_";
     public static final String EXTRA_SPLIT_COUNT = "splitCount";
     public static final String EXTRA_PLAYBACK_ACTIVE = "playbackActive";
 
@@ -113,6 +120,10 @@ public class EmbeddingForegroundService extends Service {
 
         if (ACTION_START.equals(action)) {
             ArrayList<String> paths = intent.getStringArrayListExtra(EXTRA_PATHS);
+            String requestFile = intent.getStringExtra(EXTRA_REQUEST_FILE);
+            if ((paths == null || paths.isEmpty()) && requestFile != null) {
+                paths = readStartRequest(requestFile);
+            }
             batchSplitCount = EmbeddingWindowConfig.normalizeSplitCount(
                     intent.getIntExtra(EXTRA_SPLIT_COUNT, batchSplitCount));
             playbackActiveHint = intent.getBooleanExtra(EXTRA_PLAYBACK_ACTIVE, playbackActiveHint);
@@ -619,8 +630,77 @@ public class EmbeddingForegroundService extends Service {
     }
 
     private File getEmbeddingDataDir() {
-        File extDir = getApplicationContext().getExternalFilesDir(null);
-        return extDir != null ? extDir : getApplicationContext().getFilesDir();
+        return embeddingDataDir(getApplicationContext());
+    }
+
+    private static File embeddingDataDir(Context context) {
+        File extDir = context.getExternalFilesDir(null);
+        return extDir != null ? extDir : context.getFilesDir();
+    }
+
+    /**
+     * Writes the song paths for an ACTION_START to a uniquely named file and
+     * returns its name, to be passed as {@link #EXTRA_REQUEST_FILE}. Each
+     * request gets its own file so rapid back-to-back starts can't overwrite
+     * one another before the service reads them.
+     */
+    public static String writeStartRequest(Context context, List<String> paths) throws Exception {
+        JSONArray arr = new JSONArray();
+        for (String path : paths) {
+            if (path != null && !path.isEmpty()) arr.put(path);
+        }
+        JSONObject payload = new JSONObject();
+        payload.put("paths", arr);
+        File dir = embeddingDataDir(context);
+        if (!dir.exists()) dir.mkdirs();
+        String name = START_REQUEST_PREFIX + System.nanoTime() + ".json";
+        File tmp = new File(dir, name + ".tmp");
+        try (FileOutputStream fos = new FileOutputStream(tmp)) {
+            fos.write(payload.toString().getBytes(StandardCharsets.UTF_8));
+        }
+        if (!tmp.renameTo(new File(dir, name))) {
+            tmp.delete();
+            throw new java.io.IOException("could not rename " + tmp.getName());
+        }
+        return name;
+    }
+
+    private ArrayList<String> readStartRequest(String name) {
+        if (!name.startsWith(START_REQUEST_PREFIX) || name.contains("/")) {
+            Log.w(TAG, "Ignoring unexpected start request file name: " + name);
+            return null;
+        }
+        File file = new File(getEmbeddingDataDir(), name);
+        try {
+            if (!file.exists()) {
+                Log.w(TAG, "Start request file missing: " + name);
+                return null;
+            }
+            byte[] data = new byte[(int) file.length()];
+            try (FileInputStream fis = new FileInputStream(file)) {
+                int off = 0;
+                while (off < data.length) {
+                    int r = fis.read(data, off, data.length - off);
+                    if (r < 0) break;
+                    off += r;
+                }
+            }
+            JSONArray arr = new JSONObject(new String(data, StandardCharsets.UTF_8)).optJSONArray("paths");
+            ArrayList<String> paths = new ArrayList<>();
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    String path = arr.optString(i, "");
+                    if (!path.isEmpty()) paths.add(path);
+                }
+            }
+            Log.i(TAG, "Read start request " + name + " (" + paths.size() + " songs)");
+            return paths;
+        } catch (Exception e) {
+            Log.w(TAG, "readStartRequest failed for " + name, e);
+            return null;
+        } finally {
+            file.delete();
+        }
     }
 
     private void createNotificationChannel() {
