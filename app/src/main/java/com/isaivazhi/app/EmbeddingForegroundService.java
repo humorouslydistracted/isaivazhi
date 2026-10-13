@@ -46,6 +46,10 @@ public class EmbeddingForegroundService extends Service {
     private static final String CHANNEL_ID = "embedding_service_v2";
     private static final int NOTIFICATION_ID = 2;
     private static final String ACTIVE_BATCH_FILE = "active_embedding_batch.json";
+    // Append-only list (one path per line) of songs finished in the active
+    // batch. Lets a resumed batch skip them without re-writing the full
+    // batch file after every song.
+    private static final String ACTIVE_BATCH_DONE_FILE = "active_embedding_batch.done";
 
     public static final String ACTION_START = "com.isaivazhi.app.EMBEDDING_START";
     public static final String ACTION_STOP = "com.isaivazhi.app.EMBEDDING_STOP";
@@ -138,6 +142,7 @@ public class EmbeddingForegroundService extends Service {
                 broadcastStatus();
                 return START_STICKY;
             }
+            clearBatchDoneFile();
             persistActiveBatch(paths);
             // Push #40 Tier 2D: post the foreground notification IMMEDIATELY
             // with "Warming up audio model" + indeterminate progress.
@@ -243,6 +248,7 @@ public class EmbeddingForegroundService extends Service {
             @Override
             public void onSongComplete(String filename, String filepath, String contentHash) {
                 processedCount++;
+                markBatchPathDone(filepath);
                 Bundle data = new Bundle();
                 data.putString(EmbeddingCommandContract.KEY_FILENAME, filename);
                 data.putString(EmbeddingCommandContract.KEY_FILE_PATH, filepath);
@@ -552,10 +558,11 @@ public class EmbeddingForegroundService extends Service {
                     payload.optInt("splitCount", batchSplitCount));
             JSONArray arr = payload.optJSONArray("paths");
             if (arr == null || arr.length() == 0) return null;
+            java.util.Set<String> done = loadBatchDonePaths();
             ArrayList<String> paths = new ArrayList<>();
             for (int i = 0; i < arr.length(); i++) {
                 String path = arr.optString(i, "");
-                if (!path.isEmpty()) paths.add(path);
+                if (!path.isEmpty() && !done.contains(path)) paths.add(path);
             }
             return paths.isEmpty() ? null : paths;
         } catch (Exception e) {
@@ -570,6 +577,44 @@ public class EmbeddingForegroundService extends Service {
             if (file.exists()) file.delete();
         } catch (Exception e) {
             Log.w(TAG, "clearPersistedBatch failed", e);
+        }
+        clearBatchDoneFile();
+    }
+
+    private void markBatchPathDone(String filepath) {
+        if (filepath == null || filepath.isEmpty() || filepath.indexOf('\n') >= 0) return;
+        try (FileOutputStream fos = new FileOutputStream(
+                new File(getEmbeddingDataDir(), ACTIVE_BATCH_DONE_FILE), true)) {
+            fos.write((filepath + "\n").getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Log.w(TAG, "markBatchPathDone failed", e);
+        }
+    }
+
+    private java.util.Set<String> loadBatchDonePaths() {
+        java.util.Set<String> done = new java.util.HashSet<>();
+        try {
+            File file = new File(getEmbeddingDataDir(), ACTIVE_BATCH_DONE_FILE);
+            if (!file.exists()) return done;
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (!line.isEmpty()) done.add(line);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "loadBatchDonePaths failed", e);
+        }
+        return done;
+    }
+
+    private void clearBatchDoneFile() {
+        try {
+            File file = new File(getEmbeddingDataDir(), ACTIVE_BATCH_DONE_FILE);
+            if (file.exists()) file.delete();
+        } catch (Exception e) {
+            Log.w(TAG, "clearBatchDoneFile failed", e);
         }
     }
 

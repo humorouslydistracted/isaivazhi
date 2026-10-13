@@ -852,81 +852,92 @@ public final class EmbeddingDbManager {
     }
 
     /**
-     * Ingest any pending_embeddings.json the EmbeddingService wrote since the
-     * last call. Returns rowCount + clears the pending file on success.
+     * Ingest everything the EmbeddingService staged since the last call:
+     * one spool file per song under pending_songs/ (current format) plus the
+     * legacy pending_embeddings.json (written by older builds). Each spool
+     * file is deleted only after its rows are committed to SQLite.
      *
-     * Called from EmbeddingEngine after MSG_COMPLETE so newly-embedded songs
-     * land in SQLite as soon as a batch finishes. Race-safe: the embedding
-     * service writes pending_embeddings.json atomically; this reader copes
-     * with the file being mid-write by returning a zero row count and
-     * leaving the file in place for the next attempt.
+     * Called from EmbeddingEngine after every finished song and again after
+     * MSG_COMPLETE, so songs land in SQLite as they are embedded instead of
+     * only when the whole batch ends. Spool files are written via tmp+rename
+     * so a file being mid-write is never picked up.
      */
     public void recoverPendingIfAny(Callback<JSONObject> cb) {
         run(() -> {
             JSONObject out = new JSONObject();
             File dir = getDataDir();
             File pendingFile = new File(dir, "pending_embeddings.json");
-            if (!pendingFile.exists() || pendingFile.length() == 0) {
+            File spoolDir = new File(dir, EmbeddingService.SPOOL_DIR_NAME);
+
+            File[] spoolFiles = spoolDir.isDirectory()
+                    ? spoolDir.listFiles((d, name) -> name.endsWith(".json"))
+                    : null;
+            boolean hasSpool = spoolFiles != null && spoolFiles.length > 0;
+            boolean hasLegacy = pendingFile.exists() && pendingFile.length() > 0;
+            if (!hasSpool && !hasLegacy) {
                 out.put("recovered", 0);
                 out.put("reason", "no_pending_file");
                 return out;
             }
+
             try {
-                JSONObject root = new JSONObject(readUtf8(pendingFile));
                 java.util.List<EmbeddingEntity> entities = new java.util.ArrayList<>();
                 java.util.List<EmbeddingPathIndexEntity> paths = new java.util.ArrayList<>();
-                int dim = 0;
-                JSONObject pathIndex = root.optJSONObject("_path_index");
-                java.util.Iterator<String> keys = root.keys();
-                while (keys.hasNext()) {
-                    String key = keys.next();
-                    if ("_path_index".equals(key)) continue;
-                    JSONObject row = root.optJSONObject(key);
-                    if (row == null) continue;
-                    JSONArray vecArr = row.optJSONArray("embedding");
-                    if (vecArr == null || vecArr.length() == 0) continue;
-                    if (dim == 0) dim = vecArr.length();
-                    else if (dim != vecArr.length()) continue;
-                    EmbeddingEntity ent = new EmbeddingEntity();
-                    ent.contentHash = row.optString("contentHash", row.optString("content_hash", key));
-                    if (ent.contentHash.isEmpty()) continue;
-                    ent.filepath = row.optString("filepath", "");
-                    ent.filename = row.optString("filename", "");
-                    ent.artist = row.optString("artist", "");
-                    ent.album = row.optString("album", "");
-                    ent.timestamp = row.optLong("timestamp", System.currentTimeMillis());
-                    ent.dim = dim;
-                    java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(dim * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                    for (int i = 0; i < dim; i++) bb.putFloat((float) vecArr.optDouble(i, 0.0));
-                    ent.vec = bb.array();
-                    entities.add(ent);
-                    if (!ent.filepath.isEmpty()) {
-                        EmbeddingPathIndexEntity p = new EmbeddingPathIndexEntity();
-                        p.filepath = ent.filepath;
-                        p.contentHash = ent.contentHash;
-                        paths.add(p);
+                int[] dim = new int[] {0};
+                java.util.List<File> consumedSpool = new java.util.ArrayList<>();
+
+                if (hasSpool) {
+                    for (File f : spoolFiles) {
+                        try {
+                            JSONObject row = new JSONObject(readUtf8(f));
+                            appendPendingRow(row, "", entities, paths, dim);
+                        } catch (Exception e) {
+                            Log.w(TAG, "Dropping unreadable spool file " + f.getName() + ": " + e.getMessage());
+                        }
+                        consumedSpool.add(f);
                     }
                 }
-                if (pathIndex != null) {
-                    java.util.Iterator<String> pks = pathIndex.keys();
-                    while (pks.hasNext()) {
-                        String fp = pks.next();
-                        String hash = pathIndex.optString(fp, "");
-                        if (fp.isEmpty() || hash.isEmpty()) continue;
-                        EmbeddingPathIndexEntity p = new EmbeddingPathIndexEntity();
-                        p.filepath = fp;
-                        p.contentHash = hash;
-                        paths.add(p);
+
+                boolean legacyParsed = false;
+                if (hasLegacy) {
+                    JSONObject root = new JSONObject(readUtf8(pendingFile));
+                    JSONObject pathIndex = root.optJSONObject("_path_index");
+                    java.util.Iterator<String> keys = root.keys();
+                    while (keys.hasNext()) {
+                        String key = keys.next();
+                        if ("_path_index".equals(key)) continue;
+                        JSONObject row = root.optJSONObject(key);
+                        if (row == null) continue;
+                        appendPendingRow(row, key, entities, paths, dim);
                     }
+                    if (pathIndex != null) {
+                        java.util.Iterator<String> pks = pathIndex.keys();
+                        while (pks.hasNext()) {
+                            String fp = pks.next();
+                            String hash = pathIndex.optString(fp, "");
+                            if (fp.isEmpty() || hash.isEmpty()) continue;
+                            EmbeddingPathIndexEntity p = new EmbeddingPathIndexEntity();
+                            p.filepath = fp;
+                            p.contentHash = hash;
+                            paths.add(p);
+                        }
+                    }
+                    legacyParsed = true;
                 }
+
                 if (!entities.isEmpty()) db.upsertAll(entities);
                 if (!paths.isEmpty()) db.upsertPaths(paths);
-                // Clear the pending file by truncating to an empty marker
-                // (preserves the file so the embedding service knows it was
-                // consumed; same convention as the Capacitor app).
-                java.io.FileOutputStream fos = new java.io.FileOutputStream(pendingFile);
-                try { fos.write("{\"_path_index\":{}}".getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
-                finally { fos.close(); }
+
+                for (File f : consumedSpool) {
+                    if (!f.delete()) Log.w(TAG, "Could not delete ingested spool file " + f.getName());
+                }
+                if (legacyParsed) {
+                    // Truncate to an empty marker (preserves the file; same
+                    // convention as the Capacitor app).
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(pendingFile);
+                    try { fos.write("{\"_path_index\":{}}".getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+                    finally { fos.close(); }
+                }
                 out.put("recovered", entities.size());
                 out.put("totalRows", db.count());
                 Log.i(TAG, "Recovered " + entities.size() + " pending embeddings into SQLite");
@@ -938,6 +949,35 @@ public final class EmbeddingDbManager {
                 return out;
             }
         }, cb);
+    }
+
+    private static void appendPendingRow(JSONObject row, String keyFallback,
+                                         java.util.List<EmbeddingEntity> entities,
+                                         java.util.List<EmbeddingPathIndexEntity> paths,
+                                         int[] dim) {
+        JSONArray vecArr = row.optJSONArray("embedding");
+        if (vecArr == null || vecArr.length() == 0) return;
+        if (dim[0] == 0) dim[0] = vecArr.length();
+        else if (dim[0] != vecArr.length()) return;
+        EmbeddingEntity ent = new EmbeddingEntity();
+        ent.contentHash = row.optString("contentHash", row.optString("content_hash", keyFallback));
+        if (ent.contentHash.isEmpty()) return;
+        ent.filepath = row.optString("filepath", "");
+        ent.filename = row.optString("filename", "");
+        ent.artist = row.optString("artist", "");
+        ent.album = row.optString("album", "");
+        ent.timestamp = row.optLong("timestamp", System.currentTimeMillis());
+        ent.dim = dim[0];
+        java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(dim[0] * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < dim[0]; i++) bb.putFloat((float) vecArr.optDouble(i, 0.0));
+        ent.vec = bb.array();
+        entities.add(ent);
+        if (!ent.filepath.isEmpty()) {
+            EmbeddingPathIndexEntity p = new EmbeddingPathIndexEntity();
+            p.filepath = ent.filepath;
+            p.contentHash = ent.contentHash;
+            paths.add(p);
+        }
     }
 
     /**

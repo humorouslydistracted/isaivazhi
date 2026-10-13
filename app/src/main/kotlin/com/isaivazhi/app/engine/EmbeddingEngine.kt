@@ -11,6 +11,10 @@ import com.isaivazhi.app.EmbeddingForegroundService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -125,7 +129,37 @@ class EmbeddingEngine(
 
     private var batchStartedAtMs: Long = 0L
 
+    /**
+     * Songs are saved to SQLite one at a time as the service finishes them.
+     * Each MSG_SONG_COMPLETE kicks this conflated channel; the consumer
+     * ingests whatever the service has spooled so far, so a burst of fast
+     * completions collapses into a single ingest instead of queueing one per
+     * song. [ingestMutex] keeps these ingests and the final one in
+     * MSG_COMPLETE strictly ordered.
+     */
+    private val ingestKick = Channel<Unit>(Channel.CONFLATED)
+    private val ingestMutex = Mutex()
+    private val ingestedThisBatch = AtomicInteger(0)
+    @Volatile private var lastKnownTotalRows: Int = 0
+
+    private suspend fun ingestPending(): org.json.JSONObject? = ingestMutex.withLock {
+        val res = embeddingDb.recoverPendingIfAny()
+        ingestedThisBatch.addAndGet(res?.optInt("recovered", 0) ?: 0)
+        if (res != null && res.has("totalRows")) lastKnownTotalRows = res.optInt("totalRows", 0)
+        res
+    }
+
     init {
+        scope.launch {
+            for (ignored in ingestKick) {
+                try {
+                    ingestPending()
+                } catch (t: Throwable) {
+                    android.util.Log.w("EmbeddingEngine", "per-song ingest failed: ${t.message}")
+                    logBuffer.append("error", "per-song ingest failed: ${t.message}")
+                }
+            }
+        }
         // Bind early so progress events flow even if a batch was kicked off
         // by a previous app instance and is still running in :ai.
         controllerClient.ensureConnected(object : EmbeddingControllerClient.ConnectionCallback {
@@ -188,6 +222,7 @@ class EmbeddingEngine(
                 return@launch
             }
             batchSplitCount = preferences.getEmbeddingSplitCount()
+            ingestedThisBatch.set(0)
             batchStartedAtMs = android.os.SystemClock.elapsedRealtime()
             // Push #49: preserve the previous run's snapshot fields so the
             // "Last run" line can keep showing during the brief gap
@@ -448,6 +483,7 @@ class EmbeddingEngine(
                 if (filepath.isNotBlank()) {
                     _songComplete.tryEmit(SongCompleteEvent(filename = filename, filepath = filepath))
                 }
+                ingestKick.trySend(Unit)
             }
             EmbeddingCommandContract.MSG_COMPLETE -> {
                 val processed = data.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0)
@@ -474,9 +510,10 @@ class EmbeddingEngine(
                 scope.launch {
                     try {
                         preferences.saveLastEmbedSplitCount(batchSplitCount)
-                        val res = embeddingDb.recoverPendingIfAny()
-                        val recovered = res?.optInt("recovered", 0) ?: 0
-                        val totalRows = res?.optInt("totalRows", 0) ?: 0
+                        val res = ingestPending()
+                        val recovered = ingestedThisBatch.getAndSet(0)
+                        val totalRows = res?.takeIf { it.has("totalRows") }?.optInt("totalRows", 0)
+                            ?: lastKnownTotalRows
                         logBuffer.append("ingest", "recovered=$recovered totalRows=$totalRows")
                         _batchComplete.tryEmit(BatchCompleteEvent(processed, failed, recovered, totalRows))
                         // Push #46: refresh the portable JSON backup so it

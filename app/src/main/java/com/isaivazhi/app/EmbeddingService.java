@@ -50,12 +50,12 @@ import java.util.concurrent.TimeoutException;
  *   4. Extract 3 x 10-second windows (at 20%, 50%, 80%)
  *   5. Run CLAP HTSAT-base encoder via ONNX
  *   6. Average window embeddings + L2 normalize
- *   7. Save to pending_embeddings.json
+ *   7. Save to a per-song spool file under pending_songs/
  *
  * The ONNX model (clap_audio_encoder.onnx) is loaded from internal storage
  * ({@link #ONNX_MODEL_DIR_NAME}), optionally copied from APK assets on dev
  * builds, or downloaded at runtime via {@link com.isaivazhi.app.engine.OnnxModelDownload}.
- * Results are staged in pending_embeddings.json and later promoted to the
+ * Results are staged one file per song in pending_songs/ and promoted to the
  * stable binary store by the JS layer.
  */
 public class EmbeddingService {
@@ -63,7 +63,9 @@ public class EmbeddingService {
     private static final String TAG = "EmbeddingService";
     public static final String ONNX_MODEL_DIR_NAME = "onnx_model";
     private static final String ONNX_MODEL_FILENAME = "clap_audio_encoder.onnx";
-    private static final String PENDING_EMBEDDINGS_FILE = "pending_embeddings.json";
+    /** Directory (under the data dir) holding one JSON file per freshly embedded song. */
+    public static final String SPOOL_DIR_NAME = "pending_songs";
+    private int spoolSeq = 0;
     private String dataDir; // set in constructor — app-private external storage
 
     private static final int TARGET_SAMPLE_RATE = 48000;
@@ -464,7 +466,7 @@ public class EmbeddingService {
 
     /**
      * Embed a list of audio files in background.
-     * Results are saved to pending_embeddings.json incrementally.
+     * Each song is saved to its own spool file as soon as it finishes.
      */
     public void cancelEmbedding() {
         cancelled = true;
@@ -481,18 +483,16 @@ public class EmbeddingService {
                 return;
             }
 
-            // Load existing pending embeddings so interrupted runs can resume safely.
-            JSONObject localEmbeddings = loadLocalEmbeddings();
-            try {
-                localEmbeddings.put("_split_count", splitCount);
-            } catch (Exception ignored) {}
+            // One song at a time: decode -> infer -> persist -> next. Each result
+            // is written to its own small spool file so the cost of saving a song
+            // never grows with the size of the batch, and nothing is held in memory
+            // or lost if the process dies mid-batch.
             int processed = 0;
             int failed = 0;
 
             for (int i = 0; i < filePaths.size(); i++) {
                 if (cancelled) {
                     Log.i(TAG, "Embedding cancelled at " + (i) + "/" + filePaths.size());
-                    writeLocalEmbeddings(localEmbeddings);
                     callback.onComplete(processed, failed);
                     return;
                 }
@@ -502,32 +502,19 @@ public class EmbeddingService {
 
                 callback.onProgress(filename, path, i + 1, filePaths.size());
 
-                if (isPathAlreadyEmbedded(localEmbeddings, path)) {
-                    Log.i(TAG, "Skipping already-embedded path during resume: " + filename);
-                    continue;
-                }
-
                 try {
-                    // Decode audio (memory-capped) — retry once on failure
                     if (!yieldForPolicy("decode:" + filename)) {
-                        writeLocalEmbeddings(localEmbeddings);
                         callback.onComplete(processed, failed);
                         return;
                     }
-                    // Push #45e: window-aware decode. Replaces the
-                    // previous full-song decode (up to 360 s of PCM,
-                    // ~100 MB) with 4 small `seekTo` ranges: first 30 s
-                    // for the content hash, plus 10 s each at 20/50/80 %
-                    // for the inference windows. Peak memory drops from
-                    // ~100 MB to ~12 MB; decode time drops from ~minutes
-                    // to ~10-15 s on a typical Pixel. No more OOM at
-                    // 107 MB on long songs.
+                    // Window-aware decode: first 30 s for the content hash plus
+                    // short `seekTo` ranges for the inference windows, so peak
+                    // memory stays small regardless of song length.
                     DecodeResult dec = decodeAudioWindowAware(path);
                     if (dec == null || dec.windows == null || dec.windows.isEmpty()) {
                         Log.w(TAG, "Decode failed, retrying after GC: " + filename);
                         System.gc();
                         if (!sleepResponsive(1000)) {
-                            writeLocalEmbeddings(localEmbeddings);
                             callback.onComplete(processed, failed);
                             return;
                         }
@@ -546,13 +533,9 @@ public class EmbeddingService {
                     String contentHash = computeContentHash(dec.first30s);
                     List<float[]> windows = dec.windows;
 
-                    // Run ONNX inference. Batch all windows in a single forward pass when
-                    // possible — ~2x faster than 3 separate sessions for typical songs.
-                    // Single-window short songs use the same code path; batch=1 just runs once.
                     List<float[]> windowEmbeddings;
                     boolean inferenceSetupFailed = false;
                     if (!yieldForPolicy("inference:" + filename)) {
-                        writeLocalEmbeddings(localEmbeddings);
                         callback.onComplete(processed, failed);
                         return;
                     }
@@ -564,11 +547,9 @@ public class EmbeddingService {
                     } else {
                         windowEmbeddings = runInferenceBatch(windows);
                     }
-                    // Release window arrays now that inference (or its fallback) is done.
                     for (int w = 0; w < windows.size(); w++) windows.set(w, null);
                     windows = null;
                     if (!yieldForPolicy("inference_complete:" + filename)) {
-                        writeLocalEmbeddings(localEmbeddings);
                         callback.onComplete(processed, failed);
                         return;
                     }
@@ -584,13 +565,15 @@ public class EmbeddingService {
                         continue;
                     }
 
-                    // Average embeddings and L2 normalize
                     float[] avgEmbedding = averageEmbeddings(windowEmbeddings);
                     windowEmbeddings = null;
                     l2Normalize(avgEmbedding);
 
-                    // Save to pending embeddings with filepath
-                    saveEmbedding(localEmbeddings, filename, path, avgEmbedding, contentHash);
+                    if (!saveEmbedding(filename, path, avgEmbedding, contentHash)) {
+                        callback.onError("Save failed: " + filename, path);
+                        failed++;
+                        continue;
+                    }
                     callback.onSongComplete(filename, path, contentHash);
                     processed++;
 
@@ -605,19 +588,11 @@ public class EmbeddingService {
                 // Avoid periodic explicit GC; it is a stop-the-world pause.
                 // The retry-time GC above remains only for actual decode pressure.
                 if (!yieldForPolicy("song_complete:" + filename)) {
-                    writeLocalEmbeddings(localEmbeddings);
                     callback.onComplete(processed, failed);
                     return;
                 }
-
-                // Save incrementally every 5 songs
-                if ((i + 1) % 5 == 0 || (i + 1) == filePaths.size()) {
-                    writeLocalEmbeddings(localEmbeddings);
-                }
             }
 
-            // Final save
-            writeLocalEmbeddings(localEmbeddings);
             callback.onComplete(processed, failed);
 
             Log.i(TAG, "Embedding complete: " + processed + " processed, " + failed + " failed");
@@ -1392,71 +1367,45 @@ public class EmbeddingService {
 
     // ===== LOCAL STORAGE =====
 
-    private JSONObject loadLocalEmbeddings() {
+    /**
+     * Persist one finished song as its own spool file under
+     * {@link #SPOOL_DIR_NAME}. Written to a temp name then renamed so the
+     * reader in {@link EmbeddingDbManager#recoverPendingIfAny} never sees a
+     * half-written file. Returns false if the song could not be saved.
+     */
+    private boolean saveEmbedding(String filename, String filepath, float[] embedding, String contentHash) {
+        File tmp = null;
         try {
-            File file = new File(dataDir, PENDING_EMBEDDINGS_FILE);
-            if (!file.exists()) return new JSONObject();
+            File dir = new File(dataDir, SPOOL_DIR_NAME);
+            if (!dir.exists() && !dir.mkdirs() && !dir.exists()) {
+                Log.e(TAG, "Could not create spool dir " + dir.getAbsolutePath());
+                return false;
+            }
 
-            FileInputStream fis = new FileInputStream(file);
-            byte[] data = new byte[(int) file.length()];
-            fis.read(data);
-            fis.close();
-            return new JSONObject(new String(data, "UTF-8"));
-        } catch (Exception e) {
-            return new JSONObject();
-        }
-    }
-
-    private void saveEmbedding(JSONObject localEmbeddings, String filename,
-                               String filepath, float[] embedding, String contentHash) {
-        try {
-            JSONObject entry = new JSONObject();
             JSONArray embArray = new JSONArray();
             for (float v : embedding) embArray.put(v);
+            JSONObject entry = new JSONObject();
             entry.put("embedding", embArray);
             entry.put("content_hash", contentHash);
             entry.put("filepath", filepath);
             entry.put("timestamp", System.currentTimeMillis());
             entry.put("filename", filename);
 
-            // Store by content hash as primary key
-            localEmbeddings.put(contentHash, entry);
-            // Also store filename→hash mapping for quick lookup
-            if (!localEmbeddings.has("_path_index")) {
-                localEmbeddings.put("_path_index", new JSONObject());
+            String base = System.currentTimeMillis() + "_" + (spoolSeq++) + "_" + contentHash;
+            tmp = new File(dir, base + ".tmp");
+            File dest = new File(dir, base + ".json");
+            try (FileOutputStream fos = new FileOutputStream(tmp)) {
+                fos.write(entry.toString().getBytes("UTF-8"));
             }
-            localEmbeddings.getJSONObject("_path_index").put(filepath, contentHash);
+            if (!tmp.renameTo(dest)) {
+                Log.e(TAG, "Could not rename spool file " + tmp.getName());
+                tmp.delete();
+                return false;
+            }
+            return true;
         } catch (Exception e) {
             Log.e(TAG, "Error saving embedding: " + e.getMessage());
-        }
-    }
-
-    private void writeLocalEmbeddings(JSONObject localEmbeddings) {
-        try {
-            File dir = new File(dataDir);
-            if (!dir.exists()) dir.mkdirs();
-
-            File file = new File(dir, PENDING_EMBEDDINGS_FILE);
-            FileOutputStream fos = new FileOutputStream(file);
-            fos.write(localEmbeddings.toString().getBytes("UTF-8"));
-            fos.close();
-
-            Log.i(TAG, "Pending embeddings saved: " + localEmbeddings.length() + " entries");
-        } catch (Exception e) {
-            Log.e(TAG, "Error writing pending embeddings: " + e.getMessage());
-        }
-    }
-
-    private boolean isPathAlreadyEmbedded(JSONObject localEmbeddings, String filepath) {
-        try {
-            if (localEmbeddings == null || filepath == null || filepath.isEmpty()) return false;
-            JSONObject pathIndex = localEmbeddings.optJSONObject("_path_index");
-            if (pathIndex == null) return false;
-            String contentHash = pathIndex.optString(filepath, "");
-            if (contentHash.isEmpty()) return false;
-            JSONObject existing = localEmbeddings.optJSONObject(contentHash);
-            return existing != null && existing.has("embedding");
-        } catch (Exception e) {
+            if (tmp != null) tmp.delete();
             return false;
         }
     }
