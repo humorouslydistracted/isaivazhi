@@ -129,6 +129,8 @@ class EmbeddingEngine(
 
     private var batchStartedAtMs: Long = 0L
     @Volatile private var lastServiceEventAtMs: Long = 0L
+    @Volatile private var rateAnchorMs: Long = 0L
+    @Volatile private var rateAnchorDone: Int = 0
 
     /**
      * Songs are saved to SQLite one at a time as the service finishes them.
@@ -190,6 +192,32 @@ class EmbeddingEngine(
                 android.util.Log.w("EmbeddingEngine", "startup recover failed: ${t.message}")
                 logBuffer.append("startup", "recover failed: ${t.message}")
             }
+            resumeInterruptedBatchIfAny()
+        }
+    }
+
+    /**
+     * A run stopped by Android (process killed, background time limit) leaves
+     * its remaining queue on disk. Resume it when the app opens; the service
+     * skips songs already finished in that run and retries the rest.
+     */
+    private fun resumeInterruptedBatchIfAny() {
+        if (!EmbeddingForegroundService.hasQueuedBatch(appContext)) return
+        if (!OnnxModelDownload.areModelsReady(appContext)) return
+        val intent = Intent(appContext, EmbeddingForegroundService::class.java).apply {
+            action = EmbeddingForegroundService.ACTION_RESUME
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(intent)
+            } else {
+                appContext.startService(intent)
+            }
+            logBuffer.append("resume", "resuming interrupted embedding queue")
+        } catch (t: Throwable) {
+            // Typically ForegroundServiceStartNotAllowedException when the
+            // process was started in the background; retried on next open.
+            android.util.Log.w("EmbeddingEngine", "resume failed: ${t.message}")
         }
     }
 
@@ -224,6 +252,7 @@ class EmbeddingEngine(
             }
             batchSplitCount = preferences.getEmbeddingSplitCount()
             ingestedThisBatch.set(0)
+            rateAnchorMs = 0L
             batchStartedAtMs = android.os.SystemClock.elapsedRealtime()
             // Push #49: preserve the previous run's snapshot fields so the
             // "Last run" line can keep showing during the brief gap
@@ -236,7 +265,7 @@ class EmbeddingEngine(
                 total = paths.size,
                 processed = 0,
                 current = "",
-                etaSeconds = estimateEtaSeconds(paths.size, prev.activeBackend, batchSplitCount),
+                etaSeconds = null,
                 activeBackend = prev.activeBackend,
                 failed = 0,
                 lastCompletedAtMs = prev.lastCompletedAtMs,
@@ -443,7 +472,7 @@ class EmbeddingEngine(
                     failed = failed,
                     activeBackend = backend.ifBlank { _status.value.activeBackend },
                     etaSeconds = if (inProgress) {
-                        estimateEtaSeconds((total - processed).coerceAtLeast(0), backend, batchSplitCount)
+                        measuredEtaSeconds(processed + failed, total)
                     } else null,
                     // Push #43: surface init-step text. Clear once embedding
                     // moves past init (first onProgress arrives → processed>0
@@ -468,7 +497,7 @@ class EmbeddingEngine(
                     failed = failed,
                     current = filename,
                     activeBackend = backend.ifBlank { _status.value.activeBackend },
-                    etaSeconds = estimateEtaSeconds((total - processed).coerceAtLeast(0), backend, batchSplitCount),
+                    etaSeconds = measuredEtaSeconds(processed + failed, total),
                     // Clear init step text once embedding actually starts moving.
                     initStepText = "",
                 )
@@ -504,6 +533,7 @@ class EmbeddingEngine(
                 ingestKick.trySend(Unit)
             }
             EmbeddingCommandContract.MSG_COMPLETE -> {
+                rateAnchorMs = 0L
                 val processed = data.getInt(EmbeddingCommandContract.KEY_PROCESSED, 0)
                 val failed = data.getInt(EmbeddingCommandContract.KEY_FAILED, 0)
                 _status.value = _status.value.copy(
@@ -577,32 +607,25 @@ class EmbeddingEngine(
     }
 
     /**
-     * Rough ETA estimate. Better than nothing; replaced with a real backend
-     * probe in a follow-up session.
-     *
-     * Per-song latency assumptions (from the Capacitor build's observed values):
-     *   - nnapi+fp16: ~180 ms/song
-     *   - nnapi (fp32): ~280 ms/song
-     *   - cpu: ~1400 ms/song
-     *   - unknown / "": assume ~400 ms (mid-range)
+     * Remaining time from the speed actually measured in this run. Returns
+     * null ("estimating") until a few songs have finished, instead of
+     * guessing from an assumed per-song time.
      */
-    private fun estimateEtaSeconds(
-        remainingSongs: Int,
-        backend: String,
-        splitCount: Int = batchSplitCount,
-    ): Long? {
-        if (remainingSongs <= 0) return null
-        val perSongMs = when {
-            backend.contains("fp16", ignoreCase = true) -> 180
-            backend.startsWith("nnapi", ignoreCase = true) -> 280
-            backend.equals("cpu", ignoreCase = true) -> 1400
-            else -> 400
+    private fun measuredEtaSeconds(done: Int, total: Int): Long? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (rateAnchorMs == 0L || done < rateAnchorDone) {
+            rateAnchorMs = now
+            rateAnchorDone = done
+            return null
         }
-        val scaled = (perSongMs * EmbeddingSplitCount.timeMultiplier(splitCount)).toLong()
-        return (remainingSongs.toLong() * scaled) / 1000L
+        val measured = done - rateAnchorDone
+        if (measured < MIN_SONGS_FOR_ETA) return null
+        val perSongMs = (now - rateAnchorMs) / measured
+        return ((total - done).coerceAtLeast(0).toLong() * perSongMs) / 1000L
     }
 
     private companion object {
         const val SERVICE_START_TIMEOUT_MS = 20_000L
+        const val MIN_SONGS_FOR_ETA = 3
     }
 }

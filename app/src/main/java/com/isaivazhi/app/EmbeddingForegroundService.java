@@ -46,11 +46,17 @@ public class EmbeddingForegroundService extends Service {
     // channel stays in OS settings but is unused.
     private static final String CHANNEL_ID = "embedding_service_v2";
     private static final int NOTIFICATION_ID = 2;
+    // Queue of songs still to embed in the current run. Worked through
+    // CHUNK_SIZE songs at a time; each chunk is removed once it finishes.
     private static final String ACTIVE_BATCH_FILE = "active_embedding_batch.json";
-    // Append-only list (one path per line) of songs finished in the active
-    // batch. Lets a resumed batch skip them without re-writing the full
-    // batch file after every song.
+    // Append-only list (one path per line) of songs finished in the chunk
+    // currently running. If the run is interrupted mid-chunk, these are
+    // skipped on resume and only the unfinished songs are retried.
     private static final String ACTIVE_BATCH_DONE_FILE = "active_embedding_batch.done";
+    private static final int CHUNK_SIZE = 5;
+    // Re-armed at the start of every chunk, so the CPU stays awake for as
+    // long as chunks keep running instead of a fixed budget for the batch.
+    private static final long CHUNK_WAKELOCK_TIMEOUT_MS = 30 * 60 * 1000L;
 
     public static final String ACTION_START = "com.isaivazhi.app.EMBEDDING_START";
     public static final String ACTION_STOP = "com.isaivazhi.app.EMBEDDING_STOP";
@@ -91,10 +97,8 @@ public class EmbeddingForegroundService extends Service {
     // to CPU") in the foreground notification and the AI banner.
     private volatile String initStepText = "";
     private int batchSplitCount = 3;
-    // Push #43: songs the user added (via per-row Embed or another Embed
-    // Pending tap) while a batch was already in flight. Drained at the
-    // end of the current batch into a new internal embedSongs call.
-    private final ArrayList<String> pendingAdditional = new ArrayList<>();
+    private volatile boolean stopRequested = false;
+    private List<String> currentChunk = new ArrayList<>();
 
     @Override
     public void onCreate() {
@@ -113,6 +117,7 @@ public class EmbeddingForegroundService extends Service {
         Log.i(TAG, "onStartCommand: action=" + action + " flags=" + flags + " startId=" + startId);
 
         if (ACTION_STOP.equals(action)) {
+            stopRequested = true;
             clearPersistedBatch();
             cancelEmbedding();
             return START_NOT_STICKY;
@@ -131,25 +136,11 @@ public class EmbeddingForegroundService extends Service {
                 if (!embeddingInProgress) stopSelf();
                 return embeddingInProgress ? START_STICKY : START_NOT_STICKY;
             }
-            // Push #43: if a batch is already running, APPEND the new
-            // paths to the pending-additions queue instead of overwriting
-            // the active batch + early-returning (the previous behavior
-            // silently dropped the user's add-one-while-running tap).
-            // Persistence keeps both lists so a restart resumes both.
+            // Songs added while a run is in flight join the end of its queue.
             if (embeddingInProgress) {
-                synchronized (pendingAdditional) {
-                    for (String p : paths) {
-                        if (p != null && !p.isEmpty() && !pendingAdditional.contains(p)) {
-                            pendingAdditional.add(p);
-                        }
-                    }
-                    Log.i(TAG, "Queued " + paths.size() + " song(s) to run after current batch; pending="
-                            + pendingAdditional.size());
-                }
-                persistActiveBatchCombined();
-                // Bump totalSteps so the progress bar and notification
-                // reflect that more songs are coming.
-                totalSteps += paths.size();
+                int added = appendToQueue(paths);
+                Log.i(TAG, "Queued " + added + " more song(s) onto the running batch");
+                totalSteps += added;
                 broadcastStatus();
                 return START_STICKY;
             }
@@ -174,6 +165,15 @@ public class EmbeddingForegroundService extends Service {
                 startEmbedding(persisted);
                 return START_STICKY;
             }
+            if (!embeddingInProgress && ACTION_RESUME.equals(action)) {
+                // Started via startForegroundService, so startForeground is
+                // mandatory even when there turns out to be nothing to resume.
+                startForeground(NOTIFICATION_ID, buildNotification("Nothing left to embed", 0, 0));
+                clearPersistedBatch();
+                stopForeground(true);
+                stopSelf();
+                return START_NOT_STICKY;
+            }
         }
 
         return START_NOT_STICKY;
@@ -193,6 +193,7 @@ public class EmbeddingForegroundService extends Service {
         super.onDestroy();
     }
 
+    /** Starts a run over the queue already persisted in {@link #ACTIVE_BATCH_FILE}. */
     private void startEmbedding(List<String> paths) {
         if (embeddingInProgress) {
             Log.i(TAG, "Embedding already in progress; keeping current batch");
@@ -222,12 +223,17 @@ public class EmbeddingForegroundService extends Service {
             embeddingService.setInitProgressListener((label, text) -> {
                 initStepText = text != null ? text : "";
                 Log.i(TAG, "initStep: " + label + " — " + initStepText);
-                updateWarmingUpNotification(initStepText);
+                // Every chunk re-checks the (already warm) model; only the
+                // first one should replace the progress notification.
+                if (processedCount + failedCount == 0) {
+                    updateWarmingUpNotification(initStepText);
+                }
                 broadcastStatus();
             });
         }
         embeddingService.setSplitCount(batchSplitCount);
 
+        stopRequested = false;
         embeddingInProgress = true;
         currentStep = 0;
         totalSteps = paths != null ? paths.size() : 0;
@@ -237,20 +243,40 @@ public class EmbeddingForegroundService extends Service {
         currentFilepath = "";
         broadcastStatus();
 
-        embeddingService.embedSongs(paths, new EmbeddingService.EmbeddingCallback() {
+        runNextChunk();
+    }
+
+    /** Main thread only. Takes the next CHUNK_SIZE songs off the queue and embeds them. */
+    private void runNextChunk() {
+        if (stopRequested) {
+            finishRun();
+            return;
+        }
+        ArrayList<String> queue = loadPersistedBatch();
+        if (queue == null || queue.isEmpty()) {
+            finishRun();
+            return;
+        }
+        ArrayList<String> chunk = new ArrayList<>(queue.subList(0, Math.min(CHUNK_SIZE, queue.size())));
+        currentChunk = chunk;
+        if (wakeLock != null) wakeLock.acquire(CHUNK_WAKELOCK_TIMEOUT_MS);
+        Log.i(TAG, "Chunk start: " + chunk.size() + " song(s), " + queue.size() + " left in queue");
+
+        embeddingService.embedSongs(chunk, new EmbeddingService.EmbeddingCallback() {
             @Override
             public void onProgress(String filename, String filepath, int current, int total) {
                 currentFilename = filename != null ? filename : "";
                 currentFilepath = filepath != null ? filepath : "";
-                currentStep = current;
-                totalSteps = total;
-                updateNotification("Embedding " + current + "/" + total + ": " + currentFilename, current, total);
+                int overall = processedCount + failedCount + 1;
+                currentStep = overall;
+                if (totalSteps < overall) totalSteps = overall;
+                updateNotification("Embedding " + overall + "/" + totalSteps + ": " + currentFilename, overall, totalSteps);
 
                 Bundle data = new Bundle();
                 data.putString(EmbeddingCommandContract.KEY_FILENAME, currentFilename);
                 data.putString(EmbeddingCommandContract.KEY_FILE_PATH, currentFilepath);
-                data.putInt(EmbeddingCommandContract.KEY_CURRENT, current);
-                data.putInt(EmbeddingCommandContract.KEY_TOTAL, total);
+                data.putInt(EmbeddingCommandContract.KEY_CURRENT, overall);
+                data.putInt(EmbeddingCommandContract.KEY_TOTAL, totalSteps);
                 data.putInt(EmbeddingCommandContract.KEY_PROCESSED, processedCount);
                 data.putInt(EmbeddingCommandContract.KEY_FAILED, failedCount);
                 broadcastMessage(EmbeddingCommandContract.MSG_PROGRESS, data);
@@ -270,54 +296,14 @@ public class EmbeddingForegroundService extends Service {
             }
 
             @Override
-            public void onComplete(int totalProcessed, int failed) {
-                Log.i(TAG, "Embedding complete: " + totalProcessed + " processed, " + failed + " failed");
-                embeddingInProgress = false;
-                processedCount = totalProcessed;
-                failedCount = failed;
-                currentStep = totalProcessed + failed;
-                currentFilename = "";
-                currentFilepath = "";
-
-                // Push #43: drain pending-additions queue if the user
-                // queued more songs while the batch was running. Start a
-                // new internal batch instead of cleaning up. This loops
-                // until pendingAdditional is empty.
-                ArrayList<String> additional;
-                synchronized (pendingAdditional) {
-                    additional = new ArrayList<>(pendingAdditional);
-                    pendingAdditional.clear();
-                }
-                if (!additional.isEmpty()) {
-                    Log.i(TAG, "Draining " + additional.size() + " queued song(s) into a follow-up batch");
-                    clearPersistedBatch();
-                    persistActiveBatch(additional);
-                    // Re-emit progress so banner doesn't flash "done" then
-                    // immediately restart at 0/N.
-                    Bundle bridge = new Bundle();
-                    bridge.putInt(EmbeddingCommandContract.KEY_PROCESSED, totalProcessed);
-                    bridge.putInt(EmbeddingCommandContract.KEY_FAILED, failed);
-                    bridge.putInt(EmbeddingCommandContract.KEY_TOTAL, totalProcessed + additional.size());
-                    broadcastMessage(EmbeddingCommandContract.MSG_STATUS, bridge);
-                    startEmbedding(additional);
-                    return;
-                }
-
-                clearPersistedBatch();
-                String summary = totalProcessed + " embedded" + (failed > 0 ? ", " + failed + " failed" : "") + " - done!";
-                updateNotification(summary, totalProcessed + failed, totalProcessed + failed);
-
-                Bundle data = new Bundle();
-                data.putInt(EmbeddingCommandContract.KEY_PROCESSED, totalProcessed);
-                data.putInt(EmbeddingCommandContract.KEY_FAILED, failed);
-                broadcastMessage(EmbeddingCommandContract.MSG_COMPLETE, data);
-
-                mainHandler.postDelayed(EmbeddingForegroundService.this::cleanup, 3000L);
+            public void onComplete(int chunkProcessed, int chunkFailed) {
+                mainHandler.post(() -> onChunkComplete(chunk));
             }
 
             @Override
             public void onError(String message, String filepath) {
-                if (filepath != null && !filepath.isEmpty()) {
+                boolean perSong = filepath != null && !filepath.isEmpty();
+                if (perSong) {
                     failedCount++;
                 }
                 Bundle data = new Bundle();
@@ -325,8 +311,82 @@ public class EmbeddingForegroundService extends Service {
                 if (filepath != null) data.putString(EmbeddingCommandContract.KEY_FILE_PATH, filepath);
                 data.putInt(EmbeddingCommandContract.KEY_FAILED, failedCount);
                 broadcastMessage(EmbeddingCommandContract.MSG_ERROR, data);
+                if (!perSong) {
+                    // Backend init failed; embedSongs returns without onComplete.
+                    mainHandler.post(() -> finishRun());
+                }
             }
         });
+    }
+
+    /** Main thread only. Drops the finished chunk from the queue and moves on. */
+    private void onChunkComplete(List<String> chunk) {
+        if (!embeddingInProgress) return;
+        if (stopRequested) {
+            finishRun();
+            return;
+        }
+        ArrayList<String> queue = loadPersistedBatch();
+        if (queue == null) queue = new ArrayList<>();
+        queue.removeAll(new java.util.HashSet<>(chunk));
+        clearBatchDoneFile();
+        if (queue.isEmpty()) {
+            clearPersistedBatch();
+        } else {
+            persistActiveBatch(queue);
+        }
+        currentChunk = new ArrayList<>();
+        runNextChunk();
+    }
+
+    /** Main thread only. Ends the run and reports totals for every chunk. */
+    private void finishRun() {
+        if (!embeddingInProgress) return;
+        int totalProcessed = processedCount;
+        int failed = failedCount;
+        Log.i(TAG, "Embedding complete: " + totalProcessed + " processed, " + failed + " failed");
+        embeddingInProgress = false;
+        currentStep = totalProcessed + failed;
+        currentFilename = "";
+        currentFilepath = "";
+        currentChunk = new ArrayList<>();
+        clearPersistedBatch();
+
+        String summary = totalProcessed + " embedded" + (failed > 0 ? ", " + failed + " failed" : "") + " - done!";
+        updateNotification(summary, totalProcessed + failed, totalProcessed + failed);
+
+        Bundle data = new Bundle();
+        data.putInt(EmbeddingCommandContract.KEY_PROCESSED, totalProcessed);
+        data.putInt(EmbeddingCommandContract.KEY_FAILED, failed);
+        broadcastMessage(EmbeddingCommandContract.MSG_COMPLETE, data);
+
+        mainHandler.postDelayed(() -> {
+            if (!embeddingInProgress) cleanup();
+        }, 3000L);
+    }
+
+    /**
+     * Android 15+ caps dataSync foreground services at 6 h per day. Stop the
+     * current chunk but keep the queue on disk, so the app resumes the
+     * remaining songs the next time it is opened.
+     */
+    @Override
+    public void onTimeout(int startId, int fgsType) {
+        Log.w(TAG, "onTimeout: foreground time limit reached; pausing with queue kept on disk");
+        stopRequested = true;
+        embeddingInProgress = false;
+        if (embeddingService != null) embeddingService.cancelEmbedding();
+        Bundle data = new Bundle();
+        data.putString(EmbeddingCommandContract.KEY_ERROR,
+                "Paused: Android's background time limit was reached. Open the app later to continue.");
+        data.putInt(EmbeddingCommandContract.KEY_FAILED, failedCount);
+        broadcastMessage(EmbeddingCommandContract.MSG_ERROR, data);
+        // Not cleanup(): the worker may still be inside inference, so the ONNX
+        // session must not be released under it. The system only requires the
+        // service to leave the foreground promptly.
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        stopForeground(true);
+        stopSelf();
     }
 
     private void cancelEmbedding() {
@@ -521,20 +581,20 @@ public class EmbeddingForegroundService extends Service {
         }, "EmbeddingSimilarityWorker").start();
     }
 
-    /**
-     * Push #43: write the union of the current active batch (from disk)
-     * + the pending-additions queue so a process restart resumes all
-     * songs the user has queued. Called when the user adds songs mid-batch.
-     */
-    private void persistActiveBatchCombined() {
-        ArrayList<String> combined = loadPersistedBatch();
-        if (combined == null) combined = new ArrayList<>();
-        synchronized (pendingAdditional) {
-            for (String p : pendingAdditional) {
-                if (p != null && !p.isEmpty() && !combined.contains(p)) combined.add(p);
+    private int appendToQueue(List<String> paths) {
+        ArrayList<String> queue = loadPersistedBatch();
+        if (queue == null) queue = new ArrayList<>();
+        java.util.Set<String> present = new java.util.HashSet<>(queue);
+        present.addAll(currentChunk);
+        int added = 0;
+        for (String p : paths) {
+            if (p != null && !p.isEmpty() && present.add(p)) {
+                queue.add(p);
+                added++;
             }
         }
-        persistActiveBatch(combined);
+        if (added > 0) persistActiveBatch(queue);
+        return added;
     }
 
     private void persistActiveBatch(List<String> paths) {
@@ -636,6 +696,12 @@ public class EmbeddingForegroundService extends Service {
     private static File embeddingDataDir(Context context) {
         File extDir = context.getExternalFilesDir(null);
         return extDir != null ? extDir : context.getFilesDir();
+    }
+
+    /** True when a run was interrupted and still has songs queued on disk. */
+    public static boolean hasQueuedBatch(Context context) {
+        File file = new File(embeddingDataDir(context), ACTIVE_BATCH_FILE);
+        return file.exists() && file.length() > 0;
     }
 
     /**

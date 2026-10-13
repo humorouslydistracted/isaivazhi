@@ -108,7 +108,7 @@ private fun buildSubtitle(s: EmbeddingEngine.EmbeddingStatus): String {
             secs < 3600 -> "~${secs / 60}m left"
             else -> "~${secs / 3600}h ${(secs % 3600) / 60}m left"
         }
-    }
+    } ?: if (s.inProgress) "estimating time…" else null
     val parts = listOfNotNull(
         s.current.takeIf { it.isNotBlank() },
         backendLabel,
