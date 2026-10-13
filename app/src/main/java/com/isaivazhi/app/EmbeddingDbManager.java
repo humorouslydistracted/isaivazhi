@@ -938,7 +938,10 @@ public final class EmbeddingDbManager {
                     try { fos.write("{\"_path_index\":{}}".getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
                     finally { fos.close(); }
                 }
+                JSONArray recoveredHashes = new JSONArray();
+                for (EmbeddingEntity e : entities) recoveredHashes.put(e.contentHash);
                 out.put("recovered", entities.size());
+                out.put("hashes", recoveredHashes);
                 out.put("totalRows", db.count());
                 Log.i(TAG, "Recovered " + entities.size() + " pending embeddings into SQLite");
                 return out;

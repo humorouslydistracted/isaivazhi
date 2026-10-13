@@ -278,8 +278,19 @@ class EmbeddingDbFacade(appContext: Context) {
     }
 
     /** Ingest any pending_embeddings.json into SQLite + clear the pending file. */
-    suspend fun recoverPendingIfAny(): JSONObject? = awaitJsonObject { cb ->
-        manager.recoverPendingIfAny(cb)
+    suspend fun recoverPendingIfAny(): JSONObject? {
+        val res = awaitJsonObject { cb -> manager.recoverPendingIfAny(cb) }
+        // A re-embedded song keeps its content hash, so a stale heap copy
+        // would otherwise outlive the new vector until the next restart.
+        val stale = ArrayList<String>()
+        res?.optJSONArray("hashes")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val hash = arr.optString(i, "")
+                if (hash.isNotEmpty() && vecHeapCache.remove(hash) != null) stale += hash
+            }
+        }
+        if (stale.isNotEmpty()) runCatching { getVecsByHashes(stale) }
+        return res
     }
 
     /**
