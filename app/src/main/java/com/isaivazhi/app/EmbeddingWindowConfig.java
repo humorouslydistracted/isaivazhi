@@ -14,6 +14,10 @@ package com.isaivazhi.app;
  *     but different songs are not all sampled at the same fixed fractions.
  *  3. A window that is mostly silent is moved to another spot in its own
  *     section ({@link #alternativeStarts}); the least silent one is kept.
+ *  4. Tracks under {@link #SHORT_TRACK_SECONDS}: no edge trim; leading and
+ *     trailing silence is cut instead, only as many windows as fit with at
+ *     most 50% overlap are used, and audio shorter than one window is
+ *     looped to fill it rather than padded with silence.
  */
 public final class EmbeddingWindowConfig {
 
@@ -25,6 +29,8 @@ public final class EmbeddingWindowConfig {
 
     public static final double EDGE_TRIM_FRACTION = 0.08;
     public static final double EDGE_TRIM_MAX_SECONDS = 30.0;
+    /** Below this, tracks are decoded whole: no edge trim, silence trimmed, fewer and looped windows. */
+    public static final double SHORT_TRACK_SECONDS = 30.0;
 
     /** 100 ms frames; a frame below this RMS (~ -48 dBFS) counts as silent. */
     public static final double SILENT_FRAME_SECONDS = 0.1;
@@ -94,57 +100,164 @@ public final class EmbeddingWindowConfig {
         return new double[] {lo, hi};
     }
 
-    private static double clampStart(double start, double durationSec, double windowSec) {
-        double max = Math.max(0.0, durationSec - windowSec);
-        return Math.max(0.0, Math.min(start, max));
+    /**
+     * Span that windows are placed in. Songs of {@link #SHORT_TRACK_SECONDS}
+     * or more: the song minus the trimmed edges. Shorter tracks have too
+     * little audio to give any up, so they use the audible span instead
+     * (leading/trailing silence removed, see {@link #audibleRange}).
+     */
+    public static double[] placementRange(double durationSec, double windowSec,
+                                          double audibleStartSec, double audibleEndSec) {
+        if (durationSec >= SHORT_TRACK_SECONDS) return usableRange(durationSec, windowSec);
+        double lo = Math.max(0.0, Math.min(audibleStartSec, durationSec));
+        double hi = Math.max(lo, Math.min(audibleEndSec, durationSec));
+        if (hi - lo <= 0.0) return new double[] {0.0, Math.max(0.0, durationSec)};
+        return new double[] {lo, hi};
     }
 
     /**
-     * Window start times (seconds) for a song of {@code durationSec}. Songs no
-     * longer than one window get a single window at 0.
+     * Windows that fit {@code rangeSec} with at most 50% overlap, capped at
+     * the configured split count: 1 below 15 s, 2 below 20 s, 3 below 25 s…
      */
-    public static double[] planWindowStarts(double durationSec, double windowSec, int splitCount, long seed) {
-        if (!(durationSec > windowSec)) return new double[] {0.0};
+    public static int effectiveWindowCount(double rangeSec, double windowSec, int splitCount) {
         int n = normalizeSplitCount(splitCount);
-        double[] range = usableRange(durationSec, windowSec);
-        double section = (range[1] - range[0]) / n;
+        if (!(rangeSec > windowSec)) return 1;
+        int fit = 1 + (int) Math.floor((rangeSec - windowSec) / (windowSec / 2.0));
+        return Math.max(1, Math.min(n, fit));
+    }
+
+    private static double clampToRange(double start, double lo, double hi, double windowSec) {
+        double max = Math.max(lo, hi - windowSec);
+        return Math.max(lo, Math.min(start, max));
+    }
+
+    /** {@link #planWindowStarts(double, double, int, long, double, double)} with the whole song audible. */
+    public static double[] planWindowStarts(double durationSec, double windowSec, int splitCount, long seed) {
+        return planWindowStarts(durationSec, windowSec, splitCount, seed, 0.0, durationSec);
+    }
+
+    /**
+     * Window start times (seconds). The result can be shorter than the split
+     * count for short tracks. When the placement range is shorter than one
+     * window there is a single start at the range start; the caller fills
+     * the window by looping that range ({@link #cutWindow}).
+     */
+    public static double[] planWindowStarts(double durationSec, double windowSec, int splitCount, long seed,
+                                            double audibleStartSec, double audibleEndSec) {
+        double[] range = placementRange(durationSec, windowSec, audibleStartSec, audibleEndSec);
+        double lo = range[0];
+        double hi = range[1];
+        double len = hi - lo;
+        if (!(len > windowSec)) return new double[] {lo};
+        int n = effectiveWindowCount(len, windowSec, splitCount);
+        double section = len / n;
         double slack = section - windowSec;
         double[] out = new double[n];
+        if (!(slack > 0)) {
+            // Sections narrower than a window: spread evenly from the first
+            // to the last possible start so neighbours overlap at most 50%.
+            double span = len - windowSec;
+            for (int i = 0; i < n; i++) {
+                double start = n == 1 ? lo + span / 2.0 : lo + i * span / (n - 1);
+                out[i] = clampToRange(start, lo, hi, windowSec);
+            }
+            return out;
+        }
         for (int i = 0; i < n; i++) {
-            double secStart = range[0] + i * section;
-            double start = slack > 0
-                    ? secStart + unitFor(seed, i) * slack
-                    : secStart + section / 2.0 - windowSec / 2.0;
-            out[i] = clampStart(start, durationSec, windowSec);
+            double start = lo + i * section + unitFor(seed, i) * slack;
+            out[i] = clampToRange(start, lo, hi, windowSec);
         }
         return out;
     }
 
+    public static double[] alternativeStarts(double durationSec, double windowSec, int splitCount, long seed, int index) {
+        return alternativeStarts(durationSec, windowSec, splitCount, seed, index, 0.0, durationSec);
+    }
+
     /**
      * Other places to try for window {@code index} if it turns out silent:
-     * the start, middle and end of its own section (whichever differ from
+     * the middle, end and start of its own section (whichever differ from
      * the planned start by at least a second). Empty when the section has
      * no room to move.
      */
-    public static double[] alternativeStarts(double durationSec, double windowSec, int splitCount, long seed, int index) {
-        if (!(durationSec > windowSec)) return new double[0];
-        int n = normalizeSplitCount(splitCount);
+    public static double[] alternativeStarts(double durationSec, double windowSec, int splitCount, long seed, int index,
+                                             double audibleStartSec, double audibleEndSec) {
+        double[] range = placementRange(durationSec, windowSec, audibleStartSec, audibleEndSec);
+        double lo = range[0];
+        double hi = range[1];
+        double len = hi - lo;
+        if (!(len > windowSec)) return new double[0];
+        int n = effectiveWindowCount(len, windowSec, splitCount);
         if (index < 0 || index >= n) return new double[0];
-        double[] range = usableRange(durationSec, windowSec);
-        double section = (range[1] - range[0]) / n;
+        double section = len / n;
         double slack = section - windowSec;
         if (slack < 1.0) return new double[0];
-        double planned = planWindowStarts(durationSec, windowSec, n, seed)[index];
-        double secStart = range[0] + index * section;
+        double planned = planWindowStarts(durationSec, windowSec, splitCount, seed, audibleStartSec, audibleEndSec)[index];
+        double secStart = lo + index * section;
         double[] candidates = {secStart + slack / 2.0, secStart + slack, secStart};
         double[] tmp = new double[candidates.length];
         int count = 0;
         for (double c : candidates) {
-            double s = clampStart(c, durationSec, windowSec);
+            double s = clampToRange(c, lo, hi, windowSec);
             if (Math.abs(s - planned) >= 1.0) tmp[count++] = s;
         }
         double[] out = new double[count];
         System.arraycopy(tmp, 0, out, 0, count);
+        return out;
+    }
+
+    /**
+     * [start, end] seconds between the first and last 100 ms frame that is
+     * not silent. The whole clip when nothing is audible.
+     */
+    public static double[] audibleRange(float[] samples, int validLength, int sampleRate) {
+        int len = Math.min(validLength, samples.length);
+        double total = len / (double) sampleRate;
+        int frame = Math.max(1, (int) Math.round(sampleRate * SILENT_FRAME_SECONDS));
+        int frames = len / frame;
+        double threshold2 = (double) SILENT_FRAME_RMS * SILENT_FRAME_RMS;
+        int first = -1;
+        int last = -1;
+        for (int f = 0; f < frames; f++) {
+            double sum = 0.0;
+            int base = f * frame;
+            for (int i = 0; i < frame; i++) {
+                double x = samples[base + i];
+                sum += x * x;
+            }
+            if (sum / frame >= threshold2) {
+                if (first < 0) first = f;
+                last = f;
+            }
+        }
+        if (first < 0) return new double[] {0.0, total};
+        double end = (last == frames - 1) ? total : (last + 1) * (double) frame / sampleRate;
+        return new double[] {first * (double) frame / sampleRate, end};
+    }
+
+    /**
+     * One window of {@code windowSamples} starting at {@code startSec}. When
+     * the placement range [{@code rangeStartSec}, {@code rangeEndSec}] is
+     * shorter than a window, that range is repeated to fill it instead of
+     * padding with silence.
+     */
+    public static float[] cutWindow(float[] audio, int validLength, int sampleRate, double startSec,
+                                    double rangeStartSec, double rangeEndSec, int windowSamples) {
+        int len = Math.min(validLength, audio.length);
+        float[] out = new float[windowSamples];
+        if (len <= 0) return out;
+        int lo = Math.max(0, Math.min(len - 1, (int) Math.round(rangeStartSec * sampleRate)));
+        int hi = Math.max(lo + 1, Math.min(len, (int) Math.round(rangeEndSec * sampleRate)));
+        if (hi - lo < windowSamples) {
+            int seg = hi - lo;
+            for (int i = 0; i < windowSamples; i += seg) {
+                System.arraycopy(audio, lo, out, i, Math.min(seg, windowSamples - i));
+            }
+            return out;
+        }
+        int start = (int) Math.round(startSec * sampleRate);
+        start = Math.max(0, Math.min(start, len - windowSamples));
+        System.arraycopy(audio, start, out, 0, windowSamples);
         return out;
     }
 

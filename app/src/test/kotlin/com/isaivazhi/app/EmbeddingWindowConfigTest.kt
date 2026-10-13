@@ -23,7 +23,7 @@ class EmbeddingWindowConfigTest {
             doubleArrayOf(89.308011409, 145.183420047, 223.979882153, 269.045951538, 367.540604906, 441.682997373, 542.530570964),
             plan(600.0, 7, "0000000000000000"), 1e-6,
         )
-        assertArrayEquals(doubleArrayOf(0.0, 3.3, 7.5, 11.7, 15.0), plan(25.0, 5, "1234567890abcdef"), 1e-6)
+        assertArrayEquals(doubleArrayOf(0.0, 5.0, 10.0, 15.0), plan(25.0, 5, "1234567890abcdef"), 1e-6)
         assertArrayEquals(doubleArrayOf(0.0), plan(9.0, 3, "abcdef"), 1e-9)
         assertArrayEquals(
             doubleArrayOf(47.8, 76.4, 19.2),
@@ -83,6 +83,58 @@ class EmbeddingWindowConfigTest {
             }
         }
         assertEquals(0, EmbeddingWindowConfig.alternativeStarts(25.0, 10.0, 5, seed, 0).size)
+    }
+
+    @Test
+    fun windowCountFitsShortTracksWithoutDuplicates() {
+        val expected = mapOf(5.0 to 1, 10.0 to 1, 12.0 to 1, 14.9 to 1, 15.0 to 2, 19.5 to 2, 20.0 to 3, 24.9 to 3, 25.0 to 4, 40.0 to 7)
+        for ((len, n) in expected) {
+            assertEquals("len=$len", n, EmbeddingWindowConfig.effectiveWindowCount(len, 10.0, 7))
+        }
+        assertEquals(3, EmbeddingWindowConfig.effectiveWindowCount(40.0, 10.0, 3))
+        for (d in listOf(11.0, 12.0, 15.0, 19.5, 22.0, 25.0, 29.9)) {
+            for (n in intArrayOf(3, 5, 7)) {
+                val starts = plan(d, n, "a1b2c3d4e5f60718")
+                assertEquals("d=$d n=$n", starts.size, starts.distinct().size)
+                for (i in 1 until starts.size) assertTrue(starts[i] - starts[i - 1] >= 5.0 - 1e-9)
+            }
+        }
+    }
+
+    @Test
+    fun shortTrackUsesAudibleRangeWithoutEdgeTrim() {
+        val seed = EmbeddingWindowConfig.seedFromContentHash("a1b2c3d4e5f60718")
+        val starts = EmbeddingWindowConfig.planWindowStarts(25.0, 10.0, 5, seed, 2.0, 23.0)
+        assertTrue(starts.first() >= 2.0 && starts.last() + 10.0 <= 23.0 + 1e-9)
+        val long = EmbeddingWindowConfig.planWindowStarts(240.0, 10.0, 3, seed, 100.0, 110.0)
+        assertArrayEquals(plan(240.0, 3, "a1b2c3d4e5f60718"), long, 0.0)
+        assertArrayEquals(doubleArrayOf(1.5), EmbeddingWindowConfig.planWindowStarts(8.0, 10.0, 3, seed, 1.5, 7.0), 0.0)
+    }
+
+    @Test
+    fun audibleRangeTrimsSilentEdges() {
+        val sr = 48000
+        val a = FloatArray(sr * 12) { i -> if (i in sr until sr * 10) 0.3f else 0f }
+        val r = EmbeddingWindowConfig.audibleRange(a, a.size, sr)
+        assertEquals(1.0, r[0], 1e-9)
+        assertEquals(10.0, r[1], 1e-9)
+        val quiet = FloatArray(sr * 5)
+        assertArrayEquals(doubleArrayOf(0.0, 5.0), EmbeddingWindowConfig.audibleRange(quiet, quiet.size, sr), 1e-9)
+    }
+
+    @Test
+    fun cutWindowLoopsAudioShorterThanAWindow() {
+        val sr = 100
+        val audio = FloatArray(sr * 4) { (it % sr).toFloat() + 1f }
+        val w = EmbeddingWindowConfig.cutWindow(audio, audio.size, sr, 1.0, 1.0, 3.5, sr * 10)
+        assertEquals(sr * 10, w.size)
+        assertTrue(w.none { it == 0f })
+        for (i in 0 until 250) assertEquals(audio[100 + i], w[i], 0f)
+        assertEquals(audio[100], w[250], 0f)
+        val long = FloatArray(sr * 30) { it.toFloat() }
+        val cut = EmbeddingWindowConfig.cutWindow(long, long.size, sr, 5.0, 0.0, 30.0, sr * 10)
+        assertEquals(500f, cut[0], 0f)
+        assertEquals(1499f, cut.last(), 0f)
     }
 
     @Test

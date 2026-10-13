@@ -67,6 +67,11 @@ Window placement (`stratified_v2`) is shared in `embedding_config.py` and
    gets the same windows.
 3. If a window is mostly silent (more than half of its 100 ms frames below
    ~-48 dBFS), try the middle, end, and start of the same section instead.
+4. Songs under 30 s skip the 8% trim and use only the part between the first
+   and last audible frame. They get fewer windows so neighbours overlap at
+   most 50% (1 window below 15 s, 2 below 20 s, 3 below 25 s, ...). Audio
+   shorter than one window is looped to fill 10 s instead of padded with
+   silence.
 
 Use the same split count in the app import/runtime. Vectors made with the
 older fixed positions (20/50/80%, or k/(N+1)) are not directly comparable;

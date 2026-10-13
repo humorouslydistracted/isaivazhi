@@ -964,19 +964,15 @@ public class EmbeddingService {
             codec.configure(format, null, null, 0);
             codec.start();
 
-            long windowDurUs = (long) WINDOW_SECONDS * 1_000_000L;
             long hashDurUs = 30L * 1_000_000L;
 
-            // Special case: song shorter than one window. Decode all,
-            // pad to WINDOW_SAMPLES, use as both hash + single window.
-            if (durationUs > 0 && durationUs < windowDurUs) {
+            // Short track: decode it whole (≤ 30 s, a few MB) so silence can
+            // be trimmed and windows looped; it doubles as the hash prefix.
+            if (durationUs > 0 && durationUs < (long) (EmbeddingWindowConfig.SHORT_TRACK_SECONDS * 1_000_000L)) {
                 float[] all = decodeRange(extractor, codec, sampleRate, channels, 0L, durationUs);
-                if (all == null) return null;
-                float[] padded = new float[WINDOW_SAMPLES];
-                System.arraycopy(all, 0, padded, 0, Math.min(all.length, WINDOW_SAMPLES));
-                List<float[]> wins = new ArrayList<>();
-                wins.add(padded);
-                return new DecodeResult(all, wins);
+                if (all == null || all.length == 0) return null;
+                long seed = EmbeddingWindowConfig.seedFromContentHash(computeContentHash(all));
+                return new DecodeResult(all, extractWindows(all, splitCount, seed));
             }
 
             // 1. First 30 s for the content hash.
@@ -1177,29 +1173,29 @@ public class EmbeddingService {
 
     /**
      * Extract 10-second windows from fully decoded audio using the same
-     * placement as {@link #decodeAudioWindowAware}. For short songs (< 10s),
-     * returns a single zero-padded window.
+     * placement as {@link #decodeAudioWindowAware}. Tracks shorter than one
+     * window are looped to fill it (see EmbeddingWindowConfig.cutWindow).
      */
     private List<float[]> extractWindows(float[] audio, int count, long seed) {
         List<float[]> windows = new ArrayList<>();
-
-        if (audio.length <= WINDOW_SAMPLES) {
-            // Short song: pad and return single window
-            float[] padded = new float[WINDOW_SAMPLES];
-            System.arraycopy(audio, 0, padded, 0, Math.min(audio.length, WINDOW_SAMPLES));
-            windows.add(padded);
-            return windows;
-        }
-
-        double durationSec = audio.length / (double) TARGET_SAMPLE_RATE;
-        double[] starts = EmbeddingWindowConfig.planWindowStarts(durationSec, WINDOW_SECONDS, count, seed);
+        int sr = TARGET_SAMPLE_RATE;
+        double durationSec = audio.length / (double) sr;
+        double[] audible = durationSec < EmbeddingWindowConfig.SHORT_TRACK_SECONDS
+                ? EmbeddingWindowConfig.audibleRange(audio, audio.length, sr)
+                : new double[] {0.0, durationSec};
+        double[] range = EmbeddingWindowConfig.placementRange(durationSec, WINDOW_SECONDS, audible[0], audible[1]);
+        double[] starts = EmbeddingWindowConfig.planWindowStarts(
+                durationSec, WINDOW_SECONDS, count, seed, audible[0], audible[1]);
         for (int i = 0; i < starts.length; i++) {
-            float[] best = sliceWindow(audio, starts[i]);
-            float bestSilent = EmbeddingWindowConfig.silentFraction(best, WINDOW_SAMPLES, TARGET_SAMPLE_RATE);
+            float[] best = EmbeddingWindowConfig.cutWindow(
+                    audio, audio.length, sr, starts[i], range[0], range[1], WINDOW_SAMPLES);
+            float bestSilent = EmbeddingWindowConfig.silentFraction(best, WINDOW_SAMPLES, sr);
             if (bestSilent > EmbeddingWindowConfig.MAX_SILENT_FRACTION) {
-                for (double alt : EmbeddingWindowConfig.alternativeStarts(durationSec, WINDOW_SECONDS, count, seed, i)) {
-                    float[] cand = sliceWindow(audio, alt);
-                    float s = EmbeddingWindowConfig.silentFraction(cand, WINDOW_SAMPLES, TARGET_SAMPLE_RATE);
+                for (double alt : EmbeddingWindowConfig.alternativeStarts(
+                        durationSec, WINDOW_SECONDS, count, seed, i, audible[0], audible[1])) {
+                    float[] cand = EmbeddingWindowConfig.cutWindow(
+                            audio, audio.length, sr, alt, range[0], range[1], WINDOW_SAMPLES);
+                    float s = EmbeddingWindowConfig.silentFraction(cand, WINDOW_SAMPLES, sr);
                     if (s < bestSilent) {
                         best = cand;
                         bestSilent = s;
@@ -1209,16 +1205,7 @@ public class EmbeddingService {
             }
             windows.add(best);
         }
-
         return windows;
-    }
-
-    private static float[] sliceWindow(float[] audio, double startSec) {
-        int start = (int) Math.round(startSec * TARGET_SAMPLE_RATE);
-        start = Math.max(0, Math.min(start, audio.length - WINDOW_SAMPLES));
-        float[] window = new float[WINDOW_SAMPLES];
-        System.arraycopy(audio, start, window, 0, WINDOW_SAMPLES);
-        return window;
     }
 
     // ===== ONNX INFERENCE =====
