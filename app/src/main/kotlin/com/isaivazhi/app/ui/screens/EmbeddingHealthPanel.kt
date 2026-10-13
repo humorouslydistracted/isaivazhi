@@ -55,11 +55,28 @@ private enum class HealthSection(val label: String) {
     Rare("Rarely picked"),
     Everywhere("Everywhere"),
     Suspects("Suspects"),
+    Short("Short tracks"),
 }
 
 private data class HealthRow(val song: Song, val detail: String, val canReembed: Boolean)
 
 private const val MOST_SURFACED_LIMIT = 100
+
+/** Matches EmbeddingWindowConfig.SHORT_TRACK_SECONDS: below this, clips use the audible part only. */
+private const val SHORT_TRACK_MS = 30_000L
+
+private fun shortTracks(report: EmbeddingHealthAnalyzer.Report, songsByHash: Map<String, Song>): List<Song> {
+    val keys = LinkedHashSet<String>(report.raw.occurrence.keys)
+    report.suspects.forEach { keys.add(it.key) }
+    return keys.mapNotNull { songsByHash[it] }
+        .filter { it.durationMs in 1 until SHORT_TRACK_MS }
+        .sortedBy { it.durationMs }
+}
+
+private fun formatSeconds(ms: Long): String {
+    val s = (ms + 500) / 1000
+    return "%d:%02d".format(s / 60, s % 60)
+}
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -97,7 +114,10 @@ fun EmbeddingHealthPanel(
             }
             if (ready != null) {
                 item(key = "summary") {
-                    SummaryCard(ready.report)
+                    val shortCount = remember(ready, songsByHash) {
+                        shortTracks(ready.report, songsByHash).size
+                    }
+                    SummaryCard(ready.report, shortCount)
                 }
                 item(key = "chips") {
                     Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
@@ -296,7 +316,7 @@ private fun StatusCard(state: EmbeddingHealthEngine.State, onAnalyze: () -> Unit
 }
 
 @Composable
-private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report) {
+private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report, shortCount: Int) {
     val k = report.k
     Column(
         modifier = Modifier
@@ -328,6 +348,7 @@ private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report) {
             report.centered.maxOccurrence.toString(),
         )
         SummaryLine("Suspect embeddings", report.suspects.size.toString(), "")
+        SummaryLine("Short tracks (under 30 s)", shortCount.toString(), "")
         Spacer(Modifier.height(6.dp))
         Text(
             "Each song's $k closest matches by sound alone (no taste, no variety). " +
@@ -374,6 +395,9 @@ private fun sectionHint(section: HealthSection, k: Int): String = when (section)
         "Songs in the most top-$k lists. Very high counts crowd out everything else."
     HealthSection.Suspects ->
         "Embeddings that look wrong. Listen first; tap ↻ to re-embed one if it sounds fine."
+    HealthSection.Short ->
+        "Under 30 s, so they get fewer clips (silence trimmed, very short audio looped). " +
+            "Their matches can be less reliable; listen to check."
 }
 
 private fun buildRows(
@@ -413,6 +437,10 @@ private fun buildRows(
                     "Nearly identical to ${s.nearIdenticalCount} other songs"
             }
             HealthRow(song, detail, canReembed = true)
+        }
+        HealthSection.Short -> shortTracks(report, songsByHash).map { song ->
+            val h = song.contentHash.orEmpty()
+            HealthRow(song, "${formatSeconds(song.durationMs)} • ${counts(h)}", canReembed = false)
         }
     }
 }
