@@ -1,3 +1,4 @@
+import java.util.Base64
 import java.util.Properties
 
 plugins {
@@ -31,7 +32,7 @@ val appSigningKey: AppSigningKey? = when {
     !System.getenv("ISAIVAZHI_KEYSTORE_BASE64").isNullOrBlank() -> {
         val decoded = layout.buildDirectory.file("signing/app-signing.jks").get().asFile
         decoded.parentFile.mkdirs()
-        decoded.writeBytes(java.util.Base64.getMimeDecoder().decode(System.getenv("ISAIVAZHI_KEYSTORE_BASE64")))
+        decoded.writeBytes(Base64.getMimeDecoder().decode(System.getenv("ISAIVAZHI_KEYSTORE_BASE64")))
         AppSigningKey(
             storeFile = decoded,
             storePassword = System.getenv("ISAIVAZHI_KEYSTORE_PASSWORD") ?: error("ISAIVAZHI_KEYSTORE_PASSWORD is not set"),
