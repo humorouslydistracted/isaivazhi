@@ -13,6 +13,41 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+// Android only installs an update over an existing app when both APKs are
+// signed with the same key. Every build (debug and release, on any machine,
+// CI or cloud agent) signs with the one app key when it is available, from
+// keystore.properties locally or ISAIVAZHI_KEYSTORE_* environment variables
+// elsewhere. Without it, debug builds fall back to the per-machine debug key,
+// and those APKs cannot update an install signed by anything else.
+data class AppSigningKey(val storeFile: File, val storePassword: String, val keyAlias: String, val keyPassword: String)
+
+val appSigningKey: AppSigningKey? = when {
+    keystorePropertiesFile.exists() -> AppSigningKey(
+        storeFile = rootProject.file(keystoreProperties["storeFile"] as String),
+        storePassword = keystoreProperties["storePassword"] as String,
+        keyAlias = keystoreProperties["keyAlias"] as String,
+        keyPassword = keystoreProperties["keyPassword"] as String,
+    )
+    !System.getenv("ISAIVAZHI_KEYSTORE_BASE64").isNullOrBlank() -> {
+        val decoded = layout.buildDirectory.file("signing/app-signing.jks").get().asFile
+        decoded.parentFile.mkdirs()
+        decoded.writeBytes(java.util.Base64.getMimeDecoder().decode(System.getenv("ISAIVAZHI_KEYSTORE_BASE64")))
+        AppSigningKey(
+            storeFile = decoded,
+            storePassword = System.getenv("ISAIVAZHI_KEYSTORE_PASSWORD") ?: error("ISAIVAZHI_KEYSTORE_PASSWORD is not set"),
+            keyAlias = System.getenv("ISAIVAZHI_KEY_ALIAS") ?: error("ISAIVAZHI_KEY_ALIAS is not set"),
+            keyPassword = System.getenv("ISAIVAZHI_KEY_PASSWORD") ?: error("ISAIVAZHI_KEY_PASSWORD is not set"),
+        )
+    }
+    else -> null
+}
+if (appSigningKey == null) {
+    logger.warn(
+        "isaivazhi: no app signing key (keystore.properties or ISAIVAZHI_KEYSTORE_BASE64); " +
+            "debug APKs use this machine's debug key and cannot update installs signed elsewhere."
+    )
+}
+
 android {
     namespace = "com.isaivazhi.app"
     compileSdk = 36
@@ -39,12 +74,12 @@ android {
     }
 
     signingConfigs {
-        if (keystorePropertiesFile.exists()) {
+        if (appSigningKey != null) {
             create("release") {
-                storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
+                storeFile = appSigningKey.storeFile
+                storePassword = appSigningKey.storePassword
+                keyAlias = appSigningKey.keyAlias
+                keyPassword = appSigningKey.keyPassword
             }
         }
     }
@@ -53,10 +88,13 @@ android {
         debug {
             isMinifyEnabled = false
             isDebuggable = true
+            if (appSigningKey != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         release {
             isMinifyEnabled = false
-            if (keystorePropertiesFile.exists()) {
+            if (appSigningKey != null) {
                 signingConfig = signingConfigs.getByName("release")
             }
             proguardFiles(
