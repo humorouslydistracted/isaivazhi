@@ -23,6 +23,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also requests the legacy "tools" package, which
+          # current sdkmanager no longer provides, failing the job.
+          packages: platform-tools
 
       - name: Configure local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
@@ -31,4 +35,15 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build
+        env:
+          ISAIVAZHI_KEYSTORE_BASE64: ${{ secrets.ISAIVAZHI_KEYSTORE_BASE64 }}
+          ISAIVAZHI_KEYSTORE_PASSWORD: ${{ secrets.ISAIVAZHI_KEYSTORE_PASSWORD }}
+          ISAIVAZHI_KEY_ALIAS: ${{ secrets.ISAIVAZHI_KEY_ALIAS }}
+          ISAIVAZHI_KEY_PASSWORD: ${{ secrets.ISAIVAZHI_KEY_PASSWORD }}
         run: ./gradlew :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
