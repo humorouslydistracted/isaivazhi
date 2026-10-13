@@ -427,6 +427,7 @@ public final class EmbeddingDbManager {
         meta.put("entries", entries);
         meta.put("pathIndex", pathIndex);
         meta.put("splitCount", splitCount);
+        meta.put("windowStrategy", EmbeddingWindowConfig.STRATEGY);
         byte[] metaBytes = meta.toString().getBytes(StandardCharsets.UTF_8);
 
         ByteBuffer hdr = ByteBuffer.allocate(IVZ_HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);

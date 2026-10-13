@@ -668,7 +668,7 @@ fun AiManagementScreen(
                             modifier = Modifier.padding(top = 4.dp),
                         )
                         Text(
-                            text = "Sampling: 3 × 10 s per song at 20%, 50%, 80%",
+                            text = "Sampling: 10 s clips spread across each song, skipping intro, outro and silence",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurface,
                             modifier = Modifier.padding(top = 4.dp),
@@ -982,7 +982,7 @@ fun AiManagementScreen(
                     "These values are automatic, not settings.\n\n" +
                         "• Vector search: sqlite-vec speeds up similarity search; otherwise NEON fallback.\n" +
                         "• Embedding size: 512 numbers per song (fixed by the ONNX model).\n" +
-                        "• Sampling: 3 × 10 s clips per song at 20%, 50%, and 80% of track length, then averaged."
+                        "• Sampling: 3, 5 or 7 × 10 s clips per song, one from each part of the track (skipping the intro, outro and silent spots), then averaged."
                 )
             },
             confirmButton = {
@@ -1418,7 +1418,7 @@ private fun EmbeddingSplitSection(
         )
         Text(
             text = EmbeddingSplitCount.positionsLabel(normalized) +
-                " — averaged, then L2-normalized (512-d)",
+                ", one per part of the song (skips intro, outro and silence) — averaged, then L2-normalized (512-d)",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp),

@@ -47,7 +47,8 @@ import java.util.concurrent.TimeoutException;
  *   1. Decode audio to raw PCM (via MediaCodec)
  *   2. Convert to mono float32
  *   3. Resample to 48kHz
- *   4. Extract 3 x 10-second windows (at 20%, 50%, 80%)
+ *   4. Extract 3/5/7 x 10-second windows, one per section of the song,
+ *      skipping intro/outro and silent spots (EmbeddingWindowConfig)
  *   5. Run CLAP HTSAT-base encoder via ONNX
  *   6. Average window embeddings + L2 normalize
  *   7. Save to a per-song spool file under pending_songs/
@@ -71,7 +72,6 @@ public class EmbeddingService {
     private static final int TARGET_SAMPLE_RATE = 48000;
     private static final int WINDOW_SECONDS = 10;
     private static final int WINDOW_SAMPLES = TARGET_SAMPLE_RATE * WINDOW_SECONDS; // 480,000
-    private volatile float[] windowPositions = EmbeddingWindowConfig.windowPositions(3);
     private volatile int splitCount = 3;
     private static final int EMBEDDING_DIM = 512;
     private static final int DEFAULT_ORT_THREADS = 2;
@@ -104,8 +104,7 @@ public class EmbeddingService {
     /** 3, 5, or 7 — must match tools/embeddings/embedding_config.py. */
     public void setSplitCount(int count) {
         splitCount = EmbeddingWindowConfig.normalizeSplitCount(count);
-        windowPositions = EmbeddingWindowConfig.windowPositions(splitCount);
-        Log.i(TAG, "splitCount=" + splitCount + " windows=" + windowPositions.length);
+        Log.i(TAG, "splitCount=" + splitCount + " strategy=" + EmbeddingWindowConfig.STRATEGY);
     }
 
     public int getSplitCount() {
@@ -717,7 +716,8 @@ public class EmbeddingService {
             float[] audio = decodeAudio(filePath);
             if (audio == null || audio.length == 0) return null;
 
-            List<float[]> windows = extractWindows(audio, windowPositions);
+            List<float[]> windows = extractWindows(audio, splitCount,
+                    EmbeddingWindowConfig.seedFromContentHash(computeContentHash(audio)));
             List<float[]> embeddings = new ArrayList<>();
 
             for (float[] window : windows) {
@@ -984,24 +984,38 @@ public class EmbeddingService {
             codec.flush();
             float[] first30s = decodeRange(extractor, codec, sampleRate, channels, 0L, hashDurUs);
 
-            // 2. Ten-second windows at configured center positions.
-            float[] positions = windowPositions;
-            List<float[]> windows = new ArrayList<>(positions.length);
-            for (float pos : positions) {
-                long centerUs = (long) (durationUs * pos);
-                long startUs = Math.max(0L, centerUs - windowDurUs / 2);
-                long endUs = Math.min(durationUs, startUs + windowDurUs);
-                if (endUs - startUs < windowDurUs) {
-                    // Shift back if too close to the song's end.
-                    startUs = Math.max(0L, endUs - windowDurUs);
+            // 2. Ten-second windows, one per section of the song, placed
+            //    from the content hash (see EmbeddingWindowConfig).
+            int n = splitCount;
+            long seed = EmbeddingWindowConfig.seedFromContentHash(
+                    first30s != null && first30s.length > 0 ? computeContentHash(first30s) : null);
+            double durationSec = durationUs / 1_000_000.0;
+            double[] starts = EmbeddingWindowConfig.planWindowStarts(durationSec, WINDOW_SECONDS, n, seed);
+            List<float[]> windows = new ArrayList<>(starts.length);
+            int moved = 0;
+            for (int i = 0; i < starts.length; i++) {
+                float[] best = decodeWindowAt(extractor, codec, sampleRate, channels, starts[i]);
+                if (best == null) return null;
+                float bestSilent = EmbeddingWindowConfig.silentFraction(best, best.length, TARGET_SAMPLE_RATE);
+                if (bestSilent > EmbeddingWindowConfig.MAX_SILENT_FRACTION) {
+                    for (double alt : EmbeddingWindowConfig.alternativeStarts(durationSec, WINDOW_SECONDS, n, seed, i)) {
+                        float[] cand = decodeWindowAt(extractor, codec, sampleRate, channels, alt);
+                        if (cand == null) continue;
+                        float s = EmbeddingWindowConfig.silentFraction(cand, cand.length, TARGET_SAMPLE_RATE);
+                        if (s < bestSilent) {
+                            best = cand;
+                            bestSilent = s;
+                        }
+                        if (bestSilent <= EmbeddingWindowConfig.MAX_SILENT_FRACTION) break;
+                    }
+                    moved++;
                 }
-                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
-                codec.flush();
-                float[] win = decodeRange(extractor, codec, sampleRate, channels, startUs, startUs + windowDurUs);
-                if (win == null) return null;
                 float[] fixed = new float[WINDOW_SAMPLES];
-                System.arraycopy(win, 0, fixed, 0, Math.min(win.length, WINDOW_SAMPLES));
+                System.arraycopy(best, 0, fixed, 0, Math.min(best.length, WINDOW_SAMPLES));
                 windows.add(fixed);
+            }
+            if (moved > 0) {
+                Log.i(TAG, "quiet windows re-placed: " + moved + "/" + starts.length + " in " + filePath);
             }
             return new DecodeResult(first30s != null ? first30s : new float[0], windows);
         } catch (Exception e) {
@@ -1011,6 +1025,15 @@ public class EmbeddingService {
             try { if (codec != null) { codec.stop(); codec.release(); } } catch (Exception ignored) {}
             try { extractor.release(); } catch (Exception ignored) {}
         }
+    }
+
+    private float[] decodeWindowAt(MediaExtractor extractor, MediaCodec codec,
+                                   int sampleRate, int channels, double startSec) {
+        long startUs = Math.max(0L, (long) (startSec * 1_000_000.0));
+        long windowDurUs = (long) WINDOW_SECONDS * 1_000_000L;
+        extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+        codec.flush();
+        return decodeRange(extractor, codec, sampleRate, channels, startUs, startUs + windowDurUs);
     }
 
     /**
@@ -1153,10 +1176,11 @@ public class EmbeddingService {
     // ===== WINDOW EXTRACTION =====
 
     /**
-     * Extract 10-second windows at specified positions (20%, 50%, 80%).
-     * For short songs (< 10s), returns a single zero-padded window.
+     * Extract 10-second windows from fully decoded audio using the same
+     * placement as {@link #decodeAudioWindowAware}. For short songs (< 10s),
+     * returns a single zero-padded window.
      */
-    private List<float[]> extractWindows(float[] audio, float[] positions) {
+    private List<float[]> extractWindows(float[] audio, int count, long seed) {
         List<float[]> windows = new ArrayList<>();
 
         if (audio.length <= WINDOW_SAMPLES) {
@@ -1167,19 +1191,34 @@ public class EmbeddingService {
             return windows;
         }
 
-        for (float pos : positions) {
-            int center = (int) (audio.length * pos);
-            int start = Math.max(0, center - WINDOW_SAMPLES / 2);
-            if (start + WINDOW_SAMPLES > audio.length) {
-                start = audio.length - WINDOW_SAMPLES;
+        double durationSec = audio.length / (double) TARGET_SAMPLE_RATE;
+        double[] starts = EmbeddingWindowConfig.planWindowStarts(durationSec, WINDOW_SECONDS, count, seed);
+        for (int i = 0; i < starts.length; i++) {
+            float[] best = sliceWindow(audio, starts[i]);
+            float bestSilent = EmbeddingWindowConfig.silentFraction(best, WINDOW_SAMPLES, TARGET_SAMPLE_RATE);
+            if (bestSilent > EmbeddingWindowConfig.MAX_SILENT_FRACTION) {
+                for (double alt : EmbeddingWindowConfig.alternativeStarts(durationSec, WINDOW_SECONDS, count, seed, i)) {
+                    float[] cand = sliceWindow(audio, alt);
+                    float s = EmbeddingWindowConfig.silentFraction(cand, WINDOW_SAMPLES, TARGET_SAMPLE_RATE);
+                    if (s < bestSilent) {
+                        best = cand;
+                        bestSilent = s;
+                    }
+                    if (bestSilent <= EmbeddingWindowConfig.MAX_SILENT_FRACTION) break;
+                }
             }
-
-            float[] window = new float[WINDOW_SAMPLES];
-            System.arraycopy(audio, start, window, 0, WINDOW_SAMPLES);
-            windows.add(window);
+            windows.add(best);
         }
 
         return windows;
+    }
+
+    private static float[] sliceWindow(float[] audio, double startSec) {
+        int start = (int) Math.round(startSec * TARGET_SAMPLE_RATE);
+        start = Math.max(0, Math.min(start, audio.length - WINDOW_SAMPLES));
+        float[] window = new float[WINDOW_SAMPLES];
+        System.arraycopy(audio, start, window, 0, WINDOW_SAMPLES);
+        return window;
     }
 
     // ===== ONNX INFERENCE =====

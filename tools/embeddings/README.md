@@ -58,15 +58,19 @@ If CUDA is unavailable, scripts continue on CPU and print a clear warning at sta
 
 ## Split Count (3 / 5 / 7)
 
-Window centers are shared in `embedding_config.py`:
+Window placement (`stratified_v2`) is shared in `embedding_config.py` and
+`EmbeddingWindowConfig.java`:
 
-| Splits | Positions |
-| --- | --- |
-| 3 | 20%, 50%, 80% |
-| 5 | 1/6, 2/6, 3/6, 4/6, 5/6 |
-| 7 | 1/8 … 7/8 |
+1. Skip the first and last 8% of the song (at most 30 s each side).
+2. Split the rest into N equal sections and take one 10 s window per section,
+   at an offset derived from the song's content hash. The same song always
+   gets the same windows.
+3. If a window is mostly silent (more than half of its 100 ms frames below
+   ~-48 dBFS), try the middle, end, and start of the same section instead.
 
-Use the same split count in the app import/runtime.
+Use the same split count in the app import/runtime. Vectors made with the
+older fixed positions (20/50/80%, or k/(N+1)) are not directly comparable;
+re-embed the whole library rather than mixing the two.
 
 ## Folder Rename Concern (Phone Path)
 

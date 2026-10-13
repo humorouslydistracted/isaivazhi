@@ -37,7 +37,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from embedding_config import normalize_split_count, window_positions
+from embedding_config import STRATEGY, extract_windows, normalize_split_count
 from ivz_format import write_ivz
 
 SAMPLE_RATE = 48000
@@ -126,7 +126,7 @@ def load_config(args: argparse.Namespace) -> dict:
         "split_count": cfg["split_count"],
         "output_dir": out.resolve(),
         "checkpoint": ckpt.resolve(),
-        "window_positions": window_positions(cfg["split_count"]),
+        "window_strategy": STRATEGY,
         "checkpoint_every": max(1, checkpoint_every),
         "json_only": args.json_only,
     }
@@ -236,22 +236,6 @@ def compute_content_hash(audio: np.ndarray) -> str:
     return hashlib.sha256(int16_data.tobytes()).hexdigest()[:16]
 
 
-def extract_windows(audio: np.ndarray, positions: list[float]) -> list[np.ndarray]:
-    total = len(audio)
-    if total <= WINDOW_SAMPLES:
-        padded = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
-        padded[: min(total, WINDOW_SAMPLES)] = audio[: min(total, WINDOW_SAMPLES)]
-        return [padded]
-    windows: list[np.ndarray] = []
-    for pos in positions:
-        center = int(total * pos)
-        start = max(0, center - WINDOW_SAMPLES // 2)
-        if start + WINDOW_SAMPLES > total:
-            start = total - WINDOW_SAMPLES
-        windows.append(audio[start : start + WINDOW_SAMPLES].copy())
-    return windows
-
-
 def l2_normalize(vec: np.ndarray) -> np.ndarray:
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
@@ -332,7 +316,7 @@ def main() -> None:
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     else:
         print("WARNING: CUDA not available. Running on CPU (slower, but continues).")
-    print(f"Splits: {cfg['split_count']} ({cfg['window_positions']})")
+    print(f"Splits: {cfg['split_count']} (windows: {cfg['window_strategy']})")
     print(f"Songs:  {cfg['songs_dir']}")
     print(f"Phone:  {cfg['phone_music_base']}")
     print(f"Output: {cfg['output_dir']}")
@@ -431,7 +415,7 @@ def main() -> None:
                     changed += 1
                     print("REUSED hash")
                 else:
-                    windows = extract_windows(audio.astype(np.float32), cfg["window_positions"])
+                    windows = extract_windows(audio.astype(np.float32), cfg["split_count"], content_hash)
                     embs = [get_window_embedding(model, w, device) for w in windows]
                     avg = l2_normalize(np.mean(embs, axis=0).astype(np.float32))
 

@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from embedding_config import normalize_split_count, window_positions
+from embedding_config import STRATEGY, extract_windows, normalize_split_count
 from ivz_format import write_ivz
 from json_to_ivz import load_legacy_json
 
@@ -59,22 +59,6 @@ def _compute_content_hash(audio: np.ndarray) -> str:
     chunk = audio[: SAMPLE_RATE * CONTENT_HASH_SECONDS]
     int16_data = np.clip(chunk * 32767, -32768, 32767).astype(np.int16)
     return hashlib.sha256(int16_data.tobytes()).hexdigest()[:16]
-
-
-def _extract_windows(audio: np.ndarray, positions: list[float]) -> list[np.ndarray]:
-    total = len(audio)
-    if total <= WINDOW_SAMPLES:
-        padded = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
-        padded[: min(total, WINDOW_SAMPLES)] = audio[: min(total, WINDOW_SAMPLES)]
-        return [padded]
-    windows: list[np.ndarray] = []
-    for pos in positions:
-        center = int(total * pos)
-        start = max(0, center - WINDOW_SAMPLES // 2)
-        if start + WINDOW_SAMPLES > total:
-            start = total - WINDOW_SAMPLES
-        windows.append(audio[start : start + WINDOW_SAMPLES].copy())
-    return windows
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -126,7 +110,7 @@ def run_cloud_embedding(
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     else:
         print("WARNING: CUDA not available. Running on CPU (slower, but continues).")
-    print(f"Splits: {split_count} ({window_positions(split_count)})")
+    print(f"Splits: {split_count} (windows: {STRATEGY})")
     print(f"Songs:  {songs_dir}")
     print(f"Phone:  {phone_base}")
     print(f"Output: {output_dir}")
@@ -175,7 +159,7 @@ def run_cloud_embedding(
                 changed += 1
                 print("REUSED")
             else:
-                windows = _extract_windows(audio.astype(np.float32), window_positions(split_count))
+                windows = extract_windows(audio.astype(np.float32), split_count, content_hash)
                 embs = []
                 for w in windows:
                     with torch.no_grad():
