@@ -136,6 +136,7 @@ class StartupCoordinator(
                 launch { container.disliked.awaitReady() }
                 launch { container.playlists.awaitReady() }
                 launch { container.taste.awaitReady() }
+                launch { container.loadRecommendationModePrefs() }
             }
             _authoritativeUiReady.value = true
             requestSave()

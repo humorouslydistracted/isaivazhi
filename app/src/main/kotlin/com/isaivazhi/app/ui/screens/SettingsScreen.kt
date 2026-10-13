@@ -61,6 +61,11 @@ fun SettingsScreen(
     onOpenNetworkSystemSettings: (() -> Unit)? = null,
     onOpenFolders: (() -> Unit)? = null,
     folderSummary: String = "",
+    sharperSimilarity: Boolean = false,
+    onToggleSharperSimilarity: ((Boolean) -> Unit)? = null,
+    discoverySlots: Boolean = false,
+    onToggleDiscoverySlots: ((Boolean) -> Unit)? = null,
+    onOpenEmbeddingHealth: (() -> Unit)? = null,
 ) {
     Box(
         modifier = Modifier
@@ -157,6 +162,47 @@ fun SettingsScreen(
                         title = "System-level network restriction",
                         subtitle = "For complete isolation, revoke network permission in Android settings.",
                         onClick = onOpenNetworkSystemSettings,
+                    )
+                }
+            }
+            if (onToggleSharperSimilarity != null || onToggleDiscoverySlots != null) {
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    text = "Recommendations",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+                if (onToggleSharperSimilarity != null) {
+                    SwitchRow(
+                        title = "Sharper similarity",
+                        subtitle = if (sharperSimilarity)
+                            "On — ignores the sound every song in your library shares, so matches follow what makes each song different. Turn off to go back to the original matching."
+                        else
+                            "Off — original matching. Turn on if the same few songs keep showing up everywhere.",
+                        checked = sharperSimilarity,
+                        onCheckedChange = onToggleSharperSimilarity,
+                    )
+                }
+                if (onToggleDiscoverySlots != null) {
+                    SwitchRow(
+                        title = "Discovery slot (1 in 10)",
+                        subtitle = if (discoverySlots)
+                            "On — about every 10th Up Next song is one that rarely gets picked but still fits what's playing."
+                        else
+                            "Off — Up Next is only the closest matches.",
+                        checked = discoverySlots,
+                        onCheckedChange = onToggleDiscoverySlots,
+                    )
+                }
+                if (onOpenEmbeddingHealth != null) {
+                    ActionRow(
+                        title = "Embedding health",
+                        subtitle = "See songs that never get recommended, songs that show up everywhere, and embeddings that look broken.",
+                        onClick = onOpenEmbeddingHealth,
                     )
                 }
             }
@@ -310,6 +356,37 @@ private fun ActionRow(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+@Composable
+private fun SwitchRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 

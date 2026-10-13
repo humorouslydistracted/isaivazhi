@@ -48,12 +48,13 @@ import com.isaivazhi.app.engine.ActivityLogEngine
 import com.isaivazhi.app.engine.DebugLogCapture
 import kotlinx.coroutines.launch
 
-enum class LogsTab { Activity, Embedding, Crashes, Startup }
+enum class LogsTab { Activity, Embedding, Health, Crashes, Startup }
 
 /**
  * Diagnostics — four focused logs:
  * - Activity: curated app events (playback, taste, queue, engine)
  * - Embedding: ONNX batch trace
+ * - Health: library-wide embedding health (orphans, hubs, suspects)
  * - Crashes: persisted uncaught exceptions
  * - Startup: filtered logcat for cold start / library load
  */
@@ -64,6 +65,7 @@ fun LogsScreen(
     onClearEmbeddingLog: () -> Unit,
     initialTab: LogsTab = LogsTab.Activity,
     onBack: () -> Unit,
+    healthContent: (@Composable () -> Unit)? = null,
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -83,6 +85,7 @@ fun LogsScreen(
     val tabSubtitle = when (tab) {
         LogsTab.Activity -> "What the app did: plays, skips, taste, queue, favorites (last 200)."
         LogsTab.Embedding -> "ONNX embedding batches from AI & Library only."
+        LogsTab.Health -> "How well each song is reachable through similarity. Tap a song to play the list."
         LogsTab.Crashes -> "Stack traces after the app was killed — survives restart."
         LogsTab.Startup -> "Cold start and library load (filtered device log)."
     }
@@ -90,6 +93,7 @@ fun LogsScreen(
     val copyLabel = when (tab) {
         LogsTab.Activity -> "IsaiVazhi activity log"
         LogsTab.Embedding -> "IsaiVazhi embedding log"
+        LogsTab.Health -> "IsaiVazhi embedding health"
         LogsTab.Crashes -> "IsaiVazhi crashes"
         LogsTab.Startup -> "IsaiVazhi startup diagnostics"
     }
@@ -119,7 +123,7 @@ fun LogsScreen(
             HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
             Text(
-                text = "Activity = everyday issues. Crashes = force-close. Startup = slow open. Embedding = batch jobs.",
+                text = "Activity = everyday issues. Crashes = force-close. Startup = slow open. Embedding = batch jobs. Health = songs that never or always get recommended.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -134,6 +138,9 @@ fun LogsScreen(
             ) {
                 LogsTabChip(active = tab == LogsTab.Activity, label = "Activity", onClick = { tab = LogsTab.Activity })
                 LogsTabChip(active = tab == LogsTab.Embedding, label = "Embedding", onClick = { tab = LogsTab.Embedding })
+                if (healthContent != null) {
+                    LogsTabChip(active = tab == LogsTab.Health, label = "Health", onClick = { tab = LogsTab.Health })
+                }
                 LogsTabChip(active = tab == LogsTab.Crashes, label = "Crashes", onClick = { tab = LogsTab.Crashes })
                 LogsTabChip(active = tab == LogsTab.Startup, label = "Startup", onClick = { tab = LogsTab.Startup })
             }
@@ -196,7 +203,7 @@ fun LogsScreen(
                     }
                     else -> {}
                 }
-                TextButton(onClick = {
+                if (tab != LogsTab.Health) TextButton(onClick = {
                     val clip = ctx.getSystemService(ClipboardManager::class.java)
                     val text = when (tab) {
                         LogsTab.Activity -> {
@@ -229,6 +236,9 @@ fun LogsScreen(
                 }
                 LogsTab.Startup -> {
                     MonospaceLogBody(text = if (loading) "Capturing…" else startupText)
+                }
+                LogsTab.Health -> {
+                    healthContent?.invoke()
                 }
             }
         }

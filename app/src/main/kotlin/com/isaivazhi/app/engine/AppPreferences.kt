@@ -98,6 +98,8 @@ class AppPreferences(private val appContext: Context) {
         val ONBOARDING_DISMISSED = booleanPreferencesKey("onboarding_dismissed_v1")
         /** User has toggled the in-app network block; prevents model re-downloads via app code. */
         val NETWORK_BLOCKED = booleanPreferencesKey("network_blocked_v1")
+        val SHARPER_SIMILARITY = booleanPreferencesKey("rec_sharper_similarity_v1")
+        val DISCOVERY_SLOTS = booleanPreferencesKey("rec_discovery_slots_v1")
     }
 
     val recMode: kotlinx.coroutines.flow.Flow<Boolean> =
@@ -260,6 +262,26 @@ class AppPreferences(private val appContext: Context) {
         appContext.dataStore.edit { prefs ->
             if (blocked) prefs[Keys.NETWORK_BLOCKED] = true
             else prefs.remove(Keys.NETWORK_BLOCKED)
+        }
+    }
+
+    suspend fun isSharperSimilarityEnabled(): Boolean =
+        appContext.dataStore.data.first()[Keys.SHARPER_SIMILARITY] == true
+
+    suspend fun setSharperSimilarityEnabled(enabled: Boolean) {
+        appContext.dataStore.edit { prefs ->
+            if (enabled) prefs[Keys.SHARPER_SIMILARITY] = true
+            else prefs.remove(Keys.SHARPER_SIMILARITY)
+        }
+    }
+
+    suspend fun isDiscoverySlotsEnabled(): Boolean =
+        appContext.dataStore.data.first()[Keys.DISCOVERY_SLOTS] == true
+
+    suspend fun setDiscoverySlotsEnabled(enabled: Boolean) {
+        appContext.dataStore.edit { prefs ->
+            if (enabled) prefs[Keys.DISCOVERY_SLOTS] = true
+            else prefs.remove(Keys.DISCOVERY_SLOTS)
         }
     }
 

@@ -336,6 +336,9 @@ class AppContainer(private val appContext: Context) {
 
     val recommender: Recommender by lazy {
         Recommender(embeddingDb).also { engine ->
+            engine.lowExposureProvider = { centered, lib ->
+                embeddingHealth.lowExposureHashes(centered, lib)
+            }
             engine.traceSink = { trace ->
                 recommendationExplainability.recordGeneration(trace)
                 val blend = recommendationExplainability.blendIntervals.value.firstOrNull()
@@ -580,6 +583,55 @@ class AppContainer(private val appContext: Context) {
             ),
         )
         recommendationCache.invalidate(reason, revision, triggerPrecompute)
+    }
+
+    val embeddingHealth: EmbeddingHealthEngine by lazy {
+        EmbeddingHealthEngine(embeddingDb, applicationScope)
+    }
+
+    private val _sharperSimilarity = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val sharperSimilarity: kotlinx.coroutines.flow.StateFlow<Boolean> = _sharperSimilarity
+
+    private val _discoverySlots = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val discoverySlots: kotlinx.coroutines.flow.StateFlow<Boolean> = _discoverySlots
+
+    /** Applies the saved Recommendations settings; call before the first recommendation build. */
+    suspend fun loadRecommendationModePrefs() {
+        val sharper = runCatching { preferences.isSharperSimilarityEnabled() }.getOrDefault(false)
+        val discovery = runCatching { preferences.isDiscoverySlotsEnabled() }.getOrDefault(false)
+        recommender.sharperSimilarity = sharper
+        recommender.discoverySlots = discovery
+        _sharperSimilarity.value = sharper
+        _discoverySlots.value = discovery
+    }
+
+    fun setSharperSimilarity(enabled: Boolean) {
+        if (_sharperSimilarity.value == enabled && recommender.sharperSimilarity == enabled) return
+        recommender.sharperSimilarity = enabled
+        _sharperSimilarity.value = enabled
+        sideEffectScope.launch { preferences.setSharperSimilarityEnabled(enabled) }
+        activityLog.log(
+            category = "recommendation",
+            type = "SHARPER_SIMILARITY",
+            message = "Sharper similarity ${if (enabled) "on" else "off"}",
+        )
+        invalidateRecommendationInputs("sharper_similarity")
+    }
+
+    fun setDiscoverySlots(enabled: Boolean) {
+        if (_discoverySlots.value == enabled && recommender.discoverySlots == enabled) return
+        recommender.discoverySlots = enabled
+        _discoverySlots.value = enabled
+        sideEffectScope.launch { preferences.setDiscoverySlotsEnabled(enabled) }
+        activityLog.log(
+            category = "recommendation",
+            type = "DISCOVERY_SLOTS",
+            message = "Discovery slot ${if (enabled) "on" else "off"}",
+        )
+        if (enabled && embeddingHealth.state.value !is EmbeddingHealthEngine.State.Ready) {
+            embeddingHealth.analyze(library.value)
+        }
+        invalidateRecommendationInputs("discovery_slots")
     }
 
     fun setTasteAdventurous(value: Float) {

@@ -92,6 +92,7 @@ import com.isaivazhi.app.ui.screens.AiManagementScreen
 import com.isaivazhi.app.ui.screens.AlbumsScreen
 import com.isaivazhi.app.ui.screens.BrowseCategory
 import com.isaivazhi.app.ui.screens.BrowseScreen
+import com.isaivazhi.app.ui.screens.EmbeddingHealthPanel
 import com.isaivazhi.app.ui.screens.LogsScreen
 import com.isaivazhi.app.ui.screens.LogsTab
 // Phase 4 (2026-06-01): DiscoverScreen / DiscoverSectionRef imports removed
@@ -425,6 +426,8 @@ private fun AppRoot(container: AppContainer) {
     var showOnnxSkipConfirm by remember { mutableStateOf(false) }
     var showNetworkPrompt by remember { mutableStateOf(false) }
     var networkBlocked by remember { mutableStateOf(false) }
+    val sharperSimilarityOn by container.sharperSimilarity.collectAsState()
+    val discoverySlotsOn by container.discoverySlots.collectAsState()
     var onboardingDismissed by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         onnxDownloadSkipped = container.preferences.isOnnxDownloadSkipped()
@@ -2963,6 +2966,11 @@ private fun AppRoot(container: AppContainer) {
                 else if (excl == 0) "$total folder${if (total == 1) "" else "s"} · all included"
                 else "$total folder${if (total == 1) "" else "s"} · $excl excluded"
             },
+            sharperSimilarity = sharperSimilarityOn,
+            onToggleSharperSimilarity = { container.setSharperSimilarity(it) },
+            discoverySlots = discoverySlotsOn,
+            onToggleDiscoverySlots = { container.setDiscoverySlots(it) },
+            onOpenEmbeddingHealth = { overlay = Overlay.Logs(LogsTab.Health) },
         )
     }
 
@@ -3451,6 +3459,44 @@ private fun AppRoot(container: AppContainer) {
                 },
                 initialTab = logsOverlay.initialTab,
                 onBack = { overlay = Overlay.None },
+                healthContent = {
+                    val healthState by container.embeddingHealth.state.collectAsState()
+                    val songsByHash = remember(songs) {
+                        val out = HashMap<String, Song>(songs.size)
+                        for (s in songs) {
+                            val h = s.contentHash?.takeIf { it.isNotBlank() } ?: continue
+                            if (s.filePath != null && h !in out) out[h] = s
+                        }
+                        out
+                    }
+                    EmbeddingHealthPanel(
+                        state = healthState,
+                        songsByHash = songsByHash,
+                        sharperSimilarityOn = sharperSimilarityOn,
+                        currentMediaId = playbackState.currentMediaId,
+                        nowPlayingTitle = playbackState.title,
+                        nowPlayingArtist = playbackState.artist,
+                        isPlaying = playbackState.isPlaying,
+                        onAnalyze = { container.embeddingHealth.analyze(songs) },
+                        onPlay = { list, idx ->
+                            playFromSection(
+                                list, idx,
+                                com.isaivazhi.app.engine.PlaybackEngine.QueueContext.BROWSE_SECTION,
+                                "Embedding health",
+                            )
+                        },
+                        onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
+                        onReembed = { song ->
+                            container.embedding.embedSongs(listOf(song))
+                            container.toaster.show(
+                                "Re-embedding \"${song.title.ifBlank { song.filename }}\" — re-analyze when it finishes",
+                            )
+                        },
+                        onTogglePause = { container.playback.togglePause() },
+                        onSkipPrev = { container.playback.skipPrev() },
+                        onSkipNext = { container.playback.skipNext(neutral = true) },
+                    )
+                },
             )
         }
     }

@@ -57,6 +57,40 @@ class Recommender(
     var traceSink: ((RecommendationGenerationTrace) -> Unit)? = null
 
     /**
+     * Settings → "Sharper similarity". Ranks neighbours by cosine after
+     * subtracting the library mean, but reports raw-cosine magnitudes (see
+     * [EmbeddingSpace.calibrateByRank]) so taste mixing and MMR keep their
+     * tuned balance. Off = the original raw-cosine ranking, unchanged.
+     */
+    @Volatile var sharperSimilarity: Boolean = false
+
+    /** Settings → "Discovery slot". See [DiscoverySlots]. */
+    @Volatile var discoverySlots: Boolean = false
+
+    /**
+     * Content hashes that rarely appear in neighbour lists, in the space
+     * matching [sharperSimilarity]. Null while not yet analysed; the
+     * provider is expected to start the analysis in the background.
+     */
+    @Volatile var lowExposureProvider: ((centered: Boolean, library: List<Song>) -> Set<String>?)? = null
+
+    @Volatile private var meanCache: Pair<Long, FloatArray>? = null
+
+    private suspend fun libraryMeanVector(library: List<Song>): FloatArray? {
+        val hashes = HashSet<String>(library.size)
+        for (s in library) s.contentHash?.takeIf { it.isNotBlank() }?.let { hashes += it }
+        if (hashes.isEmpty()) return null
+        var sig = hashes.size.toLong() shl 32
+        for (h in hashes) sig = sig xor (h.hashCode().toLong() and 0xffffffffL)
+        meanCache?.let { if (it.first == sig) return it.second }
+        val vecs = embeddingDb.getVecsByHashes(hashes.toList())
+        val dim = vecs.values.firstOrNull()?.size ?: return null
+        val mean = EmbeddingSpace.libraryMean(vecs.values, dim) ?: return null
+        meanCache = sig to mean
+        return mean
+    }
+
+    /**
      * Push #67: blend weight schedule. Capacitor parity (`_blendWeights`
      * in engine.js:653). Mode controls which entry point we're building
      * for; the weights ramp based on how many session listens have
@@ -422,10 +456,32 @@ class Recommender(
         library: List<Song>,
         k: Int,
         excludeFilenames: Set<String> = emptySet(),
+        excludeHashes: Set<String> = emptySet(),
     ): List<ScoredSong> {
+        val sharper = sharperSimilarity
+        val scored = scoreLibrary(queryVec, library, excludeFilenames, excludeHashes, centered = sharper)
+        if (scored.isEmpty()) return emptyList()
+        if (sharper && scored.first().centered.isFinite()) {
+            return EmbeddingSpace.calibrateByRank(scored, k).map { (song, sim) -> ScoredSong(song, sim) }
+        }
+        return scored.sortedByDescending { it.raw }.take(k).map { ScoredSong(it.item, it.raw) }
+    }
+
+    /**
+     * Raw cosine (query assumed unit length) for every embedded, playable
+     * library song; plus the centred score when [centered] is set and a
+     * library mean is available (NaN otherwise).
+     */
+    private suspend fun scoreLibrary(
+        queryVec: FloatArray,
+        library: List<Song>,
+        excludeFilenames: Set<String>,
+        excludeHashes: Set<String>,
+        centered: Boolean,
+    ): List<EmbeddingSpace.Scored<Song>> {
         val embedded = library.asSequence()
             .filter { !it.contentHash.isNullOrBlank() && it.filePath != null }
-            .filter { it.filename !in excludeFilenames }
+            .filter { it.filename !in excludeFilenames && it.contentHash !in excludeHashes }
             .distinctBy { it.contentHash!! }
             .toList()
         if (embedded.isEmpty()) return emptyList()
@@ -433,7 +489,10 @@ class Recommender(
         val vecs = embeddingDb.getVecsByHashes(hashes)
         if (vecs.isEmpty()) return emptyList()
         val dim = queryVec.size
-        val scored = ArrayList<ScoredSong>(embedded.size)
+        val centeredQuery = if (centered) {
+            libraryMeanVector(library)?.takeIf { it.size == dim }?.let { EmbeddingSpace.CenteredQuery(queryVec, it) }
+        } else null
+        val scored = ArrayList<EmbeddingSpace.Scored<Song>>(embedded.size)
         for (song in embedded) {
             val v = vecs[song.contentHash ?: continue] ?: continue
             if (v.size != dim) continue
@@ -441,10 +500,58 @@ class Recommender(
             var vn = 0f
             for (i in 0 until dim) { dot += queryVec[i] * v[i]; vn += v[i] * v[i] }
             val norm = if (vn > 0f) sqrt(vn) else 1f
-            scored += ScoredSong(song, dot / norm)
+            scored += EmbeddingSpace.Scored(song, dot / norm, centeredQuery?.score(v) ?: Float.NaN)
         }
-        scored.sortByDescending { it.similarity }
-        return scored.take(k)
+        return scored
+    }
+
+    private suspend fun unitVectorFor(song: Song): FloatArray? {
+        val hash = song.contentHash?.takeIf { it.isNotBlank() } ?: return null
+        val v = embeddingDb.getVecsByHashes(listOf(hash))[hash] ?: return null
+        return EmbeddingSpace.unit(v).takeIf { u -> u.any { it != 0f } }
+    }
+
+    /**
+     * Swap roughly one in ten of [selected] for low-exposure songs that are
+     * still in the top quarter of the library for [queryVec]. Returns
+     * [selected] untouched whenever anything needed is missing.
+     */
+    private suspend fun withDiscoverySlots(
+        selected: List<Song>,
+        k: Int,
+        queryVec: FloatArray?,
+        library: List<Song>,
+        currentSong: Song,
+        excludeFilenames: Set<String>,
+    ): List<Song> {
+        if (!discoverySlots || queryVec == null) return selected
+        val count = DiscoverySlots.slotCount(selected.size)
+        if (count == 0) return selected
+        val sharper = sharperSimilarity
+        val lowExposure = runCatching { lowExposureProvider?.invoke(sharper, library) }.getOrNull()
+        if (lowExposure.isNullOrEmpty()) return selected
+        val scored = scoreLibrary(queryVec, library, emptySet(), emptySet(), centered = sharper)
+        if (scored.isEmpty()) return selected
+        val useCentered = sharper && scored.first().centered.isFinite()
+        val blockedNames = HashSet<String>(excludeFilenames).apply {
+            add(currentSong.filename)
+            selected.forEach { add(it.filename) }
+        }
+        val blockedHashes = HashSet<String>().apply {
+            currentSong.contentHash?.let { add(it) }
+            selected.forEach { s -> s.contentHash?.let { add(it) } }
+        }
+        val picks = DiscoverySlots.pick(
+            scored = scored.map { it.item to if (useCentered) it.centered else it.raw },
+            isEligible = { s ->
+                s.filename !in blockedNames &&
+                    s.contentHash !in blockedHashes &&
+                    s.contentHash in lowExposure
+            },
+            count = count,
+        )
+        if (picks.isEmpty()) return selected
+        return DiscoverySlots.inject(selected, picks, maxSize = k)
     }
 
     suspend fun recommendUpcoming(
@@ -481,13 +588,28 @@ class Recommender(
         // vector is supplied (Push #67), rank against it; otherwise use
         // the current-song-only path via sqlite-vec.
         val overFetch = (k * 3).coerceAtLeast(k + 10)
-        val rawCandidates: List<EmbeddingDbFacade.NnResult> = if (blendedQueryVec != null) {
-            val scored = nearestNeighborsForVector(
-                queryVec = blendedQueryVec,
-                library = library,
-                k = overFetch,
-                excludeFilenames = extraExcludeFilenames + policyExcludes + setOf(currentSong.filename),
-            )
+        // The sqlite/heap filename path only knows raw cosine, so Sharper
+        // similarity routes the current-song query through the vector path.
+        val sharperCurrentVec = if (blendedQueryVec == null && sharperSimilarity) {
+            unitVectorFor(currentSong)
+        } else null
+        val rawCandidates: List<EmbeddingDbFacade.NnResult> = if (blendedQueryVec != null || sharperCurrentVec != null) {
+            val scored = if (blendedQueryVec != null) {
+                nearestNeighborsForVector(
+                    queryVec = blendedQueryVec,
+                    library = library,
+                    k = overFetch,
+                    excludeFilenames = extraExcludeFilenames + policyExcludes + setOf(currentSong.filename),
+                )
+            } else {
+                nearestNeighborsForVector(
+                    queryVec = sharperCurrentVec!!,
+                    library = library,
+                    k = overFetch,
+                    excludeFilenames = setOf(currentSong.filename),
+                    excludeHashes = excludeHashes.toSet(),
+                )
+            }
             // Adapt to NnResult shape so the rest of the pipeline is shared.
             scored.map { ss ->
                 EmbeddingDbFacade.NnResult(
@@ -614,19 +736,35 @@ class Recommender(
                 }
             }
         }
+        val finalSelected = if (discoverySlots) {
+            try {
+                withDiscoverySlots(
+                    selected = selected,
+                    k = k,
+                    queryVec = blendedQueryVec ?: sharperCurrentVec ?: unitVectorFor(currentSong),
+                    library = library,
+                    currentSong = currentSong,
+                    excludeFilenames = extraExcludeFilenames + policyExcludes,
+                )
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                selected
+            }
+        } else selected
         emitGenerationTrace(
             reason = traceReason,
             tasteInfluence = tasteInfluence,
             negativeGuard = negativeGuard,
             candidateCount = candidates.size,
-            selected = selected,
+            selected = finalSelected,
             audioByFilename = audioByFilename,
             preRankByFilename = preRankByFilename,
             totalTasteScores = totalTasteScores,
             policyExcludes = policyExcludes,
             rejected = rejectedTraces,
         )
-        return selected
+        return finalSelected
     }
 
     private fun rejectedTrace(
@@ -807,14 +945,27 @@ class Recommender(
             hardBlockedFilenames, softExcludedFilenames, dislikedFilenames,
         )
         val stableSorted: List<Song> = if (stableVecs.isEmpty()) stableSrc else {
-            stableSrc.map { song ->
+            val centeredQuery = if (sharperSimilarity) {
+                libraryMeanVector(library)?.takeIf { it.size == dim }
+                    ?.let { EmbeddingSpace.CenteredQuery(blendedQueryVec, it) }
+            } else null
+            val scored = stableSrc.map { song ->
                 val v = song.contentHash?.let { stableVecs[it] }
-                val sim = if (v != null && v.size == dim) {
+                if (v != null && v.size == dim) {
                     var dot = 0f; var n = 0f
                     for (i in 0 until dim) { dot += blendedQueryVec[i] * v[i]; n += v[i] * v[i] }
                     val norm = if (n > 0f) sqrt(n) else 1f
-                    dot / norm
-                } else -1f
+                    EmbeddingSpace.Scored(song, dot / norm, centeredQuery?.score(v) ?: Float.NaN)
+                } else {
+                    EmbeddingSpace.Scored(song, -1f, -2f)
+                }
+            }
+            val audioBySong: List<Pair<Song, Float>> = if (centeredQuery != null) {
+                EmbeddingSpace.calibrateByRank(scored)
+            } else {
+                scored.map { it.item to it.raw }
+            }
+            audioBySong.map { (song, sim) ->
                 song to UnifiedTasteContract.finalRelevance(
                     audioRelevance = sim,
                     totalScore = totalTasteScores[song.filename] ?: 0f,
@@ -942,6 +1093,27 @@ class Recommender(
         // results after filtering out negatives.
         val fetchK = if (policyExcludes.isEmpty()) k
             else (k + policyExcludes.size).coerceAtMost(k * 4)
+        val sharperVec = if (sharperSimilarity) unitVectorFor(currentSong) else null
+        if (sharperVec != null) {
+            val scored = nearestNeighborsForVector(
+                queryVec = sharperVec,
+                library = library,
+                k = fetchK,
+                excludeFilenames = setOf(currentSong.filename),
+                excludeHashes = excludeHashes.toSet(),
+            )
+            if (scored.isNotEmpty()) {
+                val rows = scored.map { ss ->
+                    EmbeddingDbFacade.NnResult(
+                        contentHash = ss.song.contentHash ?: "",
+                        filepath = ss.song.filePath ?: "",
+                        filename = ss.song.filename,
+                        similarity = ss.similarity,
+                    )
+                }
+                return resolveSimilarCandidates(rows, library, policyExcludes, k)
+            }
+        }
         val candidates = embeddingDb.nearestNeighborsForFilename(
             queryFilename = currentSong.filename,
             k = fetchK,
