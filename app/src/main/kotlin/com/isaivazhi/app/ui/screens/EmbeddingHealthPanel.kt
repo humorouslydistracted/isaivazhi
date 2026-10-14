@@ -22,19 +22,16 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,14 +48,13 @@ import com.isaivazhi.app.engine.EmbeddingHealthEngine
 import com.isaivazhi.app.engine.Song
 
 private enum class HealthSection(val label: String) {
-    Never("Never picked"),
-    Rare("Rarely picked"),
+    HardToReach("Hard to reach"),
     Everywhere("Everywhere"),
     Suspects("Suspects"),
     Short("Short tracks"),
 }
 
-private data class HealthRow(val song: Song, val detail: String, val canReembed: Boolean)
+private data class HealthRow(val song: Song, val detail: String)
 
 private const val MOST_SURFACED_LIMIT = 100
 
@@ -78,6 +74,10 @@ private fun formatSeconds(ms: Long): String {
     return "%d:%02d".format(s / 60, s % 60)
 }
 
+/**
+ * [sharperSimilarityOn] is the Settings toggle; the panel shows the space the
+ * recommender actually uses and summarises the other one in a single line.
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun EmbeddingHealthPanel(
@@ -85,172 +85,136 @@ fun EmbeddingHealthPanel(
     songsByHash: Map<String, Song>,
     sharperSimilarityOn: Boolean,
     currentMediaId: String?,
-    nowPlayingTitle: String,
-    nowPlayingArtist: String,
-    isPlaying: Boolean,
     onAnalyze: () -> Unit,
     onPlay: (songs: List<Song>, index: Int) -> Unit,
     onLongPress: (Song) -> Unit,
-    onReembed: (Song) -> Unit,
-    onTogglePause: () -> Unit,
-    onSkipPrev: () -> Unit,
-    onSkipNext: () -> Unit,
+    onReembed: (List<Song>) -> Unit,
 ) {
-    var section by rememberSaveable { mutableStateOf(HealthSection.Never) }
-    var viewSharper by rememberSaveable(sharperSimilarityOn) { mutableStateOf(sharperSimilarityOn) }
+    var section by rememberSaveable { mutableStateOf(HealthSection.HardToReach) }
+    var confirmSection by remember { mutableStateOf<List<Song>?>(null) }
     val ready = state as? EmbeddingHealthEngine.State.Ready
-    val rows: List<HealthRow> = remember(ready, section, viewSharper, songsByHash) {
-        if (ready == null) emptyList() else buildRows(ready.report, section, viewSharper, songsByHash)
+    val rows: List<HealthRow> = remember(ready, section, sharperSimilarityOn, songsByHash) {
+        if (ready == null) emptyList() else buildRows(ready.report, section, sharperSimilarityOn, songsByHash)
     }
     val playable = remember(rows) { rows.map { it.song } }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        LazyColumn(
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(bottom = 8.dp),
-        ) {
-            item(key = "status") {
-                StatusCard(state = state, onAnalyze = onAnalyze)
-            }
-            if (ready != null) {
-                item(key = "summary") {
-                    val shortCount = remember(ready, songsByHash) {
-                        shortTracks(ready.report, songsByHash).size
-                    }
-                    SummaryCard(ready.report, shortCount)
-                }
-                item(key = "chips") {
-                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            HealthChip(!viewSharper, "Original matching") { viewSharper = false }
-                            HealthChip(viewSharper, "Sharper similarity") { viewSharper = true }
-                        }
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            for (s in HealthSection.entries) {
-                                HealthChip(section == s, s.label) { section = s }
-                            }
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            text = sectionHint(section, ready.report.k),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                if (rows.isEmpty()) {
-                    item(key = "empty") {
-                        Text(
-                            text = "Nothing here — good news.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(16.dp),
-                        )
-                    }
-                }
-                itemsIndexed(rows, key = { i, r -> "h_${section.name}_${i}_${r.song.id}" }) { i, row ->
-                    val isCurrent = row.song.filename == currentMediaId
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .combinedClickable(
-                                onClick = { onPlay(playable, i) },
-                                onLongClick = { onLongPress(row.song) },
-                            )
-                            .background(
-                                if (isCurrent) MaterialTheme.colorScheme.surfaceVariant
-                                else MaterialTheme.colorScheme.background,
-                            )
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        ArtThumbnail(filePath = row.song.filePath, size = 44.dp, cornerRadius = 4.dp)
-                        Spacer(Modifier.width(12.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = row.song.title.ifBlank { row.song.filename },
-                                style = MaterialTheme.typography.titleSmall,
-                                color = if (isCurrent) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onBackground,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = listOf(row.song.artist, row.detail).filter { it.isNotBlank() }
-                                    .joinToString(" • "),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        if (row.canReembed) {
-                            IconButton(
-                                onClick = { onReembed(row.song) },
-                                modifier = Modifier.size(40.dp),
-                            ) {
-                                Icon(
-                                    Icons.Filled.Refresh,
-                                    contentDescription = "Re-embed",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 8.dp),
+    ) {
+        item(key = "status") {
+            StatusCard(state = state, onAnalyze = onAnalyze)
         }
-        if (currentMediaId != null) {
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surface)
-                    .padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
+        if (ready != null) {
+            item(key = "summary") {
+                val shortCount = remember(ready, songsByHash) {
+                    shortTracks(ready.report, songsByHash).size
+                }
+                SummaryCard(ready.report, sharperSimilarityOn, shortCount)
+            }
+            item(key = "chips") {
+                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        for (s in HealthSection.entries) {
+                            HealthChip(section == s, s.label) { section = s }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
                     Text(
-                        text = nowPlayingTitle.ifBlank { currentMediaId },
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                        text = sectionHint(section, ready.report.k),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (nowPlayingArtist.isNotBlank()) {
+                    if (playable.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        OutlinedButton(onClick = { confirmSection = playable }) {
+                            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Re-embed all (${playable.size})")
+                        }
+                    }
+                }
+            }
+            if (rows.isEmpty()) {
+                item(key = "empty") {
+                    Text(
+                        text = "Nothing here — good news.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+            itemsIndexed(rows, key = { i, r -> "h_${section.name}_${i}_${r.song.id}" }) { i, row ->
+                val isCurrent = row.song.filename == currentMediaId
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            onClick = { onPlay(playable, i) },
+                            onLongClick = { onLongPress(row.song) },
+                        )
+                        .background(
+                            if (isCurrent) MaterialTheme.colorScheme.surfaceVariant
+                            else MaterialTheme.colorScheme.background,
+                        )
+                        .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    ArtThumbnail(filePath = row.song.filePath, size = 44.dp, cornerRadius = 4.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = nowPlayingArtist,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            text = row.song.title.ifBlank { row.song.filename },
+                            style = MaterialTheme.typography.titleSmall,
+                            color = if (isCurrent) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onBackground,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        Text(
+                            text = listOf(row.song.artist, row.detail).filter { it.isNotBlank() }
+                                .joinToString(" • "),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
-                }
-                IconButton(onClick = onSkipPrev) {
-                    Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous",
-                        tint = MaterialTheme.colorScheme.onSurface)
-                }
-                IconButton(onClick = onTogglePause) {
-                    Icon(
-                        if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        contentDescription = if (isPlaying) "Pause" else "Play",
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                }
-                IconButton(onClick = onSkipNext) {
-                    Icon(Icons.Filled.SkipNext, contentDescription = "Next",
-                        tint = MaterialTheme.colorScheme.onSurface)
+                    IconButton(onClick = { onReembed(listOf(row.song)) }) {
+                        Icon(
+                            Icons.Filled.Refresh,
+                            contentDescription = "Re-embed",
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                 }
             }
         }
+    }
+
+    val pending = confirmSection
+    if (pending != null) {
+        AlertDialog(
+            onDismissRequest = { confirmSection = null },
+            title = { Text("Re-embed ${pending.size} songs?") },
+            text = {
+                Text(
+                    "Their embeddings are recomputed in the background and replace the current ones. " +
+                        "If embedding is already running, these join the end of that run. " +
+                        "Re-analyze when it finishes.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmSection = null; onReembed(pending) }) { Text("Re-embed") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmSection = null }) { Text("Cancel") }
+            },
+        )
     }
 }
 
@@ -316,8 +280,11 @@ private fun StatusCard(state: EmbeddingHealthEngine.State, onAnalyze: () -> Unit
 }
 
 @Composable
-private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report, shortCount: Int) {
+private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report, sharper: Boolean, shortCount: Int) {
     val k = report.k
+    val space = if (sharper) report.centered else report.raw
+    val other = if (sharper) report.raw else report.centered
+    val unusual = report.suspects.count { it.reason == EmbeddingHealthAnalyzer.SuspectReason.OUTLIER }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -326,34 +293,30 @@ private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report, shortCount: Int)
             .background(MaterialTheme.colorScheme.surface)
             .padding(12.dp),
     ) {
-        SummaryLine("", "Original", "Sharper", header = true)
-        SummaryLine(
-            "Never picked",
-            report.raw.orphans().size.toString(),
-            report.centered.orphans().size.toString(),
+        Text(
+            if (sharper) "Using Sharper similarity (Settings)" else "Using original matching",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        SummaryLine(
-            "Rarely picked (≤${EmbeddingHealthAnalyzer.lowExposureMax(k)})",
-            report.raw.lowExposure(k).size.toString(),
-            report.centered.lowExposure(k).size.toString(),
-        )
-        SummaryLine(
-            "Everywhere (≥${EmbeddingHealthAnalyzer.hubMin(k)})",
-            report.raw.hubs(k).size.toString(),
-            report.centered.hubs(k).size.toString(),
-        )
-        SummaryLine(
-            "Most lists one song is in",
-            report.raw.maxOccurrence.toString(),
-            report.centered.maxOccurrence.toString(),
-        )
-        SummaryLine("Suspect embeddings", report.suspects.size.toString(), "")
-        SummaryLine("Short tracks (under 30 s)", shortCount.toString(), "")
+        Spacer(Modifier.height(4.dp))
+        SummaryLine("Hard to reach (in ≤${EmbeddingHealthAnalyzer.lowExposureMax(k)} lists)", space.hardToReach(k).size)
+        SummaryLine("  of which never picked", space.orphans().size)
+        SummaryLine("Everywhere (in ≥${EmbeddingHealthAnalyzer.hubMin(k)} lists)", space.hubs(k).size)
+        SummaryLine("Suspect embeddings", report.suspects.size - unusual)
+        SummaryLine("Unusual, probably fine", unusual)
+        SummaryLine("Short tracks (under 30 s)", shortCount)
         Spacer(Modifier.height(6.dp))
         Text(
+            "Turning Sharper similarity ${if (sharper) "off" else "on"} would give " +
+                "${other.hardToReach(k).size} hard to reach and ${other.hubs(k).size} everywhere.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
             "Each song's $k closest matches by sound alone (no taste, no variety). " +
-                "On average a song is in $k lists. Lower \"Never\" and \"Everywhere\" " +
-                "counts mean similarity spreads more evenly across your library.",
+                "On average a song is in $k lists. Fewer hard-to-reach and everywhere " +
+                "songs mean similarity spreads more evenly across your library.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -361,13 +324,19 @@ private fun SummaryCard(report: EmbeddingHealthAnalyzer.Report, shortCount: Int)
 }
 
 @Composable
-private fun SummaryLine(label: String, original: String, sharper: String, header: Boolean = false) {
-    val style = if (header) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall
-    val color = if (header) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
+private fun SummaryLine(label: String, value: Int) {
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-        Text(label, style = style, color = color, modifier = Modifier.weight(1f))
-        Text(original, style = style, color = color, modifier = Modifier.width(72.dp))
-        Text(sharper, style = style, color = color, modifier = Modifier.width(72.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            value.toString(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 
@@ -387,14 +356,14 @@ private fun HealthChip(active: Boolean, label: String, onClick: () -> Unit) {
 }
 
 private fun sectionHint(section: HealthSection, k: Int): String = when (section) {
-    HealthSection.Never ->
-        "In nobody's top $k. Up Next built from similarity basically never reaches these. Tap to play them."
-    HealthSection.Rare ->
-        "In at most ${EmbeddingHealthAnalyzer.lowExposureMax(k)} lists. These are what the discovery slot draws from."
+    HealthSection.HardToReach ->
+        "In at most ${EmbeddingHealthAnalyzer.lowExposureMax(k)} of the top-$k lists, never-picked first. " +
+            "Up Next built from similarity rarely reaches these; the discovery slot draws from them."
     HealthSection.Everywhere ->
         "Songs in the most top-$k lists. Very high counts crowd out everything else."
     HealthSection.Suspects ->
-        "Embeddings that look wrong. Listen first; tap ↻ to re-embed one if it sounds fine."
+        "Embeddings that may be wrong. Listen first; re-embed if it sounds fine. " +
+            "\"Unusual\" songs are listed last and are usually fine."
     HealthSection.Short ->
         "Under 30 s, so they get fewer clips (silence trimmed, very short audio looped). " +
             "Their matches can be less reliable; listen to check."
@@ -407,40 +376,33 @@ private fun buildRows(
     songsByHash: Map<String, Song>,
 ): List<HealthRow> {
     val space = if (sharper) report.centered else report.raw
-    val other = if (sharper) report.raw else report.centered
-    val otherLabel = if (sharper) "Original" else "Sharper"
     val k = report.k
-    fun counts(hash: String): String {
-        val n = space.occurrence[hash] ?: 0
-        val o = other.occurrence[hash] ?: 0
-        return "in $n lists ($otherLabel: $o)"
+    fun lists(hash: String): String = when (val n = space.occurrence[hash] ?: 0) {
+        0 -> "never picked"
+        1 -> "in 1 list"
+        else -> "in $n lists"
     }
     return when (section) {
-        HealthSection.Never -> space.orphans()
-            .mapNotNull { h -> songsByHash[h]?.let { HealthRow(it, counts(h), canReembed = false) } }
-            .sortedBy { it.song.title.lowercase() }
-        HealthSection.Rare -> space.occurrence.entries
-            .filter { it.value in 1..EmbeddingHealthAnalyzer.lowExposureMax(k) }
-            .sortedBy { it.value }
-            .mapNotNull { (h, _) -> songsByHash[h]?.let { HealthRow(it, counts(h), canReembed = false) } }
+        HealthSection.HardToReach -> space.hardToReach(k)
+            .mapNotNull { h -> songsByHash[h]?.let { HealthRow(it, lists(h)) } }
         HealthSection.Everywhere -> space.mostSurfaced(MOST_SURFACED_LIMIT)
-            .mapNotNull { h -> songsByHash[h]?.let { HealthRow(it, counts(h), canReembed = false) } }
+            .mapNotNull { h -> songsByHash[h]?.let { HealthRow(it, lists(h)) } }
         HealthSection.Suspects -> report.suspects.mapNotNull { s ->
             val song = songsByHash[s.key] ?: return@mapNotNull null
             val detail = when (s.reason) {
                 EmbeddingHealthAnalyzer.SuspectReason.INVALID_VECTOR -> "Embedding is empty or invalid"
-                EmbeddingHealthAnalyzer.SuspectReason.OUTLIER ->
-                    "Unlike anything else: closest match %.2f (typical %.2f)".format(
-                        s.nearestSimilarity, report.medianNearestSimilarity,
-                    )
                 EmbeddingHealthAnalyzer.SuspectReason.NEAR_IDENTICAL_CLUSTER ->
                     "Nearly identical to ${s.nearIdenticalCount} other songs"
+                EmbeddingHealthAnalyzer.SuspectReason.OUTLIER ->
+                    "Unusual (probably fine): closest match %.2f, typical %.2f".format(
+                        s.nearestSimilarity, report.medianNearestSimilarity,
+                    )
             }
-            HealthRow(song, detail, canReembed = true)
+            HealthRow(song, detail)
         }
         HealthSection.Short -> shortTracks(report, songsByHash).map { song ->
             val h = song.contentHash.orEmpty()
-            HealthRow(song, "${formatSeconds(song.durationMs)} • ${counts(h)}", canReembed = false)
+            HealthRow(song, "${formatSeconds(song.durationMs)} • ${lists(h)}")
         }
     }
 }

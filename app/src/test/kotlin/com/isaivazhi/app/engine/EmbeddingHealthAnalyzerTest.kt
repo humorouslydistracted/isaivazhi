@@ -80,6 +80,32 @@ class EmbeddingHealthAnalyzerTest {
     }
 
     @Test
+    fun outliersAreListedAfterOtherSuspects() {
+        val dim = 8
+        val rng = Random(6)
+        val vecs = LinkedHashMap<String, FloatArray>()
+        for (i in 0 until 40) vecs["c$i"] = FloatArray(dim) { 1f + (rng.nextFloat() - 0.5f) * 0.2f }
+        vecs["odd"] = FloatArray(dim) { if (it % 2 == 0) -1f else 1f }
+        for (i in 0 until 3) vecs["dup$i"] = FloatArray(dim) { if (it < 4) 1f else -1f }.also { it[i] += 0.001f }
+        vecs["zero"] = FloatArray(dim)
+        val reasons = EmbeddingHealthAnalyzer().analyze(vecs, k = 5).suspects.map { it.reason }
+        assertTrue(reasons.contains(EmbeddingHealthAnalyzer.SuspectReason.OUTLIER))
+        assertEquals(reasons.sortedBy { it.ordinal }, reasons)
+        assertEquals(EmbeddingHealthAnalyzer.SuspectReason.OUTLIER, reasons.last())
+        assertEquals(EmbeddingHealthAnalyzer.SuspectReason.INVALID_VECTOR, reasons.first())
+    }
+
+    @Test
+    fun hardToReachCombinesNeverAndRarelyPicked() {
+        val space = EmbeddingHealthAnalyzer.SpaceResult(
+            mapOf("a" to 3, "b" to 0, "c" to 7, "d" to 1, "e" to 50, "f" to 0),
+        )
+        val list = space.hardToReach(k = 50)
+        assertEquals(setOf("b", "f"), list.take(2).toSet())
+        assertEquals(listOf("d", "a"), list.drop(2))
+    }
+
+    @Test
     fun nativeBatchDotResultIsUsedWhenAvailable() {
         val vecs = library(30, 8, seed = 5)
         var calls = 0

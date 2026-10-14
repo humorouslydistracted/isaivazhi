@@ -18,14 +18,14 @@ import kotlin.math.abs
  * today) and centred space ("Sharper similarity"), so the effect of that
  * setting is visible before turning it on.
  *
- * Suspects are songs whose vector looks wrong rather than just unusual:
+ * Suspects are songs whose vector may be wrong:
  *  - invalid: zero / NaN vector.
- *  - outlier: its closest neighbour is far less similar than is typical for
- *    this library (median − 4·MAD of nearest-neighbour similarity). Often a
- *    bad decode, a silent intro, or a spoken-word track.
  *  - near-identical cluster: ≥ [NEAR_DUP_MIN_OTHERS] other songs at
  *    cosine ≥ [NEAR_DUP_SIM]. Different songs should never be that close;
  *    a cluster usually means the audio failed to decode the same way.
+ *  - outlier: its closest neighbour is far less similar than is typical for
+ *    this library (median − 4·MAD of nearest-neighbour similarity). Usually
+ *    just an unusual song; sometimes a bad decode or a silent intro.
  */
 class EmbeddingHealthAnalyzer(
     /** Same contract as NativeAccelerator.dotProductBatch; return false to use the Kotlin loop. */
@@ -41,7 +41,8 @@ class EmbeddingHealthAnalyzer(
         fun hubMin(k: Int) = k * 5
     }
 
-    enum class SuspectReason { INVALID_VECTOR, OUTLIER, NEAR_IDENTICAL_CLUSTER }
+    /** Declaration order is the display order: outliers are often just unusual songs, so they come last. */
+    enum class SuspectReason { INVALID_VECTOR, NEAR_IDENTICAL_CLUSTER, OUTLIER }
 
     data class Suspect(
         val key: String,
@@ -57,6 +58,9 @@ class EmbeddingHealthAnalyzer(
         fun orphans(): List<String> = occurrence.filterValues { it == 0 }.keys.toList()
         fun lowExposure(k: Int): Set<String> =
             occurrence.filterValues { it <= lowExposureMax(k) }.keys
+        /** Orphans and low-exposure songs together, fewest lists first. */
+        fun hardToReach(k: Int): List<String> =
+            occurrence.entries.filter { it.value <= lowExposureMax(k) }.sortedBy { it.value }.map { it.key }
         fun hubs(k: Int): List<String> = occurrence.filterValues { it >= hubMin(k) }.keys.toList()
         fun mostSurfaced(limit: Int): List<String> =
             occurrence.entries.sortedByDescending { it.value }.take(limit).map { it.key }
