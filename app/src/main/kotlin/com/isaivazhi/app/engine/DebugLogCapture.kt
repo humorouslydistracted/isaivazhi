@@ -36,14 +36,21 @@ object DebugLogCapture {
      * log file before delegating to the previous handler (which lets
      * Android show the system "App stopped" dialog as usual).
      */
+    @Volatile private var handlerInstalled = false
+
+    /** Installed once per process (main and :ai), from Application.onCreate. */
+    @Synchronized
     fun installCrashHandler(ctx: Context) {
+        if (handlerInstalled) return
+        handlerInstalled = true
+        val process = currentProcessName(ctx)
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
                 val sw = StringWriter()
                 val pw = PrintWriter(sw)
                 val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-                pw.println("=== CRASH @ $ts (thread: ${thread.name}) ===")
+                pw.println("=== CRASH @ $ts (process: $process, thread: ${thread.name}) ===")
                 throwable.printStackTrace(pw)
                 pw.println()
                 appendToFile(ctx, sw.toString())
@@ -70,12 +77,84 @@ object DebugLogCapture {
         }
     }
 
-    /** Read the persisted crash log file. */
+    /** Persisted crash traces followed by Android's record of recent app exits. */
     fun readCrashLog(ctx: Context): String {
         val f = File(ctx.filesDir, CRASH_FILE)
-        return if (f.exists() && f.length() > 0) f.readText()
+        val traces = if (f.exists() && f.length() > 0) f.readText()
         else "No crash traces recorded.\n\nIf the app crashed previously and this is empty, the crash handler wasn't installed yet — close and reopen the app, then reproduce."
+        val exits = readRecentExits(ctx)
+        return if (exits.isBlank()) traces else "$traces\n\n$exits"
     }
+
+    /**
+     * Android keeps why each of the app's processes died (crash, native
+     * crash, ANR, killed for memory, background limits, user swipe…),
+     * including crashes in the :ai embedding process that our own handler
+     * may have missed. Available on Android 11+.
+     */
+    private fun readRecentExits(ctx: Context): String {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return ""
+        return try {
+            val am = ctx.getSystemService(android.app.ActivityManager::class.java) ?: return ""
+            val exits = am.getHistoricalProcessExitReasons(ctx.packageName, 0, MAX_EXITS)
+            if (exits.isEmpty()) return ""
+            val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+            buildString {
+                appendLine("=== Recent app exits (from Android, newest first) ===")
+                for (e in exits) {
+                    append(fmt.format(Date(e.timestamp)))
+                    append("  ").append(e.processName)
+                    append("  ").append(exitReasonName(e.reason))
+                    if (e.status != 0) append(" (status ${e.status})")
+                    append("  pss=").append(e.pss / 1024).append("MB rss=").append(e.rss / 1024).append("MB")
+                    e.description?.takeIf { it.isNotBlank() }?.let { append("\n    ").append(it) }
+                    appendLine()
+                    if (e.reason == android.app.ApplicationExitInfo.REASON_ANR ||
+                        e.reason == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE
+                    ) {
+                        val trace = runCatching {
+                            e.traceInputStream?.bufferedReader()?.use { r ->
+                                r.lineSequence().take(TRACE_LINES).joinToString("\n")
+                            }
+                        }.getOrNull()
+                        if (!trace.isNullOrBlank()) appendLine(trace.prependIndent("    "))
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            "Recent app exits unavailable: ${t.message}"
+        }
+    }
+
+    private fun exitReasonName(reason: Int): String = when (reason) {
+        android.app.ApplicationExitInfo.REASON_ANR -> "ANR (not responding)"
+        android.app.ApplicationExitInfo.REASON_CRASH -> "CRASH"
+        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "NATIVE CRASH"
+        android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "dependency died"
+        android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "excessive resource use"
+        android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "exited itself"
+        android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "init failure"
+        android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "killed: low memory"
+        android.app.ApplicationExitInfo.REASON_OTHER -> "other"
+        android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "permission change"
+        android.app.ApplicationExitInfo.REASON_SIGNALED -> "signaled"
+        android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "user/system stop"
+        android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "user stopped"
+        android.app.ApplicationExitInfo.REASON_FREEZER -> "freezer"
+        android.app.ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE -> "package state change"
+        android.app.ApplicationExitInfo.REASON_PACKAGE_UPDATED -> "app updated"
+        else -> "reason $reason"
+    }
+
+    private fun currentProcessName(ctx: Context): String =
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            android.app.Application.getProcessName()
+        } else {
+            ctx.packageName
+        }
+
+    private const val MAX_EXITS = 15
+    private const val TRACE_LINES = 40
 
     /** Clear the persisted crash log file. */
     fun clearCrashLog(ctx: Context) {

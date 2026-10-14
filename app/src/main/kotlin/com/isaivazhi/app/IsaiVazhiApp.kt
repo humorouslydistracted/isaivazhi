@@ -21,6 +21,7 @@ class IsaiVazhiApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        com.isaivazhi.app.engine.DebugLogCapture.installCrashHandler(this)
         container = AppContainer(this)
         if (!isDefaultProcess()) {
             android.util.Log.i(
