@@ -69,6 +69,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -147,7 +149,6 @@ private enum class Tab(val title: String) {
 
 private sealed class Overlay {
     data object None : Overlay()
-    data object FullPlayer : Overlay()
     data object Search : Overlay()
     data object Settings : Overlay()
     data object Favorites : Overlay()
@@ -591,6 +592,9 @@ private fun AppRoot(container: AppContainer) {
         libraryEmbedSplitCount = container.preferences.getLastEmbedSplitCount()
     }
     var overlay by remember { mutableStateOf<Overlay>(Overlay.None) }
+    // Separate from [overlay] so the full player opens on top of whichever
+    // screen the mini player was tapped on, and closing it returns there.
+    var fullPlayerOpen by remember { mutableStateOf(false) }
     var libraryMenuOpen by remember { mutableStateOf(false) }
     var menuSong by remember { mutableStateOf<Song?>(null) }
     var menuCloseOverlayOnAlbumNav by remember { mutableStateOf(false) }
@@ -2257,6 +2261,89 @@ private fun AppRoot(container: AppContainer) {
         }
     }
 
+    val miniPlayer: @Composable () -> Unit = {
+        MiniPlayer(
+            state = playbackState,
+            positionMs = livePositionMs,
+            durationMs = liveDurationMs,
+            controllerReady = controllerReady || playbackState.currentMediaId != null,
+            currentSongFilePath = currentSongFilePath,
+            isFavorite = isCurrentFavorite,
+            isDisliked = isCurrentDisliked,
+            aiMode = effectiveRecMode,
+            hasEmbeddingsInLibrary = hasEmbeddingsInLibrary,
+            hasEmbedding = com.isaivazhi.app.ui.songHasEmbedding(
+                filePath = currentSongFilePath,
+                embeddingsRowCount = embeddingsRowCount,
+                embeddedFilepaths = embeddedFilepaths,
+            ),
+            onToggleFavorite = {
+                playbackState.currentMediaId?.let { fn ->
+                    val wasFav = fn in favoritesSet
+                    val wasDis = fn in dislikedSet
+                    container.favorites.toggle(fn)
+                    if (!wasFav && wasDis) container.disliked.remove(fn)
+                    container.toaster.show(
+                        when {
+                            wasFav -> "Removed from favorites"
+                            wasDis -> "Added to favorites (removed dislike)"
+                            else -> "Added to favorites"
+                        }
+                    )
+                }
+            },
+            onToggleDislike = {
+                playbackState.currentMediaId?.let { fn ->
+                    val wasFav = fn in favoritesSet
+                    val nowDisliked = container.disliked.toggle(fn)
+                    if (nowDisliked && wasFav) container.favorites.remove(fn)
+                    container.toaster.show(
+                        when {
+                            !nowDisliked -> "Removed dislike"
+                            wasFav -> "Disliked (removed favorite)"
+                            else -> "Disliked"
+                        }
+                    )
+                }
+            },
+            onExpand = { fullPlayerOpen = true },
+            onTogglePause = { container.playback.togglePause() },
+            onSkipPrev = { container.playback.skipPrev() },
+            onSkipNext = { container.playback.skipNext(neutral = true) },
+            onCycleRepeat = { container.playback.cycleRepeat() },
+            onToggleShuffle = { container.playback.toggleShuffle() },
+            onSeek = { container.playback.seekTo(it) },
+            onRefresh = refreshUpcomingWithAI,
+            refreshEnabled = playbackState.currentMediaId != null && startupRefreshReady,
+            refreshInProgress = refreshInProgress ||
+                (playbackState.currentMediaId != null && !startupRefreshReady),
+            similarSongs = similarToCurrent,
+            similarLoading = similarLoading,
+            similarFrozen = similarFrozen,
+            similarSeedTitle = similarSeedTitle,
+            queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
+            onSimilarTap = { song -> playFromTap(song) },
+            onSimilarPlayNext = { song ->
+                container.playback.playNext(song)
+                container.toaster.show("Playing next")
+            },
+            onSimilarLongPress = { song ->
+                menuPlaylistContext = null
+                menuSongsTabIndex = null
+                menuSong = song
+            },
+            onQueueAllSimilar = queueAllSimilarAfterCurrent,
+            onToggleSimilarFrozen = {
+                if (similarFrozen) {
+                    similarFrozen = false
+                } else {
+                    similarFrozen = true
+                    similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
+                }
+            },
+        )
+    }
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         topBar = {
@@ -2335,86 +2422,7 @@ private fun AppRoot(container: AppContainer) {
                 // topBar already handles the status bar; the bottom bar
                 // only needs the navigation-bar inset.
                 Column(modifier = Modifier.navigationBarsPadding()) {
-                    MiniPlayer(
-                        state = playbackState,
-                        positionMs = livePositionMs,
-                        durationMs = liveDurationMs,
-                        controllerReady = controllerReady || playbackState.currentMediaId != null,
-                        currentSongFilePath = currentSongFilePath,
-                        isFavorite = isCurrentFavorite,
-                        isDisliked = isCurrentDisliked,
-                        aiMode = effectiveRecMode,
-                        hasEmbeddingsInLibrary = hasEmbeddingsInLibrary,
-                        hasEmbedding = com.isaivazhi.app.ui.songHasEmbedding(
-                            filePath = currentSongFilePath,
-                            embeddingsRowCount = embeddingsRowCount,
-                            embeddedFilepaths = embeddedFilepaths,
-                        ),
-                        onToggleFavorite = {
-                            playbackState.currentMediaId?.let { fn ->
-                                val wasFav = fn in favoritesSet
-                                val wasDis = fn in dislikedSet
-                                container.favorites.toggle(fn)
-                                if (!wasFav && wasDis) container.disliked.remove(fn)
-                                container.toaster.show(
-                                    when {
-                                        wasFav -> "Removed from favorites"
-                                        wasDis -> "Added to favorites (removed dislike)"
-                                        else -> "Added to favorites"
-                                    }
-                                )
-                            }
-                        },
-                        onToggleDislike = {
-                            playbackState.currentMediaId?.let { fn ->
-                                val wasFav = fn in favoritesSet
-                                val nowDisliked = container.disliked.toggle(fn)
-                                if (nowDisliked && wasFav) container.favorites.remove(fn)
-                                container.toaster.show(
-                                    when {
-                                        !nowDisliked -> "Removed dislike"
-                                        wasFav -> "Disliked (removed favorite)"
-                                        else -> "Disliked"
-                                    }
-                                )
-                            }
-                        },
-                        onExpand = { overlay = Overlay.FullPlayer },
-                        onTogglePause = { container.playback.togglePause() },
-                        onSkipPrev = { container.playback.skipPrev() },
-                        onSkipNext = { container.playback.skipNext(neutral = true) },
-                        onCycleRepeat = { container.playback.cycleRepeat() },
-                        onToggleShuffle = { container.playback.toggleShuffle() },
-                        onSeek = { container.playback.seekTo(it) },
-                        onRefresh = refreshUpcomingWithAI,
-                        refreshEnabled = playbackState.currentMediaId != null && startupRefreshReady,
-                        refreshInProgress = refreshInProgress ||
-                            (playbackState.currentMediaId != null && !startupRefreshReady),
-                        similarSongs = similarToCurrent,
-                        similarLoading = similarLoading,
-                        similarFrozen = similarFrozen,
-                        similarSeedTitle = similarSeedTitle,
-                        queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
-                        onSimilarTap = { song -> playFromTap(song) },
-                        onSimilarPlayNext = { song ->
-                            container.playback.playNext(song)
-                            container.toaster.show("Playing next")
-                        },
-                        onSimilarLongPress = { song ->
-                            menuPlaylistContext = null
-                            menuSongsTabIndex = null
-                            menuSong = song
-                        },
-                        onQueueAllSimilar = queueAllSimilarAfterCurrent,
-                        onToggleSimilarFrozen = {
-                            if (similarFrozen) {
-                                similarFrozen = false
-                            } else {
-                                similarFrozen = true
-                                similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
-                            }
-                        },
-                    )
+                    miniPlayer()
                     NavigationBar {
                         Tab.entries.forEachIndexed { idx, tab ->
                             NavigationBarItem(
@@ -2802,86 +2810,16 @@ private fun AppRoot(container: AppContainer) {
     }
 
     // ===== Overlays =====
-    AnimatedVisibility(
-        visible = overlay is Overlay.FullPlayer,
-        enter = slideInVertically(initialOffsetY = { it }),
-        exit = slideOutVertically(targetOffsetY = { it }),
-    ) {
-        NowPlayingScreen(
-            state = playbackState,
-            positionMs = livePositionMs,
-            durationMs = liveDurationMs,
-            currentSongFilePath = currentSongFilePath,
-            isFavorite = isCurrentFavorite,
-            isDisliked = isCurrentDisliked,
-            onClose = { overlay = Overlay.None },
-            onToggleFavorite = {
-                playbackState.currentMediaId?.let { fn ->
-                    val wasFav = fn in favoritesSet
-                    val wasDis = fn in dislikedSet
-                    container.favorites.toggle(fn)
-                    if (!wasFav && wasDis) container.disliked.remove(fn)
-                    container.toaster.show(
-                        when {
-                            wasFav -> "Removed from favorites"
-                            wasDis -> "Added to favorites (removed dislike)"
-                            else -> "Added to favorites"
-                        }
-                    )
-                }
-            },
-            onToggleDislike = {
-                playbackState.currentMediaId?.let { fn ->
-                    val wasFav = fn in favoritesSet
-                    val nowDisliked = container.disliked.toggle(fn)
-                    if (nowDisliked && wasFav) container.favorites.remove(fn)
-                    container.toaster.show(
-                        when {
-                            !nowDisliked -> "Removed dislike"
-                            wasFav -> "Disliked (removed favorite)"
-                            else -> "Disliked"
-                        }
-                    )
-                }
-            },
-            onToggleShuffle = { container.playback.toggleShuffle() },
-            onCycleRepeat = { container.playback.cycleRepeat() },
-            onTogglePause = { container.playback.togglePause() },
-            onSkipPrev = { container.playback.skipPrev() },
-            onSkipNext = { container.playback.skipNext(neutral = true) },
-            onSeek = { container.playback.seekTo(it) },
-            onRefresh = refreshUpcomingWithAI,
-            refreshEnabled = playbackState.currentMediaId != null && startupRefreshReady,
-            refreshInProgress = refreshInProgress ||
-                (playbackState.currentMediaId != null && !startupRefreshReady),
-            similarSongs = similarToCurrent,
-            similarLoading = similarLoading,
-            similarFrozen = similarFrozen,
-            similarSeedTitle = similarSeedTitle,
-            queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
-            onSimilarTap = { song -> playFromTap(song) },
-            onSimilarPlayNext = { song ->
-                container.playback.playNext(song)
-                container.toaster.show("Playing next")
-            },
-            onSimilarLongPress = { song ->
-                menuPlaylistContext = null
-                menuSongsTabIndex = null
-                menuSong = song
-            },
-            onQueueAllSimilar = queueAllSimilarAfterCurrent,
-            onToggleSimilarFrozen = {
-                if (similarFrozen) {
-                    similarFrozen = false
-                } else {
-                    similarFrozen = true
-                    similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
-                }
-            },
-        )
+    // Every overlay except the full player keeps the mini player visible
+    // below it (drawn after the overlays), so they are padded by its height.
+    var overlayMiniPlayerHeightPx by remember { mutableStateOf(0) }
+    val overlayMiniPlayerPad = if (overlay !is Overlay.None && playbackState.currentMediaId != null) {
+        with(LocalDensity.current) { overlayMiniPlayerHeightPx.toDp() }
+    } else {
+        0.dp
     }
-
     AnimatedVisibility(visible = overlay is Overlay.Search,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { -it }),
         exit = slideOutVertically(targetOffsetY = { -it })) {
         SearchOverlay(
@@ -2917,6 +2855,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.Settings,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         SettingsScreen(
@@ -3010,6 +2949,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.Folders,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         FoldersScreen(
@@ -3042,6 +2982,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.Favorites,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         FavoritesScreen(
@@ -3062,6 +3003,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.Playlists,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         PlaylistsScreen(
@@ -3081,6 +3023,7 @@ private fun AppRoot(container: AppContainer) {
     val currentDetailId = (overlay as? Overlay.PlaylistDetail)?.playlistId
     val currentDetailPlaylist = currentDetailId?.let { id -> playlistsList.firstOrNull { it.id == id } }
     AnimatedVisibility(visible = currentDetailPlaylist != null,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         if (currentDetailPlaylist != null) {
@@ -3103,6 +3046,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.History,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         HistoryScreen(
@@ -3114,6 +3058,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.Taste,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         TasteScreen(
@@ -3267,6 +3212,7 @@ private fun AppRoot(container: AppContainer) {
     }
 
     AnimatedVisibility(visible = overlay is Overlay.Ai,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         AiManagementScreen(
@@ -3447,6 +3393,7 @@ private fun AppRoot(container: AppContainer) {
 
     val logsOverlay = overlay as? Overlay.Logs
     AnimatedVisibility(visible = logsOverlay != null,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         if (logsOverlay != null) {
@@ -3474,9 +3421,6 @@ private fun AppRoot(container: AppContainer) {
                         songsByHash = songsByHash,
                         sharperSimilarityOn = sharperSimilarityOn,
                         currentMediaId = playbackState.currentMediaId,
-                        nowPlayingTitle = playbackState.title,
-                        nowPlayingArtist = playbackState.artist,
-                        isPlaying = playbackState.isPlaying,
                         onAnalyze = { container.embeddingHealth.analyze(songs) },
                         onPlay = { list, idx ->
                             playFromSection(
@@ -3486,15 +3430,16 @@ private fun AppRoot(container: AppContainer) {
                             )
                         },
                         onLongPress = { menuPlaylistContext = null; menuSongsTabIndex = null; menuSong = it },
-                        onReembed = { song ->
-                            container.embedding.embedSongs(listOf(song))
+                        onReembed = { list ->
+                            container.embedding.embedSongs(list)
                             container.toaster.show(
-                                "Re-embedding \"${song.title.ifBlank { song.filename }}\" — re-analyze when it finishes",
+                                if (list.size == 1) {
+                                    "Re-embedding \"${list[0].title.ifBlank { list[0].filename }}\" — re-analyze when it finishes"
+                                } else {
+                                    "Re-embedding ${list.size} songs — re-analyze when it finishes"
+                                },
                             )
                         },
-                        onTogglePause = { container.playback.togglePause() },
-                        onSkipPrev = { container.playback.skipPrev() },
-                        onSkipNext = { container.playback.skipNext(neutral = true) },
                     )
                 },
             )
@@ -3503,6 +3448,7 @@ private fun AppRoot(container: AppContainer) {
 
     val viewAllCat = (overlay as? Overlay.ViewAll)?.category
     AnimatedVisibility(visible = viewAllCat != null,
+        modifier = Modifier.padding(bottom = overlayMiniPlayerPad),
         enter = slideInVertically(initialOffsetY = { it }),
         exit = slideOutVertically(targetOffsetY = { it })) {
         if (viewAllCat != null) {
@@ -3575,6 +3521,98 @@ private fun AppRoot(container: AppContainer) {
                 } else null,
             )
         }
+    }
+
+    if (overlay !is Overlay.None && playbackState.currentMediaId != null) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onSizeChanged { overlayMiniPlayerHeightPx = it.height },
+            ) {
+                Column(modifier = Modifier.navigationBarsPadding()) { miniPlayer() }
+            }
+        }
+    }
+
+    AnimatedVisibility(
+        visible = fullPlayerOpen,
+        enter = slideInVertically(initialOffsetY = { it }),
+        exit = slideOutVertically(targetOffsetY = { it }),
+    ) {
+        BackHandler { fullPlayerOpen = false }
+        NowPlayingScreen(
+            state = playbackState,
+            positionMs = livePositionMs,
+            durationMs = liveDurationMs,
+            currentSongFilePath = currentSongFilePath,
+            isFavorite = isCurrentFavorite,
+            isDisliked = isCurrentDisliked,
+            onClose = { fullPlayerOpen = false },
+            onToggleFavorite = {
+                playbackState.currentMediaId?.let { fn ->
+                    val wasFav = fn in favoritesSet
+                    val wasDis = fn in dislikedSet
+                    container.favorites.toggle(fn)
+                    if (!wasFav && wasDis) container.disliked.remove(fn)
+                    container.toaster.show(
+                        when {
+                            wasFav -> "Removed from favorites"
+                            wasDis -> "Added to favorites (removed dislike)"
+                            else -> "Added to favorites"
+                        }
+                    )
+                }
+            },
+            onToggleDislike = {
+                playbackState.currentMediaId?.let { fn ->
+                    val wasFav = fn in favoritesSet
+                    val nowDisliked = container.disliked.toggle(fn)
+                    if (nowDisliked && wasFav) container.favorites.remove(fn)
+                    container.toaster.show(
+                        when {
+                            !nowDisliked -> "Removed dislike"
+                            wasFav -> "Disliked (removed favorite)"
+                            else -> "Disliked"
+                        }
+                    )
+                }
+            },
+            onToggleShuffle = { container.playback.toggleShuffle() },
+            onCycleRepeat = { container.playback.cycleRepeat() },
+            onTogglePause = { container.playback.togglePause() },
+            onSkipPrev = { container.playback.skipPrev() },
+            onSkipNext = { container.playback.skipNext(neutral = true) },
+            onSeek = { container.playback.seekTo(it) },
+            onRefresh = refreshUpcomingWithAI,
+            refreshEnabled = playbackState.currentMediaId != null && startupRefreshReady,
+            refreshInProgress = refreshInProgress ||
+                (playbackState.currentMediaId != null && !startupRefreshReady),
+            similarSongs = similarToCurrent,
+            similarLoading = similarLoading,
+            similarFrozen = similarFrozen,
+            similarSeedTitle = similarSeedTitle,
+            queueAllSimilarEnabled = similarToCurrent.isNotEmpty() && effectiveRecMode,
+            onSimilarTap = { song -> playFromTap(song) },
+            onSimilarPlayNext = { song ->
+                container.playback.playNext(song)
+                container.toaster.show("Playing next")
+            },
+            onSimilarLongPress = { song ->
+                menuPlaylistContext = null
+                menuSongsTabIndex = null
+                menuSong = song
+            },
+            onQueueAllSimilar = queueAllSimilarAfterCurrent,
+            onToggleSimilarFrozen = {
+                if (similarFrozen) {
+                    similarFrozen = false
+                } else {
+                    similarFrozen = true
+                    similarSeedMediaId = playbackState.currentMediaId ?: similarSeedMediaId
+                }
+            },
+        )
     }
 
     // Phase 4 (2026-06-01): Overlay.SectionViewAll renderer removed alongside
