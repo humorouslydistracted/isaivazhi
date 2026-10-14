@@ -57,6 +57,7 @@ public class EmbeddingForegroundService extends Service {
     // Re-armed at the start of every chunk, so the CPU stays awake for as
     // long as chunks keep running instead of a fixed budget for the batch.
     private static final long CHUNK_WAKELOCK_TIMEOUT_MS = 30 * 60 * 1000L;
+    private static final long WORKER_BUSY_RETRY_MS = 250L;
 
     public static final String ACTION_START = "com.isaivazhi.app.EMBEDDING_START";
     public static final String ACTION_STOP = "com.isaivazhi.app.EMBEDDING_STOP";
@@ -123,6 +124,23 @@ public class EmbeddingForegroundService extends Service {
             return START_NOT_STICKY;
         }
 
+        // Every ACTION_START / ACTION_RESUME arrives via startForegroundService,
+        // so startForeground must be called on every path, or Android kills
+        // this process ~10 s later. If Android refuses (e.g. the 6-hour daily
+        // dataSync limit), keep the queue on disk and stop instead of crashing.
+        if (!embeddingInProgress && !safeStartForeground(buildWarmingUpNotification("Preparing to embed…"))) {
+            if (ACTION_START.equals(action)) {
+                ArrayList<String> paths = intent.getStringArrayListExtra(EXTRA_PATHS);
+                String requestFile = intent.getStringExtra(EXTRA_REQUEST_FILE);
+                if ((paths == null || paths.isEmpty()) && requestFile != null) {
+                    paths = readStartRequest(requestFile);
+                }
+                if (paths != null && !paths.isEmpty()) appendToQueue(paths);
+            }
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         if (ACTION_START.equals(action)) {
             ArrayList<String> paths = intent.getStringArrayListExtra(EXTRA_PATHS);
             String requestFile = intent.getStringExtra(EXTRA_REQUEST_FILE);
@@ -133,7 +151,10 @@ public class EmbeddingForegroundService extends Service {
                     intent.getIntExtra(EXTRA_SPLIT_COUNT, batchSplitCount));
             playbackActiveHint = intent.getBooleanExtra(EXTRA_PLAYBACK_ACTIVE, playbackActiveHint);
             if (paths == null || paths.isEmpty()) {
-                if (!embeddingInProgress) stopSelf();
+                if (!embeddingInProgress) {
+                    stopForeground(true);
+                    stopSelf();
+                }
                 return embeddingInProgress ? START_STICKY : START_NOT_STICKY;
             }
             // Songs added while a run is in flight join the end of its queue.
@@ -166,9 +187,6 @@ public class EmbeddingForegroundService extends Service {
                 return START_STICKY;
             }
             if (!embeddingInProgress && ACTION_RESUME.equals(action)) {
-                // Started via startForegroundService, so startForeground is
-                // mandatory even when there turns out to be nothing to resume.
-                startForeground(NOTIFICATION_ID, buildNotification("Nothing left to embed", 0, 0));
                 clearPersistedBatch();
                 stopForeground(true);
                 stopSelf();
@@ -176,6 +194,10 @@ public class EmbeddingForegroundService extends Service {
             }
         }
 
+        if (!embeddingInProgress) {
+            stopForeground(true);
+            stopSelf();
+        }
         return START_NOT_STICKY;
     }
 
@@ -250,6 +272,12 @@ public class EmbeddingForegroundService extends Service {
     private void runNextChunk() {
         if (stopRequested) {
             finishRun();
+            return;
+        }
+        // A run stopped by onTimeout leaves its worker finishing the current
+        // song; starting another worker beside it would run two batches at once.
+        if (embeddingService.isWorkerRunning()) {
+            mainHandler.postDelayed(this::runNextChunk, WORKER_BUSY_RETRY_MS);
             return;
         }
         ArrayList<String> queue = loadPersistedBatch();
@@ -397,12 +425,23 @@ public class EmbeddingForegroundService extends Service {
         }
     }
 
-    private void beginForeground(int total, String text) {
-        if (wakeLock != null && !wakeLock.isHeld()) {
-            wakeLock.acquire(4 * 60 * 60 * 1000L);
-            Log.i(TAG, "WakeLock acquired (4 h budget)");
+    /** startForeground that reports instead of crashing the :ai process when Android refuses. */
+    private boolean safeStartForeground(Notification notification) {
+        try {
+            startForeground(NOTIFICATION_ID, notification);
+            return true;
+        } catch (Throwable t) {
+            String detail = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+            Log.w(TAG, "startForeground refused: " + detail, t);
+            String message = detail.contains("Time limit")
+                    ? "Android's daily background limit for embedding was reached. Keep the app open and tap Embed to continue."
+                    : "Android did not allow embedding to start (" + detail + "). Open the app and tap Embed again.";
+            Bundle data = new Bundle();
+            data.putString(EmbeddingCommandContract.KEY_ERROR, message);
+            data.putInt(EmbeddingCommandContract.KEY_FAILED, failedCount);
+            broadcastMessage(EmbeddingCommandContract.MSG_ERROR, data);
+            return false;
         }
-        startForeground(NOTIFICATION_ID, buildNotification(text, 0, total));
     }
 
     /**
@@ -418,7 +457,7 @@ public class EmbeddingForegroundService extends Service {
             Log.i(TAG, "WakeLock acquired (4 h budget)");
         }
         totalSteps = total;
-        startForeground(NOTIFICATION_ID, buildWarmingUpNotification(total));
+        safeStartForeground(buildWarmingUpNotification(total));
     }
 
     /**

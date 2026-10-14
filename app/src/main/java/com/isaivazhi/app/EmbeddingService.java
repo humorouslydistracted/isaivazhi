@@ -91,6 +91,7 @@ public class EmbeddingService {
     private int currentOrtThreads = 0;
     private boolean isInitialized = false;
     private volatile boolean cancelled = false;
+    private volatile boolean workerRunning = false;
 
     // Backend tracking — set during ensureOrtSessionForCurrentPolicy().
     // One of: "nnapi+fp16", "nnapi", "cpu", "cpu_fallback".
@@ -472,131 +473,143 @@ public class EmbeddingService {
         Log.i(TAG, "Embedding cancellation requested");
     }
 
+    public boolean isWorkerRunning() {
+        return workerRunning;
+    }
+
     public void embedSongs(List<String> filePaths, EmbeddingCallback callback) {
         cancelled = false;
+        workerRunning = true;
         new Thread(() -> {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
-
-            if (!initialize()) {
-                callback.onError("Failed to initialize ONNX Runtime: " + lastError, null);
-                return;
+            int[] totals = null;
+            try {
+                totals = runBatch(filePaths, callback);
+            } catch (Throwable t) {
+                // Never let one batch take down the :ai process; the service
+                // drops this chunk and carries on with the queue.
+                Log.e(TAG, "Embedding worker failed", t);
+                totals = new int[] {0, filePaths.size()};
+            } finally {
+                workerRunning = false;
             }
-
-            // One song at a time: decode -> infer -> persist -> next. Each result
-            // is written to its own small spool file so the cost of saving a song
-            // never grows with the size of the batch, and nothing is held in memory
-            // or lost if the process dies mid-batch.
-            int processed = 0;
-            int failed = 0;
-
-            for (int i = 0; i < filePaths.size(); i++) {
-                if (cancelled) {
-                    Log.i(TAG, "Embedding cancelled at " + (i) + "/" + filePaths.size());
-                    callback.onComplete(processed, failed);
-                    return;
-                }
-
-                String path = filePaths.get(i);
-                String filename = new File(path).getName();
-
-                callback.onProgress(filename, path, i + 1, filePaths.size());
-
-                try {
-                    if (!yieldForPolicy("decode:" + filename)) {
-                        callback.onComplete(processed, failed);
-                        return;
-                    }
-                    // Window-aware decode: first 30 s for the content hash plus
-                    // short `seekTo` ranges for the inference windows, so peak
-                    // memory stays small regardless of song length.
-                    DecodeResult dec = decodeAudioWindowAware(path);
-                    if (dec == null || dec.windows == null || dec.windows.isEmpty()) {
-                        Log.w(TAG, "Decode failed, retrying after GC: " + filename);
-                        System.gc();
-                        if (!sleepResponsive(1000)) {
-                            callback.onComplete(processed, failed);
-                            return;
-                        }
-                        dec = decodeAudioWindowAware(path);
-                    }
-                    if (dec == null || dec.windows == null || dec.windows.isEmpty()) {
-                        Log.w(TAG, "Decode failed on retry: " + filename);
-                        callback.onError("Decode failed: " + filename, path);
-                        failed++;
-                        continue;
-                    }
-
-                    // Content hash from the first-30s chunk (matches the
-                    // Python embedder's identity hash for rename-proof
-                    // matching across machines).
-                    String contentHash = computeContentHash(dec.first30s);
-                    List<float[]> windows = dec.windows;
-
-                    List<float[]> windowEmbeddings;
-                    boolean inferenceSetupFailed = false;
-                    if (!yieldForPolicy("inference:" + filename)) {
-                        callback.onComplete(processed, failed);
-                        return;
-                    }
-                    if (!ensureOrtSessionForCurrentPolicy()) {
-                        callback.onError("Failed to prepare ONNX Runtime: " + lastError, path);
-                        failed++;
-                        inferenceSetupFailed = true;
-                        windowEmbeddings = Collections.emptyList();
-                    } else {
-                        windowEmbeddings = runInferenceBatch(windows);
-                    }
-                    for (int w = 0; w < windows.size(); w++) windows.set(w, null);
-                    windows = null;
-                    if (!yieldForPolicy("inference_complete:" + filename)) {
-                        callback.onComplete(processed, failed);
-                        return;
-                    }
-
-                    if (inferenceSetupFailed) {
-                        continue;
-                    }
-
-                    if (windowEmbeddings.isEmpty()) {
-                        Log.w(TAG, "No embeddings produced for: " + filename);
-                        callback.onError("Inference failed: " + filename, path);
-                        failed++;
-                        continue;
-                    }
-
-                    float[] avgEmbedding = averageEmbeddings(windowEmbeddings);
-                    windowEmbeddings = null;
-                    l2Normalize(avgEmbedding);
-
-                    if (!saveEmbedding(filename, path, avgEmbedding, contentHash)) {
-                        callback.onError("Save failed: " + filename, path);
-                        failed++;
-                        continue;
-                    }
-                    callback.onSongComplete(filename, path, contentHash);
-                    processed++;
-
-                    Log.i(TAG, "Embedded: " + filename + " (" + (i + 1) + "/" + filePaths.size() + ")");
-
-                } catch (Exception e) {
-                    Log.e(TAG, "Error embedding " + filename, e);
-                    callback.onError("Song failed: " + filename + " — " + e.getClass().getSimpleName() + ": " + e.getMessage(), path);
-                    failed++;
-                }
-
-                // Avoid periodic explicit GC; it is a stop-the-world pause.
-                // The retry-time GC above remains only for actual decode pressure.
-                if (!yieldForPolicy("song_complete:" + filename)) {
-                    callback.onComplete(processed, failed);
-                    return;
-                }
-            }
-
-            callback.onComplete(processed, failed);
-
-            Log.i(TAG, "Embedding complete: " + processed + " processed, " + failed + " failed");
-
+            if (totals != null) callback.onComplete(totals[0], totals[1]);
         }, "EmbeddingWorker").start();
+    }
+
+    /** Returns {processed, failed}, or null after reporting a batch-level init error. */
+    private int[] runBatch(List<String> filePaths, EmbeddingCallback callback) {
+        if (!initialize()) {
+            callback.onError("Failed to initialize ONNX Runtime: " + lastError, null);
+            return null;
+        }
+
+        // One song at a time: decode -> infer -> persist -> next. Each result
+        // is written to its own small spool file so the cost of saving a song
+        // never grows with the size of the batch, and nothing is held in memory
+        // or lost if the process dies mid-batch.
+        int processed = 0;
+        int failed = 0;
+
+        for (int i = 0; i < filePaths.size(); i++) {
+            if (cancelled) {
+                Log.i(TAG, "Embedding cancelled at " + (i) + "/" + filePaths.size());
+                return new int[] {processed, failed};
+            }
+
+            String path = filePaths.get(i);
+            String filename = new File(path).getName();
+
+            callback.onProgress(filename, path, i + 1, filePaths.size());
+
+            try {
+                if (!yieldForPolicy("decode:" + filename)) {
+                    return new int[] {processed, failed};
+                }
+                // Window-aware decode: first 30 s for the content hash plus
+                // short `seekTo` ranges for the inference windows, so peak
+                // memory stays small regardless of song length.
+                DecodeResult dec = decodeAudioWindowAware(path);
+                if (dec == null || dec.windows == null || dec.windows.isEmpty()) {
+                    Log.w(TAG, "Decode failed, retrying after GC: " + filename);
+                    System.gc();
+                    if (!sleepResponsive(1000)) {
+                        return new int[] {processed, failed};
+                    }
+                    dec = decodeAudioWindowAware(path);
+                }
+                if (dec == null || dec.windows == null || dec.windows.isEmpty()) {
+                    Log.w(TAG, "Decode failed on retry: " + filename);
+                    callback.onError("Decode failed: " + filename, path);
+                    failed++;
+                    continue;
+                }
+
+                // Content hash from the first-30s chunk (matches the
+                // Python embedder's identity hash for rename-proof
+                // matching across machines).
+                String contentHash = computeContentHash(dec.first30s);
+                List<float[]> windows = dec.windows;
+
+                List<float[]> windowEmbeddings;
+                boolean inferenceSetupFailed = false;
+                if (!yieldForPolicy("inference:" + filename)) {
+                    return new int[] {processed, failed};
+                }
+                if (!ensureOrtSessionForCurrentPolicy()) {
+                    callback.onError("Failed to prepare ONNX Runtime: " + lastError, path);
+                    failed++;
+                    inferenceSetupFailed = true;
+                    windowEmbeddings = Collections.emptyList();
+                } else {
+                    windowEmbeddings = runInferenceBatch(windows);
+                }
+                for (int w = 0; w < windows.size(); w++) windows.set(w, null);
+                windows = null;
+                if (!yieldForPolicy("inference_complete:" + filename)) {
+                    return new int[] {processed, failed};
+                }
+
+                if (inferenceSetupFailed) {
+                    continue;
+                }
+
+                if (windowEmbeddings.isEmpty()) {
+                    Log.w(TAG, "No embeddings produced for: " + filename);
+                    callback.onError("Inference failed: " + filename, path);
+                    failed++;
+                    continue;
+                }
+
+                float[] avgEmbedding = averageEmbeddings(windowEmbeddings);
+                windowEmbeddings = null;
+                l2Normalize(avgEmbedding);
+
+                if (!saveEmbedding(filename, path, avgEmbedding, contentHash)) {
+                    callback.onError("Save failed: " + filename, path);
+                    failed++;
+                    continue;
+                }
+                callback.onSongComplete(filename, path, contentHash);
+                processed++;
+
+                Log.i(TAG, "Embedded: " + filename + " (" + (i + 1) + "/" + filePaths.size() + ")");
+
+            } catch (Exception | OutOfMemoryError e) {
+                Log.e(TAG, "Error embedding " + filename, e);
+                callback.onError("Song failed: " + filename + " — " + e.getClass().getSimpleName() + ": " + e.getMessage(), path);
+                failed++;
+            }
+
+            // Avoid periodic explicit GC; it is a stop-the-world pause.
+            // The retry-time GC above remains only for actual decode pressure.
+            if (!yieldForPolicy("song_complete:" + filename)) {
+                return new int[] {processed, failed};
+            }
+        }
+
+        Log.i(TAG, "Embedding complete: " + processed + " processed, " + failed + " failed");
+        return new int[] {processed, failed};
     }
 
     private boolean isPlaybackActive() {
