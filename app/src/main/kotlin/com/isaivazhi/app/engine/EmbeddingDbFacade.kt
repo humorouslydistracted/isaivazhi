@@ -424,6 +424,46 @@ class EmbeddingDbFacade(appContext: Context) {
         val similarity: Float,
     )
 
+    suspend fun getSplitRows(): List<EmbeddingSplitStats.Row> {
+        val res = awaitJsonObject { cb -> manager.getSplitRows(cb) } ?: return emptyList()
+        val arr = res.optJSONArray("rows") ?: return emptyList()
+        val out = ArrayList<EmbeddingSplitStats.Row>(arr.length())
+        for (i in 0 until arr.length()) {
+            out += splitRowFrom(arr.optJSONObject(i) ?: continue) ?: continue
+        }
+        return out
+    }
+
+    suspend fun getSplitRowForPath(filepath: String): EmbeddingSplitStats.Row? {
+        val res = awaitJsonObject { cb -> manager.getSplitRowForPath(filepath, cb) } ?: return null
+        return splitRowFrom(res.optJSONObject("row") ?: return null)
+    }
+
+    private fun splitRowFrom(o: JSONObject): EmbeddingSplitStats.Row? {
+        val hash = o.optString("contentHash", "")
+        if (hash.isEmpty()) return null
+        return EmbeddingSplitStats.Row(
+            contentHash = hash,
+            filepath = o.optString("filepath", ""),
+            filename = o.optString("filename", ""),
+            timestamp = o.optLong("timestamp", 0L),
+            splitCount = o.optInt("splitCount", 0),
+            clipCount = o.optInt("clipCount", 0),
+            source = EmbeddingSplitStats.Source.from(o.optString("splitSource", "")),
+        )
+    }
+
+    /** Labels rows embedded before tracking; recorded rows are left alone. Returns rows changed. */
+    suspend fun labelSplit(hashes: List<String>, splitCount: Int): Int = suspendCancellableCoroutine { cont ->
+        val arr = org.json.JSONArray()
+        hashes.forEach { arr.put(it) }
+        val cb = EmbeddingDbManager.Callback<Int> { result, error ->
+            if (error != null) cont.resumeWithException(error)
+            else cont.resume(result ?: 0)
+        }
+        manager.labelSplit(arr, splitCount, cb)
+    }
+
     /**
      * Push #61: a group of filepaths whose audio collapses to the same
      * content_hash. T_EMB only stores one row per hash, but T_PATH keeps

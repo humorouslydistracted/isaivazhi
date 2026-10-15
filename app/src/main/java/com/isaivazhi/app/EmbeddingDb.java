@@ -151,6 +151,23 @@ final class EmbeddingDb {
                 + "filepath TEXT PRIMARY KEY NOT NULL, "
                 + "content_hash TEXT NOT NULL"
                 + ")");
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        Cursor c = db.rawQuery("PRAGMA table_info(" + T_EMB + ")", null);
+        try {
+            int nameIdx = c.getColumnIndex("name");
+            while (c.moveToNext()) cols.add(c.getString(nameIdx));
+        } finally {
+            c.close();
+        }
+        if (!cols.contains("split_count")) {
+            db.execSQL("ALTER TABLE " + T_EMB + " ADD COLUMN split_count INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!cols.contains("clip_count")) {
+            db.execSQL("ALTER TABLE " + T_EMB + " ADD COLUMN clip_count INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!cols.contains("split_source")) {
+            db.execSQL("ALTER TABLE " + T_EMB + " ADD COLUMN split_source TEXT NOT NULL DEFAULT ''");
+        }
     }
 
     private void probeVecExtension(SQLiteDatabase db) {
@@ -435,6 +452,116 @@ final class EmbeddingDb {
         return out;
     }
 
+    static final class SplitRow {
+        String contentHash;
+        String filepath;
+        String filename;
+        long timestamp;
+        int splitCount;
+        int clipCount;
+        String splitSource;
+    }
+
+    /** Split bookkeeping for every row, without the vectors. */
+    List<SplitRow> getSplitRows() {
+        SQLiteDatabase db = getReadableDatabase();
+        List<SplitRow> out = new ArrayList<>();
+        Cursor c = db.query(T_EMB,
+                new String[]{"content_hash", "filepath", "filename", "timestamp",
+                        "split_count", "clip_count", "split_source"},
+                null, null, null, null, null);
+        try {
+            while (c.moveToNext()) out.add(readSplitRow(c));
+        } finally {
+            c.close();
+        }
+        return out;
+    }
+
+    /** Split bookkeeping for the row a library path resolves to, or null. */
+    SplitRow getSplitRowForPath(String filepath) {
+        if (filepath == null || filepath.isEmpty()) return null;
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.rawQuery(
+                "SELECT content_hash, filepath, filename, timestamp, split_count, clip_count, split_source"
+                        + " FROM " + T_EMB + " WHERE filepath = ? OR content_hash IN"
+                        + " (SELECT content_hash FROM " + T_PATH + " WHERE filepath = ?) LIMIT 1",
+                new String[]{filepath, filepath});
+        try {
+            return c.moveToFirst() ? readSplitRow(c) : null;
+        } finally {
+            c.close();
+        }
+    }
+
+    private static SplitRow readSplitRow(Cursor c) {
+        SplitRow r = new SplitRow();
+        r.contentHash = c.getString(0);
+        r.filepath = c.getString(1);
+        r.filename = c.getString(2);
+        r.timestamp = c.getLong(3);
+        r.splitCount = c.getInt(4);
+        r.clipCount = c.getInt(5);
+        r.splitSource = c.getString(6);
+        return r;
+    }
+
+    /**
+     * User-supplied split for rows embedded before tracking. Rows whose split
+     * was recorded by the embedder are never overwritten.
+     */
+    int labelSplit(List<String> hashes, int splitCount) {
+        if (hashes == null || hashes.isEmpty()) return 0;
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            ContentValues cv = new ContentValues();
+            cv.put("split_count", splitCount);
+            cv.put("split_source", EmbeddingEntity.SOURCE_LABELLED);
+            int n = 0;
+            String[] args = new String[2];
+            args[1] = EmbeddingEntity.SOURCE_RECORDED;
+            for (String h : hashes) {
+                if (h == null || h.isEmpty()) continue;
+                args[0] = h;
+                n += db.update(T_EMB, cv, "content_hash = ? AND split_source != ?", args);
+            }
+            db.setTransactionSuccessful();
+            return n;
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    /** Applies {@link MovedPathHealer#plan}: drops old index paths and re-points embedding rows. */
+    int applyMoves(List<MovedPathHealer.Move> moves) {
+        if (moves == null || moves.isEmpty()) return 0;
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            for (MovedPathHealer.Move m : moves) {
+                db.delete(T_PATH, "filepath = ? AND content_hash = ?",
+                        new String[]{m.oldPath, m.contentHash});
+                if (m.embeddingRepointed) {
+                    ContentValues cv = new ContentValues();
+                    cv.put("filepath", m.newPath);
+                    cv.put("filename", new File(m.newPath).getName());
+                    db.update(T_EMB, cv, "content_hash = ? AND filepath = ?",
+                            new String[]{m.contentHash, m.oldPath});
+                }
+                ContentValues pv = new ContentValues();
+                pv.put("filepath", m.newPath);
+                pv.put("content_hash", m.contentHash);
+                db.insertWithOnConflict(T_PATH, null, pv, SQLiteDatabase.CONFLICT_REPLACE);
+            }
+            db.setTransactionSuccessful();
+            return moves.size();
+        } finally {
+            db.endTransaction();
+            invalidateFallbackSnapshot();
+        }
+    }
+
     int deleteAllEmbeddings() {
         SQLiteDatabase db = getWritableDatabase();
         int n = db.delete(T_EMB, null, null);
@@ -446,7 +573,8 @@ final class EmbeddingDb {
         SQLiteDatabase db = getReadableDatabase();
         List<EmbeddingEntity> out = new ArrayList<>();
         Cursor c = db.query(T_EMB,
-                new String[]{"content_hash","filepath","filename","artist","album","timestamp","dim","vec"},
+                new String[]{"content_hash","filepath","filename","artist","album","timestamp","dim","vec",
+                        "split_count","clip_count","split_source"},
                 null, null, null, null, null);
         try {
             while (c.moveToNext()) {
@@ -459,6 +587,9 @@ final class EmbeddingDb {
                 e.timestamp = c.getLong(5);
                 e.dim = c.getInt(6);
                 e.vec = c.getBlob(7);
+                e.splitCount = c.getInt(8);
+                e.clipCount = c.getInt(9);
+                e.splitSource = c.getString(10);
                 out.add(e);
             }
         } finally {
@@ -734,8 +865,9 @@ final class EmbeddingDb {
             if (ents != null && !ents.isEmpty()) {
                 embStmt = db.compileStatement(
                         "INSERT OR REPLACE INTO " + T_EMB
-                                + " (content_hash, filepath, filename, artist, album, timestamp, dim, vec)"
-                                + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+                                + " (content_hash, filepath, filename, artist, album, timestamp, dim, vec,"
+                                + " split_count, clip_count, split_source)"
+                                + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
                 for (EmbeddingEntity e : ents) {
                     if (e == null || e.contentHash == null || e.contentHash.isEmpty()) continue;
                     embStmt.bindString(1, e.contentHash);
@@ -746,6 +878,9 @@ final class EmbeddingDb {
                     embStmt.bindLong(6, e.timestamp);
                     embStmt.bindLong(7, e.dim);
                     embStmt.bindBlob(8, e.vec != null ? e.vec : new byte[0]);
+                    embStmt.bindLong(9, e.splitCount);
+                    embStmt.bindLong(10, e.clipCount);
+                    embStmt.bindString(11, e.splitSource != null ? e.splitSource : "");
                     embStmt.executeInsert();
                     embStmt.clearBindings();
                 }
@@ -780,6 +915,9 @@ final class EmbeddingDb {
         cv.put("timestamp", e.timestamp);
         cv.put("dim", e.dim);
         cv.put("vec", e.vec != null ? e.vec : new byte[0]);
+        cv.put("split_count", e.splitCount);
+        cv.put("clip_count", e.clipCount);
+        cv.put("split_source", e.splitSource != null ? e.splitSource : "");
         return cv;
     }
 

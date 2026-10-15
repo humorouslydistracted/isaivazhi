@@ -248,6 +248,7 @@ public final class EmbeddingDbManager {
             ent.timestamp = row.optLong("timestamp", 0L);
             ent.dim = dim;
             ent.vec = floatArrayToBytes(vecArr);
+            readSplitFields(row, ent);
             entities.add(ent);
         }
 
@@ -336,6 +337,7 @@ public final class EmbeddingDbManager {
             ent.timestamp = e.optLong("timestamp", 0L);
             ent.dim = dim;
             ent.vec = sliceVecBytes(raw, i, dim);
+            readSplitFields(e, ent);
             entities.add(ent);
         }
 
@@ -407,6 +409,7 @@ public final class EmbeddingDbManager {
             e.put("artist", r.artist);
             e.put("album", r.album);
             e.put("timestamp", r.timestamp);
+            writeSplitFields(e, r);
             entries.put(e);
             wrote++;
         }
@@ -972,6 +975,12 @@ public final class EmbeddingDbManager {
         ent.album = row.optString("album", "");
         ent.timestamp = row.optLong("timestamp", System.currentTimeMillis());
         ent.dim = dim[0];
+        int spoolSplit = row.optInt("split_count", 0);
+        if (spoolSplit > 0) {
+            ent.splitCount = spoolSplit;
+            ent.clipCount = row.optInt("clip_count", 0);
+            ent.splitSource = EmbeddingEntity.SOURCE_RECORDED;
+        }
         java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(dim[0] * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
         for (int i = 0; i < dim[0]; i++) bb.putFloat((float) vecArr.optDouble(i, 0.0));
         ent.vec = bb.array();
@@ -1180,6 +1189,7 @@ public final class EmbeddingDbManager {
                 row.put("contentHash", r.contentHash);
                 row.put("content_hash", r.contentHash);
                 row.put("timestamp", r.timestamp);
+                writeSplitFields(row, r);
                 root.put(r.contentHash, row);
             }
 
@@ -1313,12 +1323,50 @@ public final class EmbeddingDbManager {
             }
 
             int upserted = db.upsertPaths(toUpsert);
+
+            java.util.Set<String> libraryPaths = new java.util.HashSet<>();
+            for (int i = 0; i < librarySongs.length(); i++) {
+                JSONObject row = librarySongs.optJSONObject(i);
+                String fp = row != null ? row.optString("filepath", "") : "";
+                if (!fp.isEmpty()) libraryPaths.add(fp);
+            }
+            java.util.Map<String, List<String>> indexPathsByHash = new java.util.HashMap<>();
+            for (EmbeddingPathIndexEntity p : db.getAllPaths()) {
+                if (p.filepath == null || p.filepath.isEmpty()
+                        || p.contentHash == null || p.contentHash.isEmpty()) continue;
+                List<String> l = indexPathsByHash.get(p.contentHash);
+                if (l == null) {
+                    l = new ArrayList<>();
+                    indexPathsByHash.put(p.contentHash, l);
+                }
+                l.add(p.filepath);
+            }
+            java.util.Map<String, String> embeddingPathByHash = new java.util.HashMap<>();
+            for (EmbeddingEntity e : allEmb) {
+                if (e.contentHash != null && !e.contentHash.isEmpty()) {
+                    embeddingPathByHash.put(e.contentHash, e.filepath != null ? e.filepath : "");
+                }
+            }
+            List<MovedPathHealer.Move> moves = MovedPathHealer.plan(
+                    indexPathsByHash, embeddingPathByHash, libraryPaths, path -> new File(path).exists());
+            db.applyMoves(moves);
+            JSONArray moveArr = new JSONArray();
+            for (MovedPathHealer.Move m : moves) {
+                JSONObject o = new JSONObject();
+                o.put("from", m.oldPath);
+                o.put("to", m.newPath);
+                moveArr.put(o);
+            }
+            result.put("moved", moves.size());
+            result.put("moves", moveArr);
+
             result.put("relinked", relinked);
             result.put("upserted", upserted);
             result.put("alreadyLinked", alreadyLinked);
             result.put("unmatched", unmatched);
             Log.i(TAG, "relinkLibraryPaths: relinked=" + relinked
-                    + " alreadyLinked=" + alreadyLinked + " unmatched=" + unmatched);
+                    + " alreadyLinked=" + alreadyLinked + " unmatched=" + unmatched
+                    + " moved=" + moves.size());
             return result;
         }, cb);
     }
@@ -1394,6 +1442,62 @@ public final class EmbeddingDbManager {
             }
         }
         return best != null ? best : cands.get(0);
+    }
+
+    /** Backup files carry split bookkeeping only for rows where it is known. */
+    private static void writeSplitFields(JSONObject out, EmbeddingEntity r) throws Exception {
+        if (r.splitCount <= 0) return;
+        out.put("splitCount", r.splitCount);
+        if (r.clipCount > 0) out.put("clipCount", r.clipCount);
+        if (r.splitSource != null && !r.splitSource.isEmpty()) out.put("splitSource", r.splitSource);
+    }
+
+    private static void readSplitFields(JSONObject in, EmbeddingEntity ent) {
+        int split = in.optInt("splitCount", 0);
+        if (split <= 0) return;
+        ent.splitCount = split;
+        ent.clipCount = in.optInt("clipCount", 0);
+        String src = in.optString("splitSource", "");
+        ent.splitSource = EmbeddingEntity.SOURCE_RECORDED.equals(src)
+                ? EmbeddingEntity.SOURCE_RECORDED : EmbeddingEntity.SOURCE_LABELLED;
+    }
+
+    private static JSONObject splitRowJson(EmbeddingDb.SplitRow r) throws Exception {
+        JSONObject o = new JSONObject();
+        o.put("contentHash", r.contentHash != null ? r.contentHash : "");
+        o.put("filepath", r.filepath != null ? r.filepath : "");
+        o.put("filename", r.filename != null ? r.filename : "");
+        o.put("timestamp", r.timestamp);
+        o.put("splitCount", r.splitCount);
+        o.put("clipCount", r.clipCount);
+        o.put("splitSource", r.splitSource != null ? r.splitSource : "");
+        return o;
+    }
+
+    /** { rows: [ {contentHash, filepath, filename, timestamp, splitCount, clipCount, splitSource} ] } */
+    public void getSplitRows(Callback<JSONObject> cb) {
+        run(() -> {
+            JSONArray arr = new JSONArray();
+            for (EmbeddingDb.SplitRow r : db.getSplitRows()) arr.put(splitRowJson(r));
+            JSONObject out = new JSONObject();
+            out.put("rows", arr);
+            return out;
+        }, cb);
+    }
+
+    /** { row: {...} } or {} when the path has no embedding. */
+    public void getSplitRowForPath(String filepath, Callback<JSONObject> cb) {
+        run(() -> {
+            JSONObject out = new JSONObject();
+            EmbeddingDb.SplitRow r = db.getSplitRowForPath(filepath);
+            if (r != null) out.put("row", splitRowJson(r));
+            return out;
+        }, cb);
+    }
+
+    public void labelSplit(JSONArray hashes, int splitCount, Callback<Integer> cb) {
+        run(() -> db.labelSplit(jsonArrayToStringList(hashes),
+                EmbeddingWindowConfig.normalizeSplitCount(splitCount)), cb);
     }
 
     private static String normName(String s) {

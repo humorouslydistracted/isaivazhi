@@ -550,6 +550,8 @@ public class EmbeddingService {
                 // matching across machines).
                 String contentHash = computeContentHash(dec.first30s);
                 List<float[]> windows = dec.windows;
+                int songSplitCount = splitCount;
+                int clipCount = windows.size();
 
                 List<float[]> windowEmbeddings;
                 boolean inferenceSetupFailed = false;
@@ -585,7 +587,7 @@ public class EmbeddingService {
                 windowEmbeddings = null;
                 l2Normalize(avgEmbedding);
 
-                if (!saveEmbedding(filename, path, avgEmbedding, contentHash)) {
+                if (!saveEmbedding(filename, path, avgEmbedding, contentHash, songSplitCount, clipCount)) {
                     callback.onError("Save failed: " + filename, path);
                     failed++;
                     continue;
@@ -1412,7 +1414,8 @@ public class EmbeddingService {
      * reader in {@link EmbeddingDbManager#recoverPendingIfAny} never sees a
      * half-written file. Returns false if the song could not be saved.
      */
-    private boolean saveEmbedding(String filename, String filepath, float[] embedding, String contentHash) {
+    private boolean saveEmbedding(String filename, String filepath, float[] embedding, String contentHash,
+                                  int songSplitCount, int clipCount) {
         File tmp = null;
         try {
             File dir = new File(dataDir, SPOOL_DIR_NAME);
@@ -1429,6 +1432,8 @@ public class EmbeddingService {
             entry.put("filepath", filepath);
             entry.put("timestamp", System.currentTimeMillis());
             entry.put("filename", filename);
+            entry.put("split_count", songSplitCount);
+            entry.put("clip_count", clipCount);
 
             String base = System.currentTimeMillis() + "_" + (spoolSeq++) + "_" + contentHash;
             tmp = new File(dir, base + ".tmp");

@@ -15,4 +15,13 @@ public final class EmbeddingEntity {
     public long timestamp = 0L;
     public int dim = 0;
     public byte[] vec = new byte[0];
+    /** Split count requested when this vector was made; 0 = not known (embedded before tracking). */
+    public int splitCount = 0;
+    /** Clips actually averaged (fewer than [splitCount] for short songs); 0 = not known. */
+    public int clipCount = 0;
+    /** {@link #SOURCE_RECORDED}, {@link #SOURCE_LABELLED}, or "" when unknown. */
+    public String splitSource = "";
+
+    public static final String SOURCE_RECORDED = "recorded";
+    public static final String SOURCE_LABELLED = "labelled";
 }
