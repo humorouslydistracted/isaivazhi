@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import com.isaivazhi.app.engine.EmbeddingDbFacade
 import com.isaivazhi.app.engine.EmbeddingEngine
 import com.isaivazhi.app.engine.EmbeddingSplitCount
+import com.isaivazhi.app.engine.EmbeddingSplitStats
 import com.isaivazhi.app.engine.SignalTimelineEngine
 import com.isaivazhi.app.engine.Song
 import java.text.SimpleDateFormat
@@ -83,6 +84,9 @@ fun AiManagementScreen(
     embeddingSplitCount: Int = 3,
     libraryEmbedSplitCount: Int? = null,
     onEmbeddingSplitCountChange: (Int) -> Unit = {},
+    splitRows: List<EmbeddingSplitStats.Row> = emptyList(),
+    onLabelSplit: (hashes: List<String>, split: Int) -> Unit = { _, _ -> },
+    onReembedSplitRows: (List<EmbeddingSplitStats.Row>) -> Unit = {},
     embeddedFilenames: Set<String>,
     // Push #53: filepath-based "is this song embedded" lookup. The
     // previous filename-based comparison failed for songs whose
@@ -153,6 +157,9 @@ fun AiManagementScreen(
     // so the user can un-skip if they re-encode the file.
     val skippedSongs = songs.filter { it.filePath != null && it.filePath in skippedEmbeddings }
     val librarySize = songs.count { it.filePath != null }
+    val splitSummary = remember(splitRows, embeddingSplitCount) {
+        EmbeddingSplitStats.summarize(splitRows, EmbeddingSplitCount.normalize(embeddingSplitCount))
+    }
 
     var reembedExpanded by remember { mutableStateOf(false) }
     var skippedExpanded by remember { mutableStateOf(false) }
@@ -316,8 +323,19 @@ fun AiManagementScreen(
                 EmbeddingSplitSection(
                     selected = embeddingSplitCount,
                     librarySplitCount = libraryEmbedSplitCount,
+                    summary = splitSummary,
                     inProgress = status.inProgress,
                     onSelect = onEmbeddingSplitCountChange,
+                )
+            }
+
+            item {
+                SplitConsistencyCard(
+                    summary = splitSummary,
+                    targetSplit = EmbeddingSplitCount.normalize(embeddingSplitCount),
+                    inProgress = status.inProgress,
+                    onLabel = onLabelSplit,
+                    onReembed = onReembedSplitRows,
                 )
             }
 
@@ -1399,10 +1417,12 @@ private fun TopActionBar(
 private fun EmbeddingSplitSection(
     selected: Int,
     librarySplitCount: Int?,
+    summary: EmbeddingSplitStats.Summary,
     inProgress: Boolean,
     onSelect: (Int) -> Unit,
 ) {
     val normalized = EmbeddingSplitCount.normalize(selected)
+    var confirmSplit by remember { mutableStateOf<Int?>(null) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1432,7 +1452,11 @@ private fun EmbeddingSplitSection(
             for (n in EmbeddingSplitCount.allowed) {
                 FilterChip(
                     selected = normalized == n,
-                    onClick = { if (!inProgress) onSelect(n) },
+                    onClick = {
+                        if (!inProgress && n != normalized) {
+                            if (summary.total > 0) confirmSplit = n else onSelect(n)
+                        }
+                    },
                     label = { Text("$n") },
                     enabled = !inProgress,
                 )
@@ -1447,19 +1471,11 @@ private fun EmbeddingSplitSection(
                 modifier = Modifier.padding(top = 6.dp),
             )
         }
-        if (librarySplitCount != null && librarySplitCount != normalized) {
+        if (summary.bySplit.isEmpty() && librarySplitCount != null && librarySplitCount != normalized) {
             Text(
-                text = "Library was embedded with $librarySplitCount splits. " +
-                    "Use Re-embed all after changing — do not mix split counts.",
+                text = "The last full run used $librarySplitCount splits. Do not mix split counts.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(top = 6.dp),
-            )
-        } else if (librarySplitCount == null && normalized != 3) {
-            Text(
-                text = "Existing backups are usually 3-split. Re-embed all after switching to $normalized.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp),
             )
         }
@@ -1471,6 +1487,26 @@ private fun EmbeddingSplitSection(
                 modifier = Modifier.padding(top = 4.dp),
             )
         }
+    }
+    val pendingSplit = confirmSplit
+    if (pendingSplit != null) {
+        val atCurrent = summary.countFor(normalized)
+        AlertDialog(
+            onDismissRequest = { confirmSplit = null },
+            title = { Text("Switch to $pendingSplit splits?") },
+            text = {
+                Text(
+                    "$atCurrent songs are embedded with $normalized splits" +
+                        (if (summary.unknownCount > 0) " (plus ${summary.unknownCount} not recorded)" else "") +
+                        ". Songs embedded from now on will use $pendingSplit, so the library becomes mixed " +
+                        "and recommendations get less consistent until everything is re-embedded at $pendingSplit.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmSplit = null; onSelect(pendingSplit) }) { Text("Switch") }
+            },
+            dismissButton = { TextButton(onClick = { confirmSplit = null }) { Text("Keep $normalized") } },
+        )
     }
 }
 

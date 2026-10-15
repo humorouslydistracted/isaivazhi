@@ -74,6 +74,8 @@ fun SongMenuSheet(
     isDisliked: Boolean,
     hasEmbedding: Boolean,
     currentSplitCount: Int,
+    /** e.g. "5 splits, 3 clips (short song)"; null while loading or when not embedded. */
+    embeddingSplitInfo: String? = null,
     currentPlaylistName: String?,
     songStats: HistoryEngine.Stats?,
     tasteSignal: TasteEngine.TasteSignal?,
@@ -318,6 +320,7 @@ fun SongMenuSheet(
             isFavorite = isFavorite,
             isDisliked = isDisliked,
             hasEmbedding = hasEmbedding,
+            embeddingSplitInfo = embeddingSplitInfo,
             stats = songStats,
             tasteSignal = tasteSignal,
             onResetTasteSignal = onResetTasteSignal,
@@ -332,6 +335,7 @@ private fun SongDetailsDialog(
     isFavorite: Boolean,
     isDisliked: Boolean,
     hasEmbedding: Boolean,
+    embeddingSplitInfo: String?,
     stats: HistoryEngine.Stats?,
     tasteSignal: TasteEngine.TasteSignal?,
     onResetTasteSignal: () -> Unit,
@@ -371,6 +375,7 @@ private fun SongDetailsDialog(
                 DetailRow("Filepath", song.filePath ?: "—")
                 DetailRow("Content hash", song.contentHash ?: "—")
                 DetailRow("Embedding", if (hasEmbedding) "Yes" else "No")
+                if (hasEmbedding && embeddingSplitInfo != null) DetailRow("Embedding split", embeddingSplitInfo)
                 DetailRow("Start count", playCountStr)
                 DetailRow("Avg listen", avgStr)
                 DetailRow("Last played", lastPlayedStr)

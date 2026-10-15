@@ -805,6 +805,26 @@ private fun AppRoot(container: AppContainer) {
     // Declared here so the deleteSongHelper callback can bump it after the
     // delete completes (the LE itself is wired further down).
     var dupesRefreshTick by remember { mutableStateOf(0) }
+    // relinkLibraryPaths also clears index entries left behind by songs that
+    // were moved to another folder; record each one so the user can see it.
+    val logMovedSongs: (org.json.JSONObject?) -> Int = { relink ->
+        val moves = relink?.optJSONArray("moves")
+        val n = moves?.length() ?: 0
+        for (i in 0 until n) {
+            val m = moves!!.optJSONObject(i) ?: continue
+            container.embedding.logBuffer.append(
+                "moved",
+                "${java.io.File(m.optString("from")).name}: ${m.optString("from")} → ${m.optString("to")}",
+            )
+        }
+        if (n > 0) {
+            container.activityLog.log(
+                "engine", "embedding_paths_moved", "Updated $n moved song${if (n == 1) "" else "s"}",
+                data = mapOf("moved" to n),
+            )
+        }
+        n
+    }
     val deleteSongHelper = rememberDeleteSongHelper(
         ctx = ctx,
         onBatchResult = { filepaths, success, error ->
@@ -935,6 +955,7 @@ private fun AppRoot(container: AppContainer) {
                     )
                 }
                 val relink = container.embeddingDb.relinkLibraryPaths(songs)
+                logMovedSongs(relink)
                 val relinked = relink?.optInt("relinked", 0) ?: 0
                 val hashMap = container.embeddingDb.contentHashByFilepath()
                 rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
@@ -1308,7 +1329,7 @@ private fun AppRoot(container: AppContainer) {
             // runs it to populate sets for the initial AI page render.
             if (cached.rowCount <= 0) {
                 try {
-                    container.embeddingDb.relinkLibraryPaths(songs)
+                    logMovedSongs(container.embeddingDb.relinkLibraryPaths(songs))
                     val hashMap = container.embeddingDb.contentHashByFilepath()
                     rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                     val enrichedSongs = container.embeddingDb.enrichSongsWithKnownHashes(songs)
@@ -1340,7 +1361,7 @@ private fun AppRoot(container: AppContainer) {
                 // Cached row count skipped the heavy filepath fetch — but
                 // imported backups often have stale paths. Relink + load sets.
                 try {
-                    container.embeddingDb.relinkLibraryPaths(songs)
+                    logMovedSongs(container.embeddingDb.relinkLibraryPaths(songs))
                     val hashMap = container.embeddingDb.contentHashByFilepath()
                     rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                     val enrichedSongs = container.embeddingDb.enrichSongsWithKnownHashes(songs)
@@ -1382,6 +1403,7 @@ private fun AppRoot(container: AppContainer) {
             )
             embeddingsRowCount = ev.totalRows
             libraryEmbedSplitCount = container.preferences.getLastEmbedSplitCount()
+            dupesRefreshTick++
             refreshDbStats(container) { rc, dim, ext, fns, fps ->
                 embeddingsRowCount = rc; embeddingsDim = dim; vecExtLoaded = ext
                 embeddedFilenames = fns
@@ -2252,6 +2274,13 @@ private fun AppRoot(container: AppContainer) {
         embeddedFilepaths = embeddedFilepaths,
     )
     val menuSongStats = menuSong?.filename?.let { historyStats[it] }
+    var menuSongSplitInfo by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(menuSong?.filePath) {
+        menuSongSplitInfo = null
+        val path = menuSong?.filePath ?: return@LaunchedEffect
+        menuSongSplitInfo = runCatching { container.embeddingDb.getSplitRowForPath(path) }.getOrNull()
+            ?.let { com.isaivazhi.app.engine.EmbeddingSplitStats.describe(it) }
+    }
     val menuSongTasteSignal = menuSong?.filename?.let { tasteSignals[it] }
 
     BackHandler(enabled = overlay !is Overlay.None) {
@@ -3139,12 +3168,16 @@ private fun AppRoot(container: AppContainer) {
     // Push #61: audio-duplicate groups — different filepaths sharing one
     // content_hash via T_PATH. Surfaces "same song stored twice on disk".
     var audioDuplicateGroups by remember { mutableStateOf<List<com.isaivazhi.app.engine.EmbeddingDbFacade.AudioDuplicateGroup>>(emptyList()) }
+    var splitRows by remember { mutableStateOf<List<com.isaivazhi.app.engine.EmbeddingSplitStats.Row>>(emptyList()) }
     // dupesRefreshTick declared earlier (near deleteSongHelper) so it can
     // be bumped from inside that callback.
     LaunchedEffect(overlay, dupesRefreshTick) {
         if (overlay is Overlay.Ai) {
             try {
-                container.embeddingDb.relinkLibraryPaths(songs)
+                val moved = logMovedSongs(container.embeddingDb.relinkLibraryPaths(songs))
+                if (moved > 0) {
+                    container.toaster.show("Updated $moved moved song${if (moved == 1) "" else "s"} — no re-embed needed")
+                }
                 val hashMap = container.embeddingDb.contentHashByFilepath()
                 rawSongs = container.embeddingDb.enrichSongsWithHashes(rawSongs, hashMap)
                 val enrichedSongs = container.embeddingDb.enrichSongsWithKnownHashes(songs)
@@ -3171,6 +3204,7 @@ private fun AppRoot(container: AppContainer) {
             try {
                 duplicateRows = container.embedding.getDuplicates()
                 audioDuplicateGroups = container.embedding.getAudioDuplicates()
+                splitRows = container.embeddingDb.getSplitRows()
             } catch (t: Throwable) {
                 android.util.Log.w("MainActivity", "load duplicates failed: ${t.message}")
             }
@@ -3227,6 +3261,28 @@ private fun AppRoot(container: AppContainer) {
                 coroutineScope.launch {
                     container.preferences.setEmbeddingSplitCount(count)
                     embeddingSplitCount = count
+                }
+            },
+            splitRows = splitRows,
+            onLabelSplit = { hashes, split ->
+                coroutineScope.launch {
+                    val n = runCatching { container.embeddingDb.labelSplit(hashes, split) }.getOrDefault(0)
+                    container.embedding.logBuffer.append("splits", "labelled $n songs as $split splits")
+                    container.toaster.show("Marked $n song${if (n == 1) "" else "s"} as $split splits")
+                    dupesRefreshTick++
+                }
+            },
+            onReembedSplitRows = { rows ->
+                val hashes = rows.mapTo(HashSet()) { it.contentHash }
+                val paths = rows.mapTo(HashSet()) { it.filepath }
+                val targets = songs.filter {
+                    it.filePath != null && (it.contentHash in hashes || it.filePath in paths)
+                }.distinctBy { it.contentHash ?: it.filePath }
+                if (targets.isEmpty()) {
+                    container.toaster.show("None of those songs are on this device")
+                } else {
+                    container.embedding.embedSongs(targets)
+                    container.toaster.show("Re-embedding ${targets.size} songs at $embeddingSplitCount splits…")
                 }
             },
             embeddedFilenames = embeddedFilenames,
@@ -3631,6 +3687,7 @@ private fun AppRoot(container: AppContainer) {
             isDisliked = isMenuSongDisliked,
             hasEmbedding = isMenuSongEmbedded,
             currentSplitCount = embeddingSplitCount,
+            embeddingSplitInfo = menuSongSplitInfo,
             currentPlaylistName = playlistCtxName,
             songStats = menuSongStats,
             tasteSignal = menuSongTasteSignal,
