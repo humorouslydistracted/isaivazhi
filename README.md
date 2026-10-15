@@ -142,6 +142,20 @@ Debug APK:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### Signing (required for in-place updates)
+
+Android installs an update over an existing app only when both APKs are signed
+with the same key; otherwise it reports "App not installed". Debug and release
+builds are therefore signed with the app key whenever it is available:
+
+- Locally: `keystore.properties` (see `keystore.properties.example`).
+- CI / cloud agents: `ISAIVAZHI_KEYSTORE_BASE64` (the `.jks` file, base64),
+  `ISAIVAZHI_KEYSTORE_PASSWORD`, `ISAIVAZHI_KEY_ALIAS`, `ISAIVAZHI_KEY_PASSWORD`.
+
+Without either, the build falls back to the machine's own debug key (with a
+warning). Do not publish such APKs as releases: they cannot update an install
+signed with the app key.
+
 ## AI Architecture
 
 ### Startup warm sequence
